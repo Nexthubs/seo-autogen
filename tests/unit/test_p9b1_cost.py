@@ -1,6 +1,6 @@
 """P9-B1 unit: cost tracking (SEO-AUTO-DEV-SPEC.md section 54).
 
-Covers the per-provider cost plumbing (DataForSEO credits, Exa
+Covers the per-provider cost plumbing (DataForSEO ``cost`` in USD, Exa
 costDollars, image ``cost`` field) and the LLM usage metering: the
 OpenAI-compatible provider's token accumulation (a structured-output
 repair counting as ONE logical call), the ``MeteredLLMProvider`` row
@@ -296,20 +296,28 @@ class TestSetLLMPrompt:
 # ---------------------------------------------------------------------------
 # DataForSEO cost passthrough
 # ---------------------------------------------------------------------------
-def _serp_raw(credits) -> dict:
+def _serp_raw(cost, top_cost=None) -> dict:
+    """Official DataForSEO envelope (status_code 20000, task ``cost`` USD)."""
     task = {
-        "code": 200,
-        "result": {
-            "code": 200,
-            "organic": [
-                {"position": 1, "title": "t", "url": "https://a.example.com",
-                 "domain": "a.example.com", "description": "d"}
-            ],
-        },
+        "status_code": 20000,
+        "status_message": "OK",
+        "result": [
+            {
+                "type": "organic",
+                "items": [
+                    {"type": "organic", "rank_group": 1,
+                     "title": "t", "url": "https://a.example.com",
+                     "domain": "a.example.com", "description": "d"}
+                ],
+            }
+        ],
     }
-    if credits is not None:
-        task["credits"] = credits
-    return {"status_code": 200, "tasks": [task]}
+    if cost is not None:
+        task["cost"] = cost
+    body = {"status_code": 20000, "status_message": "OK", "tasks": [task]}
+    if top_cost is not None:
+        body["cost"] = top_cost
+    return body
 
 
 class TestDataForSEOCost:
@@ -344,6 +352,26 @@ class TestDataForSEOCost:
         req = SERPRequest(keyword="k", location_code=2342, language_code="en")
         resp = await provider.search(req)
         assert resp.provider_cost is None
+
+    async def test_cost_ignores_credits_field(self):
+        # The official field is ``cost`` (USD); a stray ``credits`` key is
+        # a red herring and must never be read (audit M12).
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = _serp_raw(0.03)
+            body["tasks"][0]["credits"] = 999
+            return httpx.Response(200, json=body)
+
+        provider = DataForSEOSERPProvider(
+            settings=_settings(),
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(handler),
+                base_url="http://serp.test",
+            ),
+            backoff_seconds=(0.0, 0.0, 0.0),
+        )
+        req = SERPRequest(keyword="k", location_code=2342, language_code="en")
+        resp = await provider.search(req)
+        assert resp.provider_cost == pytest.approx(0.03)
 
 
 # ---------------------------------------------------------------------------

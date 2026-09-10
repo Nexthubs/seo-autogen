@@ -6,7 +6,11 @@ must never decide search ranking itself). The canonical endpoint is the
 
     POST /contents
     Authorization: x-api-key <EXA_API_KEY>
-    {"ids": ["https://...", ...]}
+    {"ids": ["https://...", ...], "text": true}
+
+    ``text`` MUST be sent explicitly: it defaults to ``false`` on the API,
+    in which case no page body is returned and every result is empty (the
+    step would raise SOURCE_EMPTY).
 
 Response (documented example):
 
@@ -165,7 +169,9 @@ class ExaContentExtractor(ContentExtractor):
                 ErrorCode.SOURCE_EMPTY, "extract() received no urls"
             )
 
-        data = await self._post_with_retry({"ids": urls})
+        # ``text`` is sent explicitly: the API defaults it to ``false``,
+        # which would return no page bodies and cause a SOURCE_EMPTY.
+        data = await self._post_with_retry({"ids": urls, "text": True})
         # Batch cost (spec section 54): Exa reports a per-REQUEST total in
         # ``costDollars.total``. The pipeline extracts one URL per call, so
         # the total IS the per-page cost; for a hypothetical multi-URL batch
@@ -227,14 +233,39 @@ class ExaContentExtractor(ContentExtractor):
         return pages
 
     async def health_check(self) -> bool:
-        """Configured API key + endpoint reachable (no paid call)."""
+        """Verify the configured Exa key passes auth (zero cost).
+
+        Exa validates the ``x-api-key`` header *before* it processes the
+        request body, so a POST to ``/search`` with a body that is
+        intentionally invalid (missing the required ``query``) is rejected
+        on authentication and never executed — nothing is billed:
+
+            - invalid / missing key -> 401/403  -> unhealthy
+            - valid key, bad body   -> 400      -> healthy (key was accepted)
+
+        This is a free auth probe that strictly distinguishes auth failures,
+        so a bad key is never reported as Connected (audit M15). The previous
+        implementation hit the undocumented ``GET /status`` and treated any
+        sub-500 response (including 401/403/404) as healthy.
+        """
         if not self._settings.exa_configured:
             return False
         try:
-            response = await self._client.get("/status")
-            return response.status_code < 500
+            response = await self._client.post("/search", json={})
         except httpx.HTTPError:
             return False
+        if response.status_code in (401, 403):
+            logger.info(
+                "exa_health_check_failed",
+                extra={
+                    "event": "exa_health_check_failed",
+                    "status_code": response.status_code,
+                },
+            )
+            return False
+        # A valid key reaches the API and is rejected only because the probe
+        # body is invalid.
+        return response.status_code in (400, 422)
 
     async def aclose(self) -> None:
         if self._owns_client:

@@ -185,16 +185,56 @@ class TavilyContentExtractor(ContentExtractor):
         return pages
 
     async def health_check(self) -> bool:
-        """Configured API key + endpoint reachable (no paid call)."""
+        """Verify the configured Tavily key passes auth (paid, single URL).
+
+        Tavily has no documented free health endpoint, so this probes the
+        real ``/extract`` API with one URL. Unlike the previous
+        ``status_code < 500`` check, it strictly requires a business
+        success: an HTTP 200 whose body is the documented
+        ``{"results": [...], "failed_results": [...]}`` shape. A 401/403
+        (invalid key) or any other non-200 / malformed body reports False,
+        so a bad key is never surfaced as Connected (audit M15).
+
+        Cost trade-off: each probe performs one real extraction (one credit).
+        """
         if not self._settings.tavily_api_key:
             return False
         try:
             response = await self._client.post(
                 ENDPOINT, json={"urls": ["https://example.com"]}
             )
-            return response.status_code < 500
         except httpx.HTTPError:
             return False
+        if response.status_code != 200:
+            logger.info(
+                "tavily_health_check_failed",
+                extra={
+                    "event": "tavily_health_check_failed",
+                    "status_code": response.status_code,
+                },
+            )
+            return False
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        if not isinstance(body, dict):
+            return False
+        # Both keys must be present and lists (a real extract response).
+        if (
+            isinstance(body.get("results"), list)
+            and isinstance(body.get("failed_results"), list)
+        ):
+            return True
+        logger.info(
+            "tavily_health_check_failed",
+            extra={
+                "event": "tavily_health_check_failed",
+                "status_code": 200,
+                "malformed_body": True,
+            },
+        )
+        return False
 
     async def aclose(self) -> None:
         if self._owns_client:

@@ -22,7 +22,7 @@
 | 批次 | 阶段 | 修复项 | 状态 |
 |---|---|---|---|
 | B1 | P0 / P1 | M04, H08, L02, M09, M11 | ✅ 完成（见下） |
-| B2 | P2 | H01, H02, M15 | ⏳ 待办 |
+| B2 | P2 | H01, H02, M15 | ✅ 完成（见下） |
 | B3 | P3 | H04, M05 | ⏳ 待办 |
 | B4 | P4 / P5 | H09, H06, H07, H11, M08 | ⏳ 待办 |
 | B5 | P6 | H05, H10, M06, M07, L01 | ⏳ 待办 |
@@ -48,13 +48,22 @@
 
 **B1 测试结果**：`426 passed, 1 skipped`（基线 415 + 新增 11），迁移 `0011_error_raw_usage_prompt` 已升级至本地 PG 测试库。
 
-### B2 — P2（⏳）
+### B2 — P2 ✅
 
-| ID | 级别 | 问题摘要 | 计划 | 状态 |
-|---|---|---|---|---|
-| H01 | High | DataForSEO 完整响应契约错误（`20000` / `tasks[].result[].items[]` / `rank_group`） | 按官方 Live Advanced 契约重写解析；fixtures 用官方形状；覆盖 task 失败 / PAA / 混合 / raw 保留 | ⏳ |
-| H02 | High | Exa 未显式请求 `text`，依赖未声明的服务默认值 | 显式 `text=true`（必要时 markdown），测试约束请求参数与响应 | ⏳ |
-| M15 | Med | health 可能付费（调 live SERP）且 HTTP200 业务鉴权失败判 Connected；Tavily 401/403 也算正常 | 低成本认证探测 + 严格业务成功校验；false-positive 用例 | ⏳ |
+| ID | 级别 | 问题摘要 | 修复内容 | 关键文件 | 测试证据 | 状态 |
+|---|---|---|---|---|---|---|
+| H01 | High | DataForSEO 响应契约完全错误：旧解析把 `tasks[].result` 当单个 `{organic, questions, related[]}` dict，读 `position` 作 rank；官方实为 `result` = **block 列表**，`items[]` 为**扁平混合类型**（按 item 自身 `type` 分派），rank 取 `rank_group`（`position` 是 left/right 字符串），PAA 是 `people_also_ask` item 下 `items[]` 的 `people_also_ask_element`（问题=element `title`，来源 url=首个 `expanded_element.url`，可能缺省），related 是 item 内 `items[]` **字符串列表**；另缺 featured snippet | 按官方 Live Advanced 契约（对官方脱敏样例逐字段机验）重写 `parse()`：逐 block × 逐 item 按 `type` 分派 organic/paa/related/featured；`search()` 用 `rank_group` 排序、PAA 嵌套解析（无 url 时 `source_url=None` 防御）、related 取字符串、featured 取首个带 url 的 item 映射 `FeaturedSnippet`；`SerpResult.result_type='featured'` 落库（`VARCHAR(32)` 已允许，**无需迁移**）；`serp_search_done` 日志计入 featured；模块 docstring 记录完整官方契约 | `app/providers/serp/dataforseo.py`、`app/schemas/serp.py`（新增 `FeaturedSnippet` + `SERPResponse.featured_snippet`）、`app/pipeline/steps/serp_search.py` | `tests/unit/test_dataforseo_provider.py` **整文件重写**（官方信封 fixtures，23 用例：happy path / `rank_group` 乱序排序 / 混合类型只取 organic / featured 有与无 / PAA 无 url 防御 / 空 organic→`DATAFORSEO_EMPTY_SERP` / task 失败 `result:null`→`DATAFORSEO_REQUEST_FAILED` / HTTP200+业务失败→`REQUEST_FAILED` / retry 429·401·500×3 / cost 取 `cost` 非 `credits` / health 未配置·401·200+业务失败·成功）；`scripts/p2_acceptance.py` 官方形状 + featured 落库断言（**PASS**） | ✅ |
+| H02 | High | Exa 请求体只发 `{"ids": [...]}`，`text` 依赖服务端默认（默认 `false` → 无正文 → 每页 SOURCE_EMPTY） | `extract()` 显式发 `{"ids": urls, "text": True}`（API 默认 `text=false`，不显式声明则拿不到正文）；`/contents` docstring 同步标注 `text` 必须显式；新增“结果全缺 `text` → SOURCE_EMPTY”用例 | `app/providers/extractor/exa.py` | `tests/unit/test_exa_extractor.py`：`test_extract_sends_api_key_and_ids` 断言 body == `{"ids": [...], "text": True}`；新增 `test_extract_results_without_text_raise_source_empty` | ✅ |
+| M15 | Med | health_check 假阳性 + 成本不清：DataForSEO 只判“无传输错误”（HTTP200 业务鉴权失败 `status_code!=20000` 会判 Connected）；Exa 走未文档化的 `GET /status` 且 `status_code<500`（401/403/404 也算健康）；Tavily `status_code<500`（401/403 算健康） | **DataForSEO**：`health_check()` 真实（付费，~1 次 SERP，`depth=1`）请求后额外 `self.parse(raw)`，要求顶层**且**task 级 `status_code==20000` 且 `result` 非空，任何 `PipelineError`（401/403/业务失败/空 SERP）→ False。**Exa**：改为**零成本认证探测**——POST `/search` 带故意非法 body（缺 `query`），Exa 先校验 `x-api-key` 再处理 body，故坏 key→401/403→False（未计费），有效 key→400/422→True（key 被接受，body 被拒）；彻底消除 401/403 假阳性且不付费。**Tavily**：保留真实 `/extract` 付费探测（单次 1 次抽取，**成本已文档化**），但严格要求 HTTP 200 且 body 含 `results`(list) + `failed_results`(list)；401/403/其它非 200/畸形 body → False | `app/providers/serp/dataforseo.py`、`app/providers/extractor/exa.py`、`app/providers/extractor/tavily.py` | DataForSEO：`test_health_check_*` 4 用例（未配置 / HTTP401 / HTTP200+业务失败40101 / 成功）。Exa：`test_health_check_*` 5 用例（未配置 / 400·422 有效 key→True / 401 / 403 / 传输错误→False）。Tavily：`test_p9_reliability.py::TestTavilyExtractor` 新增 7 用例（未配置 / 401 / 403 / 200 畸形 / 200 results 非 list / 200 正确形状→True / 传输错误→False） | ✅ |
+
+**B2 测试结果**：`448 passed, 1 skipped`（B1 后 426 + 新增 22：DataForSEO 重写 +9、Exa +5、Tavily +7、cost +1）。`scripts/p2_acceptance.py` 对本地 PG 实跑 **ACCEPTANCE: PASS**（8 organic / 3 PAA / 1 featured 落库、Top-5 唯一 URL、去重回填、二次命中缓存 0 次抽取）。**无需新迁移**（`serp_results.result_type` 为 `VARCHAR(32)` 且已含 "featured"）。
+
+> **M15 成本权衡（已文档化）**：三家 provider 的“连通性”信号不同——
+> DataForSEO **恒返回 HTTP 200**，真实结果只在 body `status_code`（20000=ok），故 health 必须发一次真实付费 SERP 调用来区分鉴权失败；
+> Exa **无文档化免费 ping 端点**（`GET /status` 未在 docs 声明），采用零成本的“非法 body 认证探测”（key 校验先于 body 处理）；
+> Tavily **无免费端点**，保留真实付费 `/extract` 探测但要求业务成功形状。三者都彻底消除“401/403 被判 Connected”的假阳性。
+>
+> **M12 前置子项（B2 顺手完成）**：`_extract_cost()` 改读官方 `cost`（USD，task 级优先、顶层兜底），不再读 `credits`——这是 B7 M12 的“读错字段”部分；M12 的“不可变请求账本 + cache-hit 零计”主体仍在 B7。
 
 ### B3 — P3（⏳）
 
@@ -105,6 +114,12 @@
 
 ## 变更日志
 
+- **2026-09-17 — B2 完成**：H01 / H02 / M15 全部修复并测试（`448 passed, 1 skipped`）。
+  - **H01**：DataForSEO 解析按官方 Live Advanced 契约重写（`result`=block 列表、`items[]` 扁平混合按 `type` 分派、rank 取 `rank_group`、PAA 嵌套 `people_also_ask_element`、related 字符串列表）；新增 **featured snippet**（`FeaturedSnippet` schema + `SerpResult.result_type='featured'` 落库，无需迁移）。`test_dataforseo_provider.py` 整文件重写（官方脱敏信封，23 用例）。
+  - **H02**：Exa `extract()` 显式 `text: True`（API 默认 `false` → 否则无正文 SOURCE_EMPTY）。
+  - **M15**：三家 provider `health_check()` 全部严格化，消除 401/403 假阳性——DataForSEO 付费 SERP + 业务 `status_code==20000` 校验；Exa 改零成本“非法 body 认证探测”（400/422=True，401/403=False）；Tavily 保留付费探测但要求 HTTP200 + `results`/`failed_results` 形状。
+  - **M12 前置子项**：`_extract_cost()` 改读官方 `cost`（USD），弃用 `credits`（主体在 B7）。
+  - `scripts/p2_acceptance.py` 改官方形状并对本地 PG 实跑 **PASS**（8 organic / 3 PAA / 1 featured 落库）。**无新迁移**。
 - **2026-09-17 — B1 完成**：M04 / H08 / L02 / M09 / M11 全部修复并测试（`426 passed, 1 skipped`）；
   新增迁移 `0011_error_raw_usage_prompt`（`generation_jobs.error_raw` + `llm_usage` prompt 三列）；
   新增测试 `tests/unit/test_h08_rq_timeout.py`，扩展 `test_p9b1_cost.py` / `test_p9_reliability.py` /

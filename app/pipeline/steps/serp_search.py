@@ -137,6 +137,21 @@ async def run_serp_search(
                 raw_item={"title": rel},
             )
         )
+    if response.featured_snippet is not None:
+        feat = response.featured_snippet
+        session.add(
+            SerpResult(
+                serp_run_id=run.id,
+                result_type="featured",
+                rank=None,
+                title=feat.title,
+                url=feat.url,
+                normalized_url=normalize_url(feat.url) if feat.url else None,
+                domain=_domain(feat.url) if feat.url else feat.domain,
+                snippet=feat.snippet,
+                raw_item=feat.model_dump(),
+            )
+        )
 
     # Top-5 unique competitor URLs are part of the checkpoint (12.1).
     select_top5_unique(response)
@@ -152,6 +167,8 @@ async def run_serp_search(
             "job_id": str(job.id),
             "organic": len(response.organic_results),
             "paa": len(response.paa_questions),
+            "related": len(response.related_searches),
+            "featured": 1 if response.featured_snippet is not None else 0,
         },
     )
     return response

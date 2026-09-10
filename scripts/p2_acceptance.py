@@ -82,29 +82,88 @@ def _content_for(url: str) -> str:
 
 
 def _serp_payload() -> dict:
+    """Official DataForSEO envelope (machine-verified contract).
+
+    ``tasks[0].result`` is a LIST of SERP blocks; the single block's
+    ``items[]`` is a FLAT, MIXED-type list. Organic items carry
+    ``rank_group`` (the rank), PAA items nest ``people_also_ask_element``
+    dicts (question = element ``title``, url from ``expanded_element``),
+    related items hold a list of plain strings, and a featured_snippet
+    item carries its own top-level title/url/description.
+    """
+    items: list[dict] = []
+    for rank, title, url in ORGANIC:
+        items.append(
+            {
+                "type": "organic",
+                "rank_group": rank,
+                "rank_absolute": rank + 4,
+                "page": 1,
+                "position": "left",
+                "domain": url.split("/")[2],
+                "title": title,
+                "url": url,
+                "description": f"snippet for {title}",
+            }
+        )
+    items.append(
+        {
+            "type": "people_also_ask",
+            "rank_group": 1,
+            "items": [
+                {
+                    "type": "people_also_ask_element",
+                    "title": q,
+                    "expanded_element": [
+                        {
+                            "type": "people_also_ask_expanded_element",
+                            "url": f"https://paa.example.com/{i}",
+                            "domain": "paa.example.com",
+                            "title": f"Answer to: {q}",
+                            "description": "snippet",
+                        }
+                    ],
+                }
+                for i, q in enumerate(PAA)
+            ],
+        }
+    )
+    items.append({"type": "related_searches", "rank_group": 1, "items": RELATED})
+    items.append(
+        {
+            "type": "featured_snippet",
+            "rank_group": 1,
+            "domain": "featured.example.com",
+            "title": "Featured: What is no contact?",
+            "featured_title": None,
+            "description": "No contact is the practice of cutting off all communication.",
+            "url": "https://featured.example.com/no-contact",
+        }
+    )
     return {
-        "status_code": 200,
+        "version": "2026-09-01",
+        "status_code": 20000,
         "status_message": "OK",
+        "time": "0.24",
+        "cost": 0.03,
         "tasks": [
             {
                 "cost": 0.03,
-                "credits": 1,
-                "result": {
-                    "organic": [
-                        {
-                            "position": rank,
-                            "title": title,
-                            "url": url,
-                            "domain": url.split("/")[2],
-                            "description": f"snippet for {title}",
-                        }
-                        for rank, title, url in ORGANIC
-                    ],
-                    "people_also_ask": [
-                        {"questions": [{"question": q, "url": None} for q in PAA]}
-                    ],
-                    "related_searches": [{"title": q} for q in RELATED],
-                },
+                "status_code": 20000,
+                "status_message": "OK",
+                "id": "task-acceptance",
+                "path": "/v3/serp/google/organic/live/advanced",
+                "result_count": 1,
+                "time": "0.2",
+                "data": {},
+                "result": [
+                    {
+                        "type": "organic",
+                        "keyword": KEYWORD,
+                        "items_count": len(items),
+                        "items": items,
+                    }
+                ],
             }
         ],
     }
@@ -197,6 +256,7 @@ async def main() -> int:
     print(f"    organic results returned : {len(response.organic_results)}")
     print(f"    PAA questions            : {len(response.paa_questions)}")
     print(f"    related searches         : {len(response.related_searches)}")
+    print(f"    featured snippet present : {response.featured_snippet is not None}")
     print("    Top-5 unique competitor URLs:")
     for rank, url in top5:
         print(f"        rank {rank}: {url}")
@@ -220,12 +280,24 @@ async def main() -> int:
                 )
             ).all()
         )
+        n_feat = len(
+            session.scalars(
+                select(SerpResult).where(
+                    SerpResult.serp_run_id == run.id,
+                    SerpResult.result_type == "featured",
+                )
+            ).all()
+        )
         raw = run.raw_response
 
     org_ok = n_org == len(ORGANIC)
     paa_ok = n_paa == len(PAA)
+    feat_ok = n_feat == 1
     top5_ok = len(top5) == 5
-    print(f"[2] persisted serp_results   : {n_org} organic, {n_paa} paa")
+    print(
+        f"[2] persisted serp_results   : {n_org} organic, {n_paa} paa, "
+        f"{n_feat} featured"
+    )
     print(
         f"    serp_runs.raw_response   : status_code="
         f"{raw.get('status_code')}, tasks={len(raw.get('tasks', []))}"
@@ -299,13 +371,23 @@ async def main() -> int:
         session.delete(session.get(GenerationJob, job_id))
         session.commit()
 
-    ok = ok and org_ok and paa_ok and top5_ok and dup_ok and backfill_ok and cache_ok
+    ok = (
+        ok
+        and org_ok
+        and paa_ok
+        and feat_ok
+        and top5_ok
+        and dup_ok
+        and backfill_ok
+        and cache_ok
+    )
     print("=" * 62)
     print(f"ACCEPTANCE: {'PASS' if ok else 'FAIL'}")
-    print(f"  [x] DataForSEO request success : {raw.get('status_code') == 200}")
+    print(f"  [x] DataForSEO request success : {raw.get('status_code') == 20000}")
     print(f"  [x] organic persisted          : {org_ok}  ({n_org}/{len(ORGANIC)})")
     print(f"  [x] Top-5 unique URLs selected : {top5_ok}  (got {len(top5)})")
     print(f"  [x] PAA persisted              : {paa_ok}  ({n_paa}/{len(PAA)})")
+    print(f"  [x] featured snippet persisted : {feat_ok}  ({n_feat}/1)")
     print(f"  [x] content extracted          : {len(pages) >= 1}  ({len(pages)} pages)")
     print(f"  [x] duplicate content deduped  : {dup_ok and backfill_ok}")
     print(f"  [x] 2nd-run cache hit, 0 calls : {cache_ok}")

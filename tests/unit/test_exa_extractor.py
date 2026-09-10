@@ -2,12 +2,16 @@
 (spec sections 10.3, 15, 51, 52).
 
 Covers:
-  - /contents request with x-api-key header and {"ids": [...]} body
+  - /contents request with x-api-key header and
+    {"ids": [...], "text": true} body (`text` must be explicit: the API
+    defaults it to false, which returns no page bodies)
   - one ExtractedPage per successful result
   - deterministic truncation at SOURCE_MAX_CHARS (spec 15)
-  - per-page failure/empty skipped; all failed -> SOURCE_EMPTY
+  - per-page failure/empty skipped; all failed/empty -> SOURCE_EMPTY
   - 401 -> EXTRACTOR_AUTH_FAILED (no retry), 429 retried
-  - health_check
+  - health_check (audit M15): zero-cost auth probe via an intentionally
+    invalid /search body — 401/403 (bad key) is False, 400/422 (valid key,
+    rejected body) is True; never a paid call
 """
 
 import httpx
@@ -77,7 +81,10 @@ async def test_extract_sends_api_key_and_ids():
     pages = await p.extract(["https://a.example.com/1"])
     assert captured["key"] == "test-key"
     assert captured["path"] == "/contents"
-    assert captured["body"] == {"ids": ["https://a.example.com/1"]}
+    assert captured["body"] == {
+        "ids": ["https://a.example.com/1"],
+        "text": True,
+    }
     assert len(pages) == 1
     assert pages[0].title == "Page A"
     assert pages[0].content_markdown == "Content A"
@@ -159,6 +166,28 @@ async def test_extract_all_failed_raises_source_empty():
     assert exc.value.error_code == ErrorCode.SOURCE_EMPTY
 
 
+async def test_extract_results_without_text_raise_source_empty():
+    # A provider response where every result carries no ``text`` body (as
+    # happens when the request omits ``text: true``) is unusable — the
+    # step must fail with SOURCE_EMPTY instead of persisting empty pages.
+    body = _contents_body(
+        items=[
+            {
+                "id": "https://a.example.com/1",
+                "url": "https://a.example.com/1",
+                "title": "A",
+            }
+        ],
+        statuses=[
+            {"id": "https://a.example.com/1", "status": "success"}
+        ],
+    )
+    p = _provider(lambda r: httpx.Response(200, json=body))
+    with pytest.raises(PipelineError) as exc:
+        await p.extract(["https://a.example.com/1"])
+    assert exc.value.error_code == ErrorCode.SOURCE_EMPTY
+
+
 async def test_extract_no_urls_raises_source_empty():
     p = _provider(lambda r: httpx.Response(200, json={}))
     with pytest.raises(PipelineError) as exc:
@@ -220,6 +249,33 @@ async def test_health_check_unconfigured_false():
     assert await p.health_check() is False
 
 
-async def test_health_check_reachable_true():
-    p = _provider(lambda r: httpx.Response(200, json={"status": "ok"}))
+async def test_health_check_valid_key_rejected_body_true():
+    # A valid key reaches the API; the intentionally invalid probe body is
+    # then rejected with 400 — the key is healthy, and nothing was billed.
+    p = _provider(lambda r: httpx.Response(400, json={"error": "query is required"}))
     assert await p.health_check() is True
+
+
+async def test_health_check_valid_key_422_true():
+    p = _provider(lambda r: httpx.Response(422, json={"error": "validation"}))
+    assert await p.health_check() is True
+
+
+async def test_health_check_401_false():
+    # An invalid key is rejected on authentication — must NOT read as
+    # Connected (audit M15).
+    p = _provider(lambda r: httpx.Response(401, json={"error": "invalid x-api-key"}))
+    assert await p.health_check() is False
+
+
+async def test_health_check_403_false():
+    p = _provider(lambda r: httpx.Response(403, json={"error": "forbidden"}))
+    assert await p.health_check() is False
+
+
+async def test_health_check_transport_error_false():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    p = _provider(handler)
+    assert await p.health_check() is False

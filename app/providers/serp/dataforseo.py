@@ -15,6 +15,48 @@ SERP features we actually store are requested:
 The full raw response must be preserved (spec section 12.2) — callers
 store it in ``serp_runs.raw_response``.
 
+Response contract (official, machine-verified against the documented
+example; see ``tests/unit/test_dataforseo_provider.py``):
+
+    {
+      "status_code": 20000,            # business code (HTTP is always 200)
+      "status_message": "OK",
+      "cost": 0.003,                   # USD cost of the whole request
+      "tasks": [
+        {
+          "status_code": 20000,        # task-level business code
+          "cost": 0.003,               # USD cost of this task
+          "result": [                  # a LIST of SERP blocks
+            {
+              "type": "organic",
+              "items": [               # flat, MIXED-type item list
+                {"type": "organic", "rank_group": 26, "rank_absolute": 30,
+                 "position": "left", "domain": "...", "title": "...",
+                 "url": "...", "description": "..."},
+                {"type": "featured_snippet", "title": "...", "url": "...",
+                 "description": "...", "domain": "..."},
+                {"type": "people_also_ask",
+                 "items": [{"type": "people_also_ask_element",
+                            "title": "<question>",
+                            "expanded_element": [
+                              {"type": "people_also_ask_expanded_element",
+                               "url": "...", "title": "...", "description": "..."}]}]},
+                {"type": "related_searches",
+                 "items": ["iphone xr", "iphone xs", ...]},
+                ...
+              ],
+            }
+          ],
+        }
+      ],
+    }
+
+The parser therefore scans each block's ``items[]`` and dispatches every
+item by its own ``type`` — it does NOT assume a single ``result["organic"]``
+dict. Organic rank comes from ``rank_group`` (the ``position`` field is a
+left/right string, not a rank). A task is a failure when its
+``status_code != 20000`` or its ``result`` is not a non-empty list.
+
 Retry policy (spec section 51):
     retryable      429, 500, 502, 503, 504, timeout, connection reset
     non-retryable  400, 401, 403, 404 (configuration errors)
@@ -31,6 +73,7 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import ErrorCode, PipelineError
 from app.providers.serp.base import SERPProvider
 from app.schemas.serp import (
+    FeaturedSnippet,
     OrganicResult,
     PAAQuestion,
     SERPRequest,
@@ -167,62 +210,105 @@ class DataForSEOSERPProvider(SERPProvider):
     # ------------------------------------------------------------
     @staticmethod
     def _extract_cost(data: dict) -> float | None:
-        """Best-effort cost/credits from the response payload."""
+        """Best-effort USD cost from the response payload.
+
+        DataForSEO reports cost in US dollars under the ``cost`` key (never
+        ``credits``). The per-task ``cost`` is authoritative; the top-level
+        ``cost`` (the cost of the whole request) is the fallback when the
+        task does not carry one. Returns ``None`` when neither is present or
+        numeric.
+        """
         try:
             task = data["tasks"][0]
-            cost = task.get("credits")
-            if cost is None:
-                return None
-            return float(cost)
-        except (KeyError, IndexError, TypeError, ValueError):
-            return None
+        except (KeyError, IndexError, TypeError):
+            task = None
+        candidates: list[object] = []
+        if isinstance(task, dict):
+            candidates.append(task.get("cost"))
+        candidates.append(data.get("cost"))
+        for value in candidates:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        return None
 
     def parse(self, raw: dict) -> dict:
         """Parse the full response body into a structured result dict.
 
         Returns ``{"organic": [...], "paa": [...], "related": [...],
-        "featured_snippet": {...} | None}``. Raises ``PipelineError`` on
+        "featured_snippet": dict | None}`` where the three lists hold the
+        *item* dicts (one per SERP element) and ``featured_snippet`` is the
+        raw featured-snippet item (or ``None``). Raises ``PipelineError`` on
         transport/task-level failures.
+
+        The official contract (see module docstring) is:
+          - top-level ``status_code == 20000`` (HTTP is always 200);
+          - ``tasks[0].status_code == 20000`` and ``tasks[0].result`` is a
+            LIST of SERP blocks (a task failure has ``result`` null or a
+            non-list);
+          - each block's ``items[]`` is a flat, mixed-type list, so every
+            item is dispatched by its own ``type``.
         """
-        if raw.get("status_code") != 200:
+        if raw.get("status_code") != 20000:
             raise PipelineError(
                 ErrorCode.DATAFORSEO_REQUEST_FAILED,
                 f"DataForSEO status_code={raw.get('status_code')} "
-                f"message={raw.get('message')!r}",
+                f"status_message={raw.get('status_message')!r}",
                 raw=raw,
             )
         tasks = raw.get("tasks") or []
         if not tasks:
             raise PipelineError(
-                ErrorCode.DATAFORSEO_EMPTY_SERP,
+                ErrorCode.DATAFORSEO_REQUEST_FAILED,
                 "DataForSEO response contains no tasks",
                 raw=raw,
             )
         task = tasks[0]
-        result = task.get("result")
-        # Task-level error: result is a dict with code/message, not data.
-        if not isinstance(result, dict):
+        if not isinstance(task, dict) or task.get("status_code") != 20000:
             raise PipelineError(
                 ErrorCode.DATAFORSEO_REQUEST_FAILED,
-                f"DataForSEO task has no result (code={task.get('code')}, "
-                f"message={task.get('message')!r})",
+                f"DataForSEO task failed (status_code={task.get('status_code')}, "
+                f"status_message={task.get('status_message')!r})",
                 raw=task,
             )
-        if result.get("code") not in (200, None) or not (
-            result.get("organic") or result.get("people_also_ask")
-            or result.get("related_searches")
-        ):
+        result = task.get("result")
+        # A task failure leaves `result` null (or a non-list error payload).
+        if not isinstance(result, list) or not result:
             raise PipelineError(
-                ErrorCode.DATAFORSEO_EMPTY_SERP,
-                f"DataForSEO task returned no SERP data "
-                f"(code={result.get('code')}, message={result.get('message')!r})",
-                raw=result,
+                ErrorCode.DATAFORSEO_REQUEST_FAILED,
+                f"DataForSEO task has no result "
+                f"(status_code={task.get('status_code')}, "
+                f"status_message={task.get('status_message')!r})",
+                raw=task,
             )
+
+        organic: list[dict] = []
+        paa: list[dict] = []
+        related: list[str] = []
+        featured: dict | None = None
+        for block in result:
+            if not isinstance(block, dict):
+                continue
+            for item in block.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                itype = item.get("type")
+                if itype == "organic":
+                    if item.get("url"):
+                        organic.append(item)
+                elif itype == "people_also_ask":
+                    paa.append(item)
+                elif itype == "related_searches":
+                    for rel in item.get("items") or []:
+                        if isinstance(rel, str) and rel:
+                            related.append(rel)
+                elif itype == "featured_snippet":
+                    if featured is None and item.get("url"):
+                        featured = item
         return {
-            "organic": result.get("organic") or [],
-            "paa": result.get("people_also_ask") or [],
-            "related": result.get("related_searches") or [],
-            "featured_snippet": result.get("featured_snippet"),
+            "organic": organic,
+            "paa": paa,
+            "related": related,
+            "featured_snippet": featured,
         }
 
     # ------------------------------------------------------------
@@ -232,37 +318,44 @@ class DataForSEOSERPProvider(SERPProvider):
         raw, cost = await self._request_raw(request)
         parsed = self.parse(raw)
 
+        # `organic` already holds only item dicts with a url (parse filtered
+        # them). Rank comes from `rank_group`; the `position` field is a
+        # left/right string and is deliberately ignored.
         organic = [
             OrganicResult(
-                rank=int(item.get("position") or 0),
+                rank=int(item.get("rank_group") or 0),
                 title=item.get("title") or "",
                 url=item.get("url") or "",
                 domain=item.get("domain"),
                 snippet=item.get("description"),
             )
             for item in parsed["organic"]
-            if isinstance(item, dict) and item.get("url")
         ]
         organic.sort(key=lambda r: r.rank)
 
+        # A `people_also_ask` item's `items[]` is a list of
+        # `people_also_ask_element` dicts; the question is the element
+        # `title`, the source URL the first `expanded_element` entry's
+        # `url` (defensive: some element variants carry no url).
         paa: list[PAAQuestion] = []
-        for block in parsed["paa"]:
-            if not isinstance(block, dict):
-                continue
-            for q in block.get("questions") or []:
-                if isinstance(q, dict) and q.get("question"):
-                    paa.append(
-                        PAAQuestion(
-                            question=q["question"],
-                            source_url=q.get("url"),
-                        )
-                    )
+        for item in parsed["paa"]:
+            for q in item.get("items") or []:
+                if not isinstance(q, dict) or q.get("type") != "people_also_ask_element":
+                    continue
+                question = q.get("title")
+                if not question:
+                    continue
+                source_url = None
+                for exp in q.get("expanded_element") or []:
+                    if isinstance(exp, dict) and exp.get("url"):
+                        source_url = exp["url"]
+                        break
+                paa.append(
+                    PAAQuestion(question=question, source_url=source_url)
+                )
 
-        related = [
-            item["title"]
-            for item in parsed["related"]
-            if isinstance(item, dict) and item.get("title")
-        ]
+        related = parsed["related"]
+        featured = parsed["featured_snippet"]
 
         if not organic:
             raise PipelineError(
@@ -276,20 +369,37 @@ class DataForSEOSERPProvider(SERPProvider):
             organic_results=organic,
             paa_questions=paa,
             related_searches=related,
+            featured_snippet=(
+                FeaturedSnippet(
+                    title=featured.get("title"),
+                    snippet=featured.get("description"),
+                    url=featured.get("url"),
+                    domain=featured.get("domain"),
+                )
+                if featured
+                else None
+            ),
             raw=raw,
             provider_cost=cost,
         )
 
     async def health_check(self) -> bool:
-        """Configured credentials + endpoint reachable.
+        """Configured credentials + a successful live SERP call.
 
-        A DataForSEO "auth failed" error page (HTTP 200 with a task-level
-        error, or HTTP 401) reports False.
+        DataForSEO always answers HTTP 200 and carries the real outcome in
+        the body's ``status_code`` (20000 = ok), so an HTTP-only check would
+        treat an auth/business failure (e.g. status_code 40101, or a task
+        error) as "connected". This probe therefore runs a real (paid,
+        ~one SERP call) live search with ``depth=1`` and requires the
+        business envelope to parse successfully: top-level AND task-level
+        ``status_code == 20000`` with a non-empty ``result`` list. Any
+        ``PipelineError`` (HTTP 401/403, business failure, empty SERP) is
+        False.
         """
         if not self._settings.dataforseo_configured:
             return False
         try:
-            await self._request_raw(
+            raw, _ = await self._request_raw(
                 SERPRequest(
                     keyword="health check",
                     location_code=self._settings.dataforseo_location_code,
@@ -298,6 +408,7 @@ class DataForSEOSERPProvider(SERPProvider):
                     depth=1,
                 )
             )
+            self.parse(raw)
             return True
         except PipelineError as exc:
             logger.info(

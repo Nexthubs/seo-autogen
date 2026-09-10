@@ -1,15 +1,37 @@
 """P2 DataForSEO provider tests via httpx.MockTransport
-(spec sections 10.2, 12, 51, 52).
+(spec sections 10.2, 12, 51, 52; audit H01, M12, M15).
+
+Fixtures are pinned to the REAL, desensitized official DataForSEO envelope
+(machine-verified against the documented ``/v3/serp/google/organic/live/
+advanced`` response):
+
+  - top-level business ``status_code == 20000`` (HTTP is always 200)
+  - per-task ``status_code`` / ``cost`` (USD, NOT ``credits``)
+  - ``tasks[0].result`` is a LIST of SERP blocks; each block's ``items[]``
+    is a FLAT, MIXED-type list dispatched by the item's own ``type``
+  - organic rank comes from ``rank_group`` (``position`` is a left/right
+    string, not a rank)
+  - PAA: item ``people_also_ask`` -> ``items[]`` of
+    ``people_also_ask_element`` (question = element ``title``, source url =
+    first ``expanded_element`` entry's ``url``, which may be absent)
+  - related: item ``related_searches`` -> ``items`` is a list of strings
+  - featured: item ``featured_snippet`` with top-level title/url/description
 
 Covers:
   - task body per spec section 12 (array, fields, PAA click depth flag)
   - HTTP Basic Auth header present
-  - parse(): organic/PAA/related/featured snippet
-  - search(): happy path, empty organic -> DATAFORSEO_EMPTY_SERP
-  - task-level error result -> DATAFORSEO_EMPTY_SERP
+  - parse(): organic / PAA / related / featured snippet, mixed item types
+  - rank ordering by ``rank_group`` from a shuffled provider order
+  - task failure (result null / task status_code != 20000)
+    -> DATAFORSEO_REQUEST_FAILED
+  - empty organic -> DATAFORSEO_EMPTY_SERP
+  - raw retention: full payload kept, ``status_code == 20000``
+  - cost: read from ``cost`` (task-level, top-level fallback), never
+    ``credits`` (audit M12)
   - retry policy: 429 retried then success; 401 -> DATAFORSEO_AUTH_FAILED
     with no retry; 500 x3 -> DATAFORSEO_REQUEST_FAILED
-  - health_check: unconfigured -> False, auth failure -> False, ok -> True
+  - health_check (audit M15): unconfigured -> False, HTTP 401 -> False,
+    HTTP 200 + business failure -> False, official success -> True
 """
 
 import base64
@@ -43,55 +65,168 @@ def _settings(**over) -> Settings:
     return Settings(**base, _env_file=None)
 
 
+def _organic_item(rank_group: int, idx: int) -> dict:
+    return {
+        "type": "organic",
+        "rank_group": rank_group,
+        "rank_absolute": rank_group + 4,
+        "page": 1,
+        "position": "left",
+        "domain": f"site{idx}.example.com",
+        "title": f"Title {rank_group}",
+        "url": f"https://site{idx}.example.com/article-{rank_group}",
+        "description": f"Snippet {rank_group}",
+    }
+
+
+def _paa_item() -> dict:
+    return {
+        "type": "people_also_ask",
+        "rank_group": 1,
+        "rank_absolute": 3,
+        "items": [
+            {
+                "type": "people_also_ask_element",
+                "title": "Why does no contact work?",
+                "seed_question": None,
+                "xpath": "/html/body[1]/div[3]",
+                "expanded_element": [
+                    {
+                        "type": "people_also_ask_expanded_element",
+                        "featured_title": None,
+                        "url": "https://paa.example.com/1",
+                        "domain": "paa.example.com",
+                        "title": "No Contact Explained",
+                        "description": "snippet",
+                    }
+                ],
+            },
+            # Second element: expanded by the AI overview variant, which has
+            # no ``url`` key — the parser must keep the question with a
+            # None source_url.
+            {
+                "type": "people_also_ask_element",
+                "title": "How long should you do no contact?",
+                "seed_question": None,
+                "expanded_element": [
+                    {
+                        "type": "people_also_ask_ai_overview_expanded_element",
+                        "items": [
+                            {"type": "ai_overview_element", "title": "AI note"}
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _related_item() -> dict:
+    return {
+        "type": "related_searches",
+        "rank_group": 1,
+        "rank_absolute": 8,
+        "items": ["no contact rules", "anxious attachment style"],
+    }
+
+
+def _featured_item() -> dict:
+    return {
+        "type": "featured_snippet",
+        "rank_group": 1,
+        "rank_absolute": 10,
+        "domain": "featured.example.com",
+        "title": "Featured snippet title",
+        "featured_title": None,
+        "description": "Featured snippet description",
+        "url": "https://featured.example.com/answer",
+    }
+
+
+def _noise_items() -> list[dict]:
+    """Non-organic SERP features, in the official mixed order (a carousel
+    item may even lead the list)."""
+    return [
+        {
+            "type": "carousel",
+            "rank_group": 1,
+            "rank_absolute": 3,
+            "items": [{"type": "carousel_element", "title": "Carousel"}],
+        },
+        {
+            "type": "paid",
+            "rank_group": 1,
+            "rank_absolute": 1,
+            "url": "https://paid.example.com",
+        },
+        {"type": "ai_overview", "rank_group": 1, "rank_absolute": 1},
+    ]
+
+
 def _serp_body(
     *,
     organic_count: int = 6,
+    organic_ranks: list[int] | None = None,
     with_paa: bool = True,
     with_related: bool = True,
     with_featured: bool = False,
+    with_noise: bool = True,
+    cost: float | None = 0.03,
+    top_cost: float | None = None,
 ) -> dict:
-    organic = [
-        {
-            "position": i,
-            "title": f"Title {i}",
-            "url": f"https://site{i}.example.com/article-{i}",
-            "domain": f"site{i}.example.com",
-            "description": f"Snippet {i}",
-        }
-        for i in range(1, organic_count + 1)
-    ]
-    result = {"organic": organic}
+    """A desensitized official envelope with ``organic_count`` organic items.
+
+    ``organic_ranks`` overrides the per-item ``rank_group`` values (use a
+    shuffled order to prove the parser sorts by ``rank_group``).
+    """
+    ranks = organic_ranks or list(range(1, organic_count + 1))
+    items = _noise_items() if with_noise else []
+    items.extend(
+        _organic_item(rank, idx) for idx, rank in enumerate(ranks, start=1)
+    )
     if with_paa:
-        result["people_also_ask"] = [
-            {
-                "questions": [
-                    {"question": "Why no contact works?", "url": "https://paa.example.com/1"},
-                    {"question": "How long is no contact?", "url": None},
-                ]
-            }
-        ]
+        items.append(_paa_item())
     if with_related:
-        result["related_searches"] = [
-            {"title": "no contact rules"},
-            {"title": "anxious attachment style"},
-        ]
+        items.append(_related_item())
     if with_featured:
-        result["featured_snippet"] = {
-            "position": 0,
-            "url": "https://featured.example.com",
-            "title": "Featured",
-        }
-    return {
-        "status_code": 200,
+        items.append(_featured_item())
+
+    task = {
+        "status_code": 20000,
         "status_message": "OK",
-        "tasks": [
+        "id": "task-1",
+        "path": "/v3/serp/google/organic/live/advanced",
+        "result_count": 1,
+        "time": "0.2",
+        "data": {},
+        "result": [
             {
-                "cost": 0.03,
-                "credits": 1,
-                "result": result,
+                "type": "organic",
+                "keyword": "anxious attachment no contact",
+                "item_types": sorted({i["type"] for i in items}),
+                "items_count": len(items),
+                "items": items,
             }
         ],
     }
+    if cost is not None:
+        task["cost"] = cost
+    # Deliberate red herring: the old parser read this field. The official
+    # cost field is ``cost`` (USD).
+    task["credits"] = 999
+
+    body: dict = {
+        "version": "2026-09-01",
+        "status_code": 20000,
+        "status_message": "OK",
+        "time": "0.3",
+        "tasks_count": 1,
+        "tasks_error": 0,
+        "tasks": [task],
+    }
+    if top_cost is not None:
+        body["cost"] = top_cost
+    return body
 
 
 def _provider(handler, **settings_over) -> DataForSEOSERPProvider:
@@ -187,51 +322,113 @@ async def test_search_happy_path():
     assert len(resp.organic_results) == 6
     assert [r.rank for r in resp.organic_results] == [1, 2, 3, 4, 5, 6]
     assert resp.organic_results[0].domain == "site1.example.com"
-    assert resp.paa_questions[0].question == "Why no contact works?"
+    assert resp.paa_questions[0].question == "Why does no contact work?"
     assert resp.paa_questions[0].source_url == "https://paa.example.com/1"
     assert resp.related_searches == ["no contact rules", "anxious attachment style"]
     # full raw payload kept for audit (spec 12.2)
-    assert resp.raw["status_code"] == 200
+    assert resp.raw["status_code"] == 20000
 
 
-async def test_search_ignores_non_organic_features():
-    # paid/video/shopping never reach organic (spec 12.1); only `organic`
-    # list is parsed, so nothing to filter — verify parser only reads it.
-    body = _serp_body()
-    body["tasks"][0]["result"]["paid"] = [
-        {"position": 1, "url": "https://paid.example.com"}
-    ]
-    p = _provider(lambda r: httpx.Response(200, json=body))
-    resp = await p.search(
-        SERPRequest(
-            keyword="k", location_code=2840, language_code="en"
+async def test_search_sorts_organic_by_rank_group_not_input_order():
+    # Provider item order is NOT rank order (official example: a carousel
+    # leads, organic sits at rank_group 26). Shuffled input must come out
+    # sorted by rank_group.
+    p = _provider(
+        lambda r: httpx.Response(
+            200, json=_serp_body(organic_ranks=[5, 1, 3, 2, 6, 4])
         )
     )
+    resp = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+    assert [r.rank for r in resp.organic_results] == [1, 2, 3, 4, 5, 6]
+    # rank 2 item is the one at index 1 in the shuffled input
+    assert resp.organic_results[0].url == "https://site2.example.com/article-1"
+
+
+async def test_search_mixed_item_types_only_organic_collected():
+    # paid/video/carousel/ai_overview never reach organic (spec 12.1) even
+    # though they live in the SAME flat items[] list as organic results.
+    body = _serp_body(with_noise=True, organic_count=2, with_paa=False,
+                      with_related=False)
+    p = _provider(lambda r: httpx.Response(200, json=body))
+    resp = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+    assert len(resp.organic_results) == 2
     assert all("paid" not in r.url for r in resp.organic_results)
+    assert all("carousel" not in r.url for r in resp.organic_results)
+
+
+async def test_search_featured_snippet_parsed():
+    p = _provider(
+        lambda r: httpx.Response(200, json=_serp_body(with_featured=True))
+    )
+    resp = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+    assert resp.featured_snippet is not None
+    assert resp.featured_snippet.title == "Featured snippet title"
+    assert resp.featured_snippet.url == "https://featured.example.com/answer"
+    assert resp.featured_snippet.snippet == "Featured snippet description"
+    assert resp.featured_snippet.domain == "featured.example.com"
+
+
+async def test_search_no_featured_when_absent():
+    p = _provider(lambda r: httpx.Response(200, json=_serp_body()))
+    resp = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+    assert resp.featured_snippet is None
+
+
+async def test_search_paa_expanded_without_url_yields_none_source():
+    # The AI-overview expanded element variant has no ``url`` key — the
+    # question must survive with a None source_url (defensive parse).
+    p = _provider(lambda r: httpx.Response(200, json=_serp_body()))
+    resp = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+    second = resp.paa_questions[1]
+    assert second.question == "How long should you do no contact?"
+    assert second.source_url is None
 
 
 async def test_search_empty_organic_raises():
-    p = _provider(lambda r: httpx.Response(200, json=_serp_body(organic_count=0)))
+    p = _provider(
+        lambda r: httpx.Response(
+            200, json=_serp_body(organic_count=0, with_paa=False,
+                                 with_related=False)
+        )
+    )
     with pytest.raises(PipelineError) as exc:
         await p.search(SERPRequest(keyword="k", location_code=2840, language_code="en"))
     assert exc.value.error_code == ErrorCode.DATAFORSEO_EMPTY_SERP
 
 
-async def test_task_level_error_result_raises_empty_serp():
-    body = {
-        "status_code": 200,
-        "tasks": [
-            {
-                "cost": 0,
-                "credits": 0,
-                "result": {"code": 401, "message": "invalid credentials"},
-            }
-        ],
-    }
+async def test_task_failure_result_null_raises_request_failed():
+    # Task-level failure in the official envelope: task status_code !=
+    # 20000 and result null (a task error, not an empty SERP).
+    body = _serp_body(organic_count=1)
+    body["tasks"][0]["status_code"] = 40101
+    body["tasks"][0]["status_message"] = "invalid credentials"
+    body["tasks"][0]["result"] = None
     p = _provider(lambda r: httpx.Response(200, json=body))
     with pytest.raises(PipelineError) as exc:
         await p.search(SERPRequest(keyword="k", location_code=2840, language_code="en"))
-    assert exc.value.error_code == ErrorCode.DATAFORSEO_EMPTY_SERP
+    assert exc.value.error_code == ErrorCode.DATAFORSEO_REQUEST_FAILED
+
+
+async def test_http_200_business_failure_raises_request_failed():
+    # DataForSEO always returns HTTP 200; the business outcome is the
+    # top-level status_code. 40101 = invalid credentials (audit M15).
+    body = _serp_body(organic_count=1)
+    body["status_code"] = 40101
+    body["status_message"] = "invalid credentials"
+    p = _provider(lambda r: httpx.Response(200, json=body))
+    with pytest.raises(PipelineError) as exc:
+        await p.search(SERPRequest(keyword="k", location_code=2840, language_code="en"))
+    assert exc.value.error_code == ErrorCode.DATAFORSEO_REQUEST_FAILED
 
 
 async def test_http_status_not_200_raises_request_failed():
@@ -241,6 +438,38 @@ async def test_http_status_not_200_raises_request_failed():
     with pytest.raises(PipelineError) as exc:
         await p.search(SERPRequest(keyword="k", location_code=2840, language_code="en"))
     assert exc.value.error_code == ErrorCode.DATAFORSEO_REQUEST_FAILED
+
+
+# ------------------------------------------------------------
+# cost (audit M12: official field is ``cost`` USD, never ``credits``)
+# ------------------------------------------------------------
+async def test_cost_read_from_cost_field_not_credits():
+    # The fixture carries credits=999 on purpose; the parser must ignore it.
+    p = _provider(
+        lambda r: httpx.Response(200, json=_serp_body(cost=0.12, top_cost=None))
+    )
+    resp = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+    assert resp.provider_cost == pytest.approx(0.12)
+
+
+async def test_cost_falls_back_to_top_level_cost():
+    body = _serp_body(cost=None, top_cost=0.05)
+    p = _provider(lambda r: httpx.Response(200, json=body))
+    resp = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+    assert resp.provider_cost == pytest.approx(0.05)
+
+
+async def test_cost_none_when_absent():
+    body = _serp_body(cost=None, top_cost=None)
+    p = _provider(lambda r: httpx.Response(200, json=body))
+    resp = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+    assert resp.provider_cost is None
 
 
 # ------------------------------------------------------------
@@ -292,7 +521,7 @@ async def test_500_exhaustion_raises_request_failed():
 
 
 # ------------------------------------------------------------
-# health_check
+# health_check (audit M15)
 # ------------------------------------------------------------
 async def test_health_check_unconfigured_false():
     p = DataForSEOSERPProvider(
@@ -304,8 +533,17 @@ async def test_health_check_unconfigured_false():
     assert await p.health_check() is False
 
 
-async def test_health_check_auth_failure_false():
+async def test_health_check_http_401_false():
     p = _provider(lambda r: httpx.Response(401, text="bad"))
+    assert await p.health_check() is False
+
+
+async def test_health_check_http_200_business_failure_false():
+    # HTTP 200 + business auth failure must NOT read as Connected.
+    body = _serp_body(organic_count=1)
+    body["status_code"] = 40101
+    body["status_message"] = "invalid credentials"
+    p = _provider(lambda r: httpx.Response(200, json=body))
     assert await p.health_check() is False
 
 

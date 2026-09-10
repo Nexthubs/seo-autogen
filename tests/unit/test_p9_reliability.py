@@ -478,6 +478,72 @@ class TestTavilyExtractor:
         assert exc.value.error_code.value == "EXTRACTOR_FAILED"
         assert calls["n"] == 3  # 429/5xx retried up to 3 attempts
 
+    # ----------------------------------------------------------
+    # health_check (audit M15): requires a business success, not just
+    # "HTTP < 500" — a bad key (401/403) or a malformed 200 body is
+    # never reported as Connected.
+    # ----------------------------------------------------------
+    def _health_settings(self, **over):
+        s = _settings()
+        s.tavily_api_key = "tv-key"
+        for k, v in over.items():
+            setattr(s, k, v)
+        return s
+
+    def test_health_unconfigured_false(self):
+        client = _mock_client(
+            lambda r: httpx.Response(200, json={"results": [], "failed_results": []})
+        )
+        ext = _tavily(client, settings=_settings())  # no tavily_api_key
+        import asyncio
+        assert asyncio.run(ext.health_check()) is False
+
+    def test_health_401_false(self):
+        client = _mock_client(lambda r: httpx.Response(401, json={"error": "bad key"}))
+        ext = _tavily(client, settings=self._health_settings())
+        import asyncio
+        assert asyncio.run(ext.health_check()) is False
+
+    def test_health_403_false(self):
+        client = _mock_client(lambda r: httpx.Response(403, json={"error": "forbidden"}))
+        ext = _tavily(client, settings=self._health_settings())
+        import asyncio
+        assert asyncio.run(ext.health_check()) is False
+
+    def test_health_200_malformed_body_false(self):
+        client = _mock_client(lambda r: httpx.Response(200, json={"unexpected": True}))
+        ext = _tavily(client, settings=self._health_settings())
+        import asyncio
+        assert asyncio.run(ext.health_check()) is False
+
+    def test_health_200_results_not_list_false(self):
+        client = _mock_client(
+            lambda r: httpx.Response(200, json={"results": {}, "failed_results": []})
+        )
+        ext = _tavily(client, settings=self._health_settings())
+        import asyncio
+        assert asyncio.run(ext.health_check()) is False
+
+    def test_health_200_shape_true(self):
+        client = _mock_client(
+            lambda r: httpx.Response(
+                200,
+                json={"results": [{"url": "u", "raw_content": "c"}], "failed_results": []},
+            )
+        )
+        ext = _tavily(client, settings=self._health_settings())
+        import asyncio
+        assert asyncio.run(ext.health_check()) is True
+
+    def test_health_transport_error_false(self):
+        def handler(request):
+            raise httpx.ConnectError("boom")
+
+        client = _mock_client(handler)
+        ext = _tavily(client, settings=self._health_settings())
+        import asyncio
+        assert asyncio.run(ext.health_check()) is False
+
 
 class TestFallingBackExtractor:
     def test_fallback_fills_missing_urls(self):
