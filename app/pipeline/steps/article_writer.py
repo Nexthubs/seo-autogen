@@ -18,6 +18,7 @@ import re
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.pipeline.steps._article_common import (
@@ -153,7 +154,8 @@ async def run_article_writer(
             ctx["markers"],
         ),
         response_model=ArticleDraftOutput,
-        temperature=0.7,
+        # M08: tunable via .env (LLM_TEMPERATURE_WRITING), not hardcoded.
+        temperature=get_settings().llm_temperature_writing,
     )
 
     doc = build_article_document(

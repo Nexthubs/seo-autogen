@@ -88,6 +88,7 @@ class FakeLLM:
             {
                 "system": body["messages"][0]["content"],
                 "user": body["messages"][1]["content"],
+                "temperature": body.get("temperature"),
             }
         )
         return _chat_ok(self.payloads.pop(0))
@@ -510,3 +511,42 @@ async def test_reviser_requires_draft(db, job):
         await run_article_reviser(db, job, llm)
     assert ei.value.error_code is ErrorCode.ARTICLE_VALIDATION_FAILED
     await llm.aclose()
+
+
+# ============================================================
+# M08: writer/reviser/reviewer temperatures come from Settings
+# ============================================================
+async def test_m08_temperatures_come_from_settings(db, job, monkeypatch):
+    """M08: .env temperature tuning must reach the wire (was hardcoded).
+
+    ``get_settings()`` is lru_cached — patch the instance the steps read,
+    then assert the provider puts each value in the real request body.
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_temperature_writing", 0.11)
+    monkeypatch.setattr(settings, "llm_temperature_review", 0.22)
+    monkeypatch.setattr(settings, "llm_temperature_revision", 0.33)
+
+    # writer → LLM_TEMPERATURE_WRITING
+    llm = await _run_writer(db, job)
+    await llm.aclose()
+    assert llm.calls[0]["temperature"] == 0.11
+
+    # three reviewers → LLM_TEMPERATURE_REVIEW
+    for run, payload in (
+        (run_seo_review, SEO_REVIEW),
+        (run_fact_review, FACT_REVIEW),
+        (run_style_review, STYLE_REVIEW),
+    ):
+        llm = FakeLLM([json.dumps(payload)])
+        await run(db, job, llm, guideline_excerpt="G")
+        await llm.aclose()
+        assert llm.calls[0]["temperature"] == 0.22
+
+    # reviser → LLM_TEMPERATURE_REVISION
+    llm = FakeLLM([json.dumps(REVISER_DRAFT)])
+    await run_article_reviser(db, job, llm)
+    await llm.aclose()
+    assert llm.calls[0]["temperature"] == 0.33

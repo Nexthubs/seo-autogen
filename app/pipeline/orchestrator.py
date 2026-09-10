@@ -202,7 +202,14 @@ async def _run_steps(
         ),
         (
             "evidence_research",
-            (lambda: run_evidence_research(session, job, llm)),
+            # H09: verify each evidence note's source via the independent
+            # extractor channel; unverifiable sources are downgraded so the
+            # writer can only lean on them cautiously.
+            (
+                lambda: run_evidence_research(
+                    session, job, llm, verifier=providers.extractor
+                )
+            ),
         ),
         (
             "content_brief",

@@ -31,6 +31,23 @@ logger = logging.getLogger(__name__)
 PROMPT_NAME = "content_brief"
 
 
+#: Meaning of each accepted strategy (app.schemas.job.STRATEGY_*), told to
+#: the LLM so ``article_strategy`` follows the job's chosen angle (M08).
+STRATEGY_MEANINGS = {
+    "auto": "choose the angle the SERP synthesis says wins best",
+    "high_volume": "compete for the high-volume head term; match intent, "
+    "beat the current top results on depth and structure",
+    "low_kd": "target a lower-competition angle that still serves the "
+    "keyword; rank realistically, do not overpromise",
+    "high_cpc": "emphasize commercial value and conversion paths; the "
+    "reader is close to a decision or purchase",
+    "long_tail": "answer a specific long-tail question directly and "
+    "completely; win on precision, not breadth",
+    "pillar": "write a comprehensive pillar page; link outward with the "
+    "allowed markers, cover the topic space end to end",
+}
+
+
 def build_user_prompt(
     keyword: str,
     metrics: dict | None,
@@ -38,9 +55,14 @@ def build_user_prompt(
     evidence: list[dict],
     allowed_markers: list[str],
     target_function: str | None,
+    strategy: str | None = None,
 ) -> str:
     """Assemble the brief user prompt (section 50)."""
     parts = [f"Target keyword: {keyword}"]
+    # M08: the job's strategy must reach the brief (it was previously
+    # dropped — the LLM invented an angle without it).
+    parts.append(f"Content strategy: {strategy or 'auto'} — "
+                 f"{STRATEGY_MEANINGS.get(strategy or 'auto', STRATEGY_MEANINGS['auto'])}")
     if metrics:
         parts.append(f"Dataset metrics: {json.dumps(metrics, ensure_ascii=False)}")
     else:
@@ -119,6 +141,7 @@ async def run_content_brief(
             evidence,
             allowed_markers,
             job.target_function,
+            strategy=job.strategy,
         ),
         response_model=ContentBrief,
     )

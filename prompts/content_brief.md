@@ -34,6 +34,8 @@ no commentary) with exactly these fields:
 }
 
 Rules:
+- "article_strategy" must follow the "Content strategy:" line in the
+  input; do not ignore the chosen strategy angle.
 - "internal_link_markers" may contain ONLY markers from the allowed list
   in the input; an empty list is fine.
 - "required_topics" must cover the synthesis "missing_topics" and

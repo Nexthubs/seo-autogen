@@ -5,6 +5,7 @@ Hard rule: ``body_markdown`` never contains an H1. The article title is
 the single H1, rendered by the frontend from ``Blog.title``.
 """
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -12,6 +13,13 @@ from pydantic import BaseModel, Field, field_validator
 #: Max keywords for Strapi seoKeywords field (spec section 6.8).
 SEO_KEYWORDS_MAX_COUNT = 12
 SEO_KEYWORDS_MAX_CHARS = 500
+
+#: Setext H1: a non-blank text line followed by an ``=`` underline (a
+#: ``-`` underline is a Setext *H2*, not an H1 — matching only ``=`` keeps
+#: horizontal rules and H2 underlines out of it).
+_SETEXT_H1 = re.compile(
+    r"(?m)^[^\n`#*\s][^\n]*[^\n`\s]\n[ \t]*={2,}[ \t]*\r?$"
+)
 
 
 class ArticleDocument(BaseModel):
@@ -41,6 +49,11 @@ class ArticleDocument(BaseModel):
                     "body_markdown must not contain an H1; "
                     "the title is the only H1 (spec section 5)"
                 )
+        if _SETEXT_H1.search(value):
+            raise ValueError(
+                "body_markdown must not contain a Setext H1 (= underline); "
+                "the title is the only H1 (spec section 5)"
+            )
         return value
 
     @field_validator("slug")

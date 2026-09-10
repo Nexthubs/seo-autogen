@@ -219,55 +219,89 @@ class TestCheckpoints:
         assert not checkpoints.step_done(db, job, "image_generate")
         assert checkpoints.first_incomplete_step(db, job) == 15
 
-    def test_reset_writer_invalidates_downstream_keeps_earlier(self, db):
+    def test_reset_writer_keeps_version_history_deletes_images(self, db):
         job = _make_job(db)
         _seed_full_chain(db, job)
         assert checkpoints.step_done(db, job, "article_writer")
         assert checkpoints.step_done(db, job, "article_reviser")
 
-        # retry step 9 (article_writer): writer + revision + reviews + images
-        # are deleted, but the SERP run, sources, competitor analyses and
-        # keyword flag survive.
+        # H11: a writer retry (step 9) does NOT delete the immutable article
+        # history (writer v1 + revision v2 + the 3 reviews are kept) — it only
+        # drops the re-runnable per-run artifacts: the image rows.
         removed = checkpoints.reset_from_step(db, job, 9)
         db.commit()
         assert removed == 15 - 9 + 1
-        assert not checkpoints.step_done(db, job, "article_writer")
-        assert not checkpoints.step_done(db, job, "article_reviser")
-        # earlier steps preserved
+        versions = [
+            v.version
+            for v in db.scalars(
+                select(ArticleVersionRow)
+                .where(ArticleVersionRow.job_id == job.id)
+                .order_by(ArticleVersionRow.version)
+            ).all()
+        ]
+        assert versions == [1, 2]
+        assert db.scalar(
+            select(ArticleReviewRow).where(
+                ArticleReviewRow.job_id == job.id,
+                ArticleReviewRow.review_type == "seo",
+            )
+        ) is not None
+        assert db.scalar(select(ImageRow).where(ImageRow.job_id == job.id)) is None
+        # earlier (pre-article) steps preserved
         assert checkpoints.step_done(db, job, "keyword_prepare")
         assert checkpoints.step_done(db, job, "serp_search")
         assert checkpoints.step_done(db, job, "source_extract")
         assert checkpoints.step_done(db, job, "competitor_analysis")
-        assert db.scalar(select(ArticleVersionRow).where(ArticleVersionRow.job_id == job.id)) is None
-        assert db.scalar(select(ImageRow).where(ImageRow.job_id == job.id)) is None
-        assert checkpoints.first_incomplete_step(db, job) == 9
+        # writer + reviser still read done (the kept rows satisfy the
+        # derived-current predicates); images gone -> image_plan (14) is the
+        # first incomplete checkpoint.
+        assert checkpoints.step_done(db, job, "article_writer")
+        assert checkpoints.step_done(db, job, "article_reviser")
+        assert checkpoints.first_incomplete_step(db, job) == 14
 
-    def test_reset_review_keeps_writer(self, db):
+    def test_reset_review_keeps_version_history(self, db):
         job = _make_job(db)
         writer = _seed_full_chain(db, job)
         writer_id = writer.id
-        # retry step 10 (seo_review): only the revision-stage version and
-        # its own reviews are invalidated; the writer draft and the writer's
-        # other reviews survive (a re-run keeps them).
+        # H11: a review re-run (step 10) keeps the immutable article history
+        # (writer draft + revision + the writer's reviews all survive); only
+        # the re-runnable per-run artifacts (image rows) are dropped.
         removed = checkpoints.reset_from_step(db, job, 10)
         db.commit()
         assert removed == 15 - 10 + 1
-        assert checkpoints.step_done(db, job, "article_writer")  # writer kept
-        assert not checkpoints.step_done(db, job, "article_reviser")  # revision gone
+        assert checkpoints.step_done(db, job, "article_writer")
+        assert checkpoints.step_done(db, job, "article_reviser")  # v2 > v1 kept
         # the writer draft survives with its id intact
         writer_after = db.get(ArticleVersionRow, writer_id)
         assert writer_after is not None
         assert writer_after.stage == "writer"
-        # the writer's reviews (attached to the writer version) survive, so
-        # steps 10-12 still read done; only the revision (step 13) was
-        # invalidated -> the first incomplete checkpoint is 13.
+        # the writer's reviews (attached to the writer version) survive
         assert db.scalar(
             select(ArticleReviewRow).where(
                 ArticleReviewRow.article_version_id == writer_after.id,
                 ArticleReviewRow.review_type == "seo",
             )
         ) is not None
-        assert checkpoints.first_incomplete_step(db, job) == 13
+        # images dropped -> image_plan (14) is the first incomplete checkpoint
+        assert checkpoints.first_incomplete_step(db, job) == 14
+
+    def test_new_writer_draft_invalidates_stale_revision(self, db):
+        job = _make_job(db)
+        _seed_full_chain(db, job)
+        assert checkpoints.step_done(db, job, "article_reviser")
+
+        # H11: simulate the writer re-run appending a NEW draft (v3). The
+        # current draft is now v3, so the stale revision (v2, older than the
+        # current draft) no longer marks the reviser done, and the fresh
+        # draft has no reviews yet -> resume must re-run reviews + reviser.
+        db.add(ArticleVersionRow(
+            job_id=job.id, version=3, stage="writer", title="T3",
+            body_markdown="b3", seo_title="s3", meta_description="m3", slug="sl3"))
+        db.commit()
+        assert checkpoints.step_done(db, job, "article_writer")
+        assert not checkpoints.step_done(db, job, "article_reviser")  # v2 < v3
+        assert not checkpoints.step_done(db, job, "seo_review")  # no reviews on v3
+        assert checkpoints.first_incomplete_step(db, job) == 10
 
     def test_reset_invalid_index(self, db):
         job = _make_job(db)

@@ -24,7 +24,7 @@
 | B1 | P0 / P1 | M04, H08, L02, M09, M11 | ✅ 完成（见下） |
 | B2 | P2 | H01, H02, M15 | ✅ 完成（见下） |
 | B3 | P3 | H04, M05 | ✅ 完成（见下） |
-| B4 | P4 / P5 | H09, H06, H07, H11, M08 | ⏳ 待办 |
+| B4 | P4 / P5 | H09, H06, H07, H11, M08 | ✅ 完成（见下） |
 | B5 | P6 | H05, H10, M06, M07, L01 | ⏳ 待办 |
 | B6 | P7 | H03, M01, M02 | ⏳ 待办 |
 | B7 | P8 / P9 + 文档 | M13, M14, M12, M10, M03, H12, L03 | ⏳ 待办 |
@@ -74,15 +74,17 @@
 
 **B3 测试结果**：`453 passed, 1 skipped`（B2 后 448 + 新增 5：H04 全链路回归 ×1、M05 unit ×3、M05 PG 集成 ×1）。**无需新迁移**（无 schema 变更）。
 
-### B4 — P4 / P5（⏳）
+### B4 — P4 / P5 ✅
 
-| ID | 级别 | 问题摘要 | 计划 | 状态 |
-|---|---|---|---|---|
-| H09 | High | evidence 来源全部由同一 LLM 自述，无真实性核查 | 独立可审计的来源核实（Exa/搜索存在性检查）；无证据时降级为谨慎非事实陈述 | ⏳ |
-| H06 | High | DoD gate 形同虚设（FAQ/CTA 只查标题、无 Setext H1、图片不查文件、畸形 marker 放过） | Markdown 解析结构检查 + 关联研究/审核/图片完整性；负向 fixture | ⏳ |
-| H07 | High | 最终导出与 Strapi 同步未解析内链 marker | 共享 final renderer：先内链后图片；断言无残留 marker | ⏳ |
-| H11 | High | retry 删除全部 article_versions，文章历史不可追溯 | 区分当前 checkpoint 与不可变历史（run/attempt/current-version 关联）；重试后旧版本保留、新版本递增 | ⏳ |
-| M08 | Med | `job.strategy` 未进入 Brief prompt；writing/review 温度硬编码，`.env` 调参无效 | 贯通 strategy 与 Settings 温度到各步骤；unsupported 输入限制/说明 | ⏳ |
+| ID | 级别 | 问题摘要 | 修复内容 | 关键文件 | 测试证据 | 状态 |
+|---|---|---|---|---|---|---|
+| H09 | High | evidence 来源全部由同一 LLM 自述，无真实性核查，引用可能指向不存在的"研究" | 新增独立核实通道 `verify_evidence_sources()`：每条 note 的 `source_url` 由**内容提取器**（非产出 note 的同一 LLM）抓取；抓取失败/异常/空正文 → 副本降级 `confidence="low"` + `usage="avoid"` 并追加 `source_unverified:` 标记；重跑时整组替换（delete+reinsert）；无 verifier（focused unit）则原样通过。orchestrator 将配置的 extractor 注入 `run_evidence_research(verifier=...)`；日志新增 `downgraded_unverifiable_sources` | `app/services/evidence_verification.py`（新增）、`app/pipeline/steps/evidence_research.py`、`app/pipeline/orchestrator.py` | `tests/unit/test_research_steps.py` 新增 6 用例（无 verifier 原样 / 可达源保留 / 不可达降级 / 空正文降级 / 抓取异常降级 / brief 带 strategy）；`tests/integration/test_p9_pipeline.py`：全链路与 retry 断言计入证据核实调用（冷缓存 `TOP_N+1` 次抽取、缓存命中重跑仅 `[[EVIDENCE_SOURCE_URL]]`、强制刷新 `TOP_N+1` 且 URL 集合含证据源） | ✅ |
+| H06 | High | DoD gate 形同虚设：FAQ/CTA 只查标题存在、Setext H1 不识别、图片不查文件是否存在、畸形/小写 marker 放过、无研究/审核行完整性 | `validate_article_done` 重写为基于 Markdown 结构解析的完整性门禁（仍为只读）：① 正文必须含 ATX 或 **Setext** 形式 H1（`_H1_PATTERN` + 下划线分隔行识别，排除 H2 误判）；② FAQ 段逐题计数且空答案不计、CTA slot 段必须有正文；③ 图片 plan 逐条核对 `local_path` 非空且文件存在；④ marker 大小写不敏感扫描（`_INTERNAL_LINK_ANY`）——未知/非激活内链、小写 `[[internal_link:x]]`、小写前缀一律 fail；⑤ 关联完整性：每源竞品分析、研究行（synthesis/brief/outline 非空且不损坏）、当前 writer 草稿的 3 份 review + 终稿 anticopy（serious overlap 亦 fail）、SERP run 存在、source 去重/上限、图片数量；⑥ **H11 新门禁**：最新版本必须 `stage == "revision"`（writer 重跑后 reviser 未重跑 → 裸草稿不再静默放行）。`article_field_failures` 负向 fixture 化（参数化 mutate + needle 断言错误信息） | `app/services/article_dod.py`、`app/schemas/article.py` | `tests/unit/test_article_dod.py` 大幅扩展（合规 job 过门、只读断言、字段级负向参数化、缺 review/anticopy/overlap、未知与小写 marker、缺 SERP、重复源、源上限、坏 outline/outline 空、坏 brief、Setext H1、H2 下划线不误判、FAQ 题数/空答案、CTA 空段、图片路径缺失/None、缺竞品分析、无版本） | ✅ |
+| H07 | High | 最终导出（article.md）与 Strapi 同步只解析 `[[IMAGE:N]]`，writer 的 `[[INTERNAL_LINK:X]]` 原始 marker 被静默写入导出与 Draft | 新增共享终稿渲染器 `render_final_body()`：先解析内链（`resolve_markers`）再解析图片（`resolve_image_markers`），任一残留 marker 一律抛 `PipelineError`（DoD 应已拦截，到达此处即契约违例，必须响亮失败）；本地导出（`image_generate` 末步）与 `strapi_sync` 两条终稿路径统一改走该渲染器 | `app/services/final_body.py`（新增）、`app/pipeline/steps/image_generate.py`、`app/pipeline/steps/strapi_sync.py` | `tests/unit/test_image_steps.py` 新增 2 用例（导出解析内链 marker / 未知内链 marker 抛错）；`tests/unit/test_strapi_sync_step.py` 新增 2 用例（sync body 解析内链 / 未知 marker 失败）；DoD 侧 `test_unknown_internal_link_marker_fails`、`test_lowercase_internal_link_marker_fails` 兜底 | ✅ |
+| H11 | High | retry 删除全部 article_versions/reviews，文章历史不可追溯；且"当前版本"靠删除来隐式表达 | **不可变 append-only 历史**（spec §27/§28/46.13–46.14）：① `checkpoints.reset_from_step` 与 `routes/jobs._reset_artifacts` **不再删除** versions/reviews，只删可重跑的 per-run 产物（SERP/来源/研究/outline/图片/LLM usage）；② "当前有效"**派生**而非删除：新增 `latest_writer_version()`（最新 `stage="writer"`）——reviewer/reviser 改评审/修订**当前 writer 草稿**而非全局最新版本；③ reviser `step_done` 新谓词：存在 `version >` 当前 writer 版本号的 revision（writer 重试追加 v3 后，stale revision v2 不再算完成，resume 自动重跑 10→13）；reviewer `step_done` 仍按 writer 草稿挂行（旧草稿的 review 属历史，不计）；④ DoD 新门禁：最新版本必须 `stage="revision"`。无效化时机=**新 writer 版本追加时**（非 reset 时）。无需迁移（无 attempt 列/无 schema 变更） | `app/pipeline/checkpoints.py`、`app/pipeline/steps/_article_common.py`、`app/pipeline/steps/reviewers.py`、`app/pipeline/steps/article_reviser.py`、`app/routes/jobs.py`、`app/services/article_dod.py` | `tests/unit/test_p9_reliability.py::TestCheckpoints` 重写/新增 3 用例：reset(9) 保留 v1+v2+review 仅删图片（first_incomplete=14）、reset(10) 保留全部版本历史、**新 writer 草稿 v3 使 stale revision 失效**（reviser/reviewer 转未完成，first_incomplete=10）；既有全链路/断点续跑断言（versions `[1,2]`、stages、review 超集）无需改动即通过 | ✅ |
+| M08 | Med | `job.strategy` 未进入 Brief prompt（LLM 自造角度）；writing/review 温度硬编码，`.env` 调参无效 | ① `content_brief.build_user_prompt` 新增 `strategy` 参数并附 `STRATEGY_MEANINGS` 释义（auto/high_volume/low_kd/high_cpc/long_tail/pillar 六种策略语义入 prompt），`run_content_brief` 传 `job.strategy`；② 温度全部改读 Settings：writer `llm_temperature_writing`、reviser 新增 `llm_temperature_revision=0.50`（原硬编码 0.5）、image_plan 新增 `llm_temperature_image_planning=0.30`；review 各步沿用 `llm_temperature_review` | `app/core/config.py`、`app/pipeline/steps/content_brief.py`、`app/pipeline/steps/article_writer.py`、`app/pipeline/steps/article_reviser.py`、`app/pipeline/steps/image_plan.py`、`prompts/content_brief.md`（strategy 字段说明） | `tests/unit/test_article_steps.py::test_m08_temperatures_come_from_settings`（monkeypatch Settings 后 writer/reviser/image_plan 各取各自温度）；`tests/unit/test_research_steps.py::test_content_brief_prompt_carries_job_strategy`（strategy 入 prompt 含语义） | ✅ |
+
+**B4 测试结果**：`478 passed, 1 skipped`（B3 后 453 + 新增 25：H09 ×6、H06 扩展、H07 ×4、H11 ×3、M08 ×2（含 image_plan 温度用例），含改写用例）。**无需新迁移**（H11 刻意不引入 attempt 列——当前版本由历史派生）。
 
 ### B5 — P6（⏳）
 
@@ -116,6 +118,12 @@
 
 ## 变更日志
 
+- **2026-09-17 — B4 完成**：H09 / H06 / H07 / H11 / M08 全部修复并测试（`478 passed, 1 skipped`，净增 25 用例）。**无新迁移**。
+  - **H09**：新增 `app/services/evidence_verification.py`——evidence note 的来源 URL 由独立提取器通道核实，不可达/空正文 → `usage="avoid"` + `confidence="low"` + `source_unverified:` 标记；orchestrator 注入 extractor，p9 集成测试的抽取调用计数同步计入该核实调用。
+  - **H06**：DoD gate 重写为 Markdown 结构解析完整性门禁（Setext H1、FAQ 逐题计数、CTA 正文、图片文件存在性、marker 大小写不敏感、研究/审核/竞品分析关联完整性、源去重与上限）；负向 fixture 参数化。
+  - **H07**：新增 `app/services/final_body.py::render_final_body`——内链→图片两级解析 + 残留 marker 响亮失败；本地导出与 Strapi 同步两条终稿路径统一走共享渲染器。
+  - **H11**：文章 versions/reviews 改为**不可变 append-only 历史**——reset/retry 不再删除，当前草稿由 `latest_writer_version()` 派生；reviser `step_done` = 存在更新于当前 writer 草稿的 revision；DoD 新增"最新版本必须为 revision 阶段"门禁（writer 重试后未重跑 reviser 不再静默放行裸草稿）。
+  - **M08**：`job.strategy`（含六种策略语义）贯通进 Brief prompt；writer/reviser/image_plan 温度改读 Settings（新增 `llm_temperature_revision` / `llm_temperature_image_planning`，`image_plan` 原硬编码 0.3 已改读 Settings）。
 - **2026-09-17 — B3 完成**：H04 / M05 全部修复并测试（`453 passed, 1 skipped`）。
   - **H04**：`prepare_keyword` 改 `async def`（orchestrator 统一 await，旧 sync 返回 `KeywordMetrics` 对已知词必 TypeError；未知词返回 None 侥幸通过）。新增 orchestrator 级已知词全链路回归（`test_p9_pipeline.py::test_known_keyword_full_run_reaches_ready`）。
   - **M05**：① 导入每 sheet 先 `casefold` 内存去重（后行覆盖 + warning），消除 `autoflush=False` 下重复新词 commit IntegrityError；② 全部关键词/簇名比较改 `lower()` 字面量精确匹配，`%`/`_` 不再当 LIKE 通配符。新增生产同款 `autoflush=False` session 测试 ×2、unit 字面量匹配 ×1、真实 PG 集成 ×1。

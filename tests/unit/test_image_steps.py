@@ -129,6 +129,7 @@ class FakeLLM:
             {
                 "system": body["messages"][0]["content"],
                 "user": body["messages"][1]["content"],
+                "temperature": body.get("temperature"),
             }
         )
         return httpx.Response(
@@ -319,6 +320,22 @@ async def test_planner_requires_article(db, tmp_path):
     assert excinfo.value.error_code == ErrorCode.IMAGE_PLAN_INVALID
 
 
+async def test_m08_image_planning_temperature_from_settings(db, tmp_path, monkeypatch):
+    """M08: the planner's temperature must come from Settings
+    (LLM_TEMPERATURE_IMAGE_PLANNING), not a hardcoded 0.3."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_temperature_image_planning", 0.44)
+
+    job = db.scalars(select(GenerationJob)).one()
+    _add_version(db, job, BODY_2201)
+    llm = FakeLLM([json.dumps(PLAN_HERO_ONLY)], _settings(tmp_path))
+    await run_image_planner(db, job, llm)
+    await llm.aclose()
+    assert llm.calls[0]["temperature"] == 0.44
+
+
 async def test_normalize_plan_rejects_empty():
     with pytest.raises(PipelineError) as excinfo:
         normalize_plan(ImagePlanOutput(total_count=0, images=[]), 3)
@@ -395,6 +412,89 @@ async def test_generation_markers_resolved_in_body(db, tmp_path):
     # Hero stays out of the body (default flag true).
     assert "images/hero.webp" not in article_md
     assert job.status == JobStatus.READY.value
+
+
+async def test_h07_export_resolves_internal_link_markers(db, tmp_path):
+    """H07: the local article.md export ships NO raw markers.
+
+    The Writer emits ``[[INTERNAL_LINK:X]]`` markers (section 21); the
+    final renderer must resolve them to markdown links BEFORE the export
+    (image markers are inserted on top, after link resolution).
+    """
+    from app.schemas.internal_link import InternalLinkRule as _Rule
+    from app.services.internal_link_service import upsert_rule
+
+    job = db.scalars(select(GenerationJob)).one()
+    upsert_rule(
+        db,
+        _Rule(
+            marker="ATTACHMENT_TEST",
+            anchor_text="attachment test",
+            target_url="https://example.com/attachment-test",
+        ),
+    )
+    db.commit()
+    body = (
+        "## What is anxious attachment\n\n"
+        + "Take the "
+        + "[[INTERNAL_LINK:ATTACHMENT_TEST]] "
+        + "before you reach out. " * 350
+    )
+    _add_version(db, job, body)
+    settings = _settings(tmp_path)
+    llm = FakeLLM([json.dumps(PLAN_THREE)], settings)
+    await run_image_planner(db, job, llm)
+    await llm.aclose()
+    await run_image_generation(db, job, FakeImageProvider(settings), settings=settings)
+
+    article_md = (tmp_path / "articles" / str(job.id) / "article.md").read_text()
+    # internal link resolved to a real markdown link
+    assert "[attachment test](https://example.com/attachment-test)" in article_md
+    # NO residual marker of either kind
+    assert "[[INTERNAL_LINK:" not in article_md
+    assert "[[IMAGE:" not in article_md
+    # images still resolved
+    assert "![Inline one alt](images/inline-1.webp)" in article_md
+    assert job.status == JobStatus.READY.value
+
+
+async def test_h07_export_unknown_internal_link_marker_fails(db, tmp_path):
+    """H07: an unresolvable internal link marker is a pipeline error.
+
+    No raw marker may silently ship to article.md; the DoD gate is
+    supposed to catch these, so a marker that survives to the export
+    step is a contract violation and must fail loudly.
+    """
+    from app.schemas.internal_link import InternalLinkRule as _Rule
+    from app.services.internal_link_service import upsert_rule
+
+    job = db.scalars(select(GenerationJob)).one()
+    upsert_rule(
+        db,
+        _Rule(
+            marker="ATTACHMENT_TEST",
+            anchor_text="attachment test",
+            target_url="https://example.com/attachment-test",
+        ),
+    )
+    body = (
+        "## What is anxious attachment\n\n"
+        + "A "
+        + "[[INTERNAL_LINK:GHOST_MARKER]] "
+        + "that does not exist in the rules. " * 350
+    )
+    _add_version(db, job, body)
+    settings = _settings(tmp_path)
+    llm = FakeLLM([json.dumps(PLAN_THREE)], settings)
+    await run_image_planner(db, job, llm)
+    await llm.aclose()
+
+    with pytest.raises(PipelineError) as excinfo:
+        await run_image_generation(db, job, FakeImageProvider(settings), settings=settings)
+    assert excinfo.value.error_code == ErrorCode.ARTICLE_VALIDATION_FAILED
+    # the job STAYS at image_generating — the export was NOT written
+    assert job.status == JobStatus.IMAGE_GENERATING.value
+    assert not (tmp_path / "articles" / str(job.id) / "article.md").exists()
 
 
 async def test_generation_failure_keeps_image_generating(db, tmp_path):

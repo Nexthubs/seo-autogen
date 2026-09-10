@@ -31,10 +31,38 @@ MAX_GUIDELINE_CHARS = 24000
 def latest_article_version(
     session: Session, job: GenerationJob
 ) -> ArticleVersionRow | None:
-    """The highest-numbered article version for the job."""
+    """The highest-numbered article version for the job (any stage).
+
+    This is the FINAL / shipped version: after a complete run the highest
+    version is the ``revision`` stage. Use it for "what ships" consumers
+    (image planning, Strapi sync, DoD, the article API).
+    """
     return session.scalars(
         select(ArticleVersionRow)
         .where(ArticleVersionRow.job_id == job.id)
+        .order_by(ArticleVersionRow.version.desc())
+    ).first()
+
+
+def latest_writer_version(
+    session: Session, job: GenerationJob
+) -> ArticleVersionRow | None:
+    """The current writer draft: the highest ``stage="writer"`` version.
+
+    ``article_versions`` is immutable, append-only history (spec sections
+    27-28): a retry re-runs the writer and appends a NEW draft (v1, v3, ...)
+    rather than deleting the old one, and the old ``revision`` (v2) stays
+    behind. The "current valid" draft is therefore DERIVED as the newest
+    writer version — NOT the overall newest version, which after a retry may
+    be a stale revision. The reviewers and the reviser target this draft so
+    a stale revision can never shadow the new one.
+    """
+    return session.scalars(
+        select(ArticleVersionRow)
+        .where(
+            ArticleVersionRow.job_id == job.id,
+            ArticleVersionRow.stage == "writer",
+        )
         .order_by(ArticleVersionRow.version.desc())
     ).first()
 

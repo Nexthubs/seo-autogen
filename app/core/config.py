@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     llm_temperature_analysis: float = 0.25
     llm_temperature_writing: float = 0.70
     llm_temperature_review: float = 0.20
+    llm_temperature_revision: float = 0.50
+    llm_temperature_image_planning: float = 0.30
 
     # ======================================================
     # DATAFORSEO

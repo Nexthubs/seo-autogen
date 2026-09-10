@@ -78,6 +78,10 @@ FAST_BACKOFF = (0.001, 0.001, 0.001)
 PNG_1x1_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake-png-body" * 3
 TOP_N = 5
 ORGANIC_URLS = [f"https://p9test-site{i}.example.com/a{i}" for i in range(1, 9)]
+# H09: evidence_research (step 6) verifies its single note's source URL via the
+# independent extractor channel, adding exactly one extract() call to any run
+# that reaches step 6 (full runs and retry_step<=6; NOT retry_step=14).
+EVIDENCE_SOURCE_URL = "https://doi.org/10.1037/0022-3514.53.3.519"
 
 # ---- scripted payloads (one per LLM call, in pipeline order) -------------
 ANALYSIS_TMPL = {
@@ -744,8 +748,9 @@ async def test_plain_rerun_cache_hit_vs_forced_rerun(job, tmp_path):
         job_row = session.get(GenerationJob, job)
         result = await _full_run(session, job_row, providers, settings)
     assert result.status == JobStatus.READY.value
-    # Cold cache: all 5 sources were extracted (one extract([url]) per URL).
-    assert len(extractor.extract_calls) == TOP_N
+    # Cold cache: all 5 sources were extracted (one extract([url]) per URL),
+    # PLUS one evidence_research (step 6) verification of the note's source.
+    assert len(extractor.extract_calls) == TOP_N + 1
     # Count SourcePage rows directly (job-independent global cache table):
     # the 5 cache rows now back every later step-3 re-run.
     with SessionLocal() as session:
@@ -768,8 +773,10 @@ async def test_plain_rerun_cache_hit_vs_forced_rerun(job, tmp_path):
             session, job_row, providers2, settings=settings2, retry_step=3
         )
     assert result2.status == JobStatus.READY.value
-    # The whole point of the cache: a plain re-run re-fetches nothing.
-    assert extractor2.extract_calls == []
+    # The whole point of the cache: a plain re-run re-fetches no *source* page
+    # (step 3 hits the TTL cache). The only extract call is the H09
+    # evidence_research (step 6) verification of the note's source URL.
+    assert extractor2.extract_calls == [[EVIDENCE_SOURCE_URL]]
     assert len(llm2.calls) == 15
 
     # Run 3: the same re-run but with ``force_source_refresh=True``. The TTL
@@ -787,10 +794,11 @@ async def test_plain_rerun_cache_hit_vs_forced_rerun(job, tmp_path):
             force_source_refresh=True,
         )
     assert result3.status == JobStatus.READY.value
-    # Forced refresh re-extracts every top-5 source URL.
+    # Forced refresh re-extracts every top-5 source URL, plus the H09
+    # evidence_research (step 6) verification of the note's source URL.
     called_urls = {url for batch in extractor3.extract_calls for url in batch}
-    assert len(extractor3.extract_calls) == TOP_N
-    assert called_urls == set(ORGANIC_URLS[:TOP_N])
+    assert len(extractor3.extract_calls) == TOP_N + 1
+    assert called_urls == set(ORGANIC_URLS[:TOP_N]) | {EVIDENCE_SOURCE_URL}
     assert len(llm3.calls) == 15
 
 

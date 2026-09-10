@@ -36,7 +36,7 @@ from app.pipeline.steps._article_common import latest_article_version
 from app.providers.image.base import ImageProvider
 from app.schemas.images import ImageGenerationRequest
 from app.services.article_renderer import export_article
-from app.services.image_markers import insert_image_markers, resolve_image_markers
+from app.services.final_body import render_final_body
 
 logger = logging.getLogger(__name__)
 
@@ -116,16 +116,16 @@ async def run_image_generation(
         row.provider_cost = image.provider_cost
         session.commit()
 
-    # Marker body (section 33): internal markers around inline images.
+    # Marker body (sections 21 + 33, H07): the SHARED final renderer
+    # resolves internal link markers FIRST, then image markers, then
+    # asserts no residual marker ships to the local export.
     placements = [
         (row.insertion_marker, row.section_heading)
         for row in planned
         if row.role == ImageRole.INLINE.value and row.insertion_marker
     ]
-    marked_body = insert_image_markers(version.body_markdown, placements)
-
-    # Resolve markers with LOCAL image references (P6). P7 replaces the
-    # src with the Strapi media URL before sync (section 33).
+    # Resolve image markers with LOCAL references (P6). P7 (Strapi sync)
+    # re-renders through the SAME renderer with the Strapi media URLs.
     hero = next(r for r in planned if r.role == ImageRole.HERO.value)
     images_map = {
         row.insertion_marker: (row.alt_text, f"images/{row.filename}")
@@ -135,8 +135,12 @@ async def run_image_generation(
     include_hero = None
     if not settings.strapi_frontend_renders_main_image:
         include_hero = (hero.alt_text, f"images/{hero.filename}")
-    final_body = resolve_image_markers(
-        marked_body, images_map, include_hero=include_hero
+    final_body = render_final_body(
+        session,
+        version.body_markdown,
+        images=images_map,
+        placements=placements,
+        include_hero=include_hero,
     )
 
     # Local export (sections 5.1, 34): article.md + article.json.

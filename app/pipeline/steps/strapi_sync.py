@@ -44,10 +44,7 @@ from app.schemas.strapi import (
     payload_hash,
     resolve_media_url,
 )
-from app.services.image_markers import (
-    insert_image_markers,
-    resolve_image_markers,
-)
+from app.services.final_body import render_final_body
 
 logger = logging.getLogger(__name__)
 
@@ -235,19 +232,20 @@ async def run_strapi_sync(
             _record_media(img, result, settings)
             session.commit()  # checkpoint (section 9): per image
 
-        # ================= STEP D: resolve markers (section 36) =======
-        marked = insert_image_markers(
-            version.body_markdown,
-            [(r.insertion_marker, r.section_heading) for r in inlines],
-        )
-        images = {
-            r.insertion_marker: (r.alt_text, r.strapi_url) for r in inlines
-        }
+        # ================= STEP D: resolve markers (section 36, H07) ===
+        # Shared final renderer (sections 21 + 33): internal link markers
+        # resolve FIRST, image markers second, and a hard assertion that
+        # no raw marker reaches Strapi (the body PUT next).
+        images = {r.insertion_marker: (r.alt_text, r.strapi_url) for r in inlines}
         include_hero = None
         if not settings.strapi_frontend_renders_main_image:
             include_hero = (hero.alt_text, hero.strapi_url)
-        final_body = resolve_image_markers(
-            marked, images, include_hero=include_hero
+        final_body = render_final_body(
+            session,
+            version.body_markdown,
+            images=images,
+            placements=[(r.insertion_marker, r.section_heading) for r in inlines],
+            include_hero=include_hero,
         )
 
         # ================= STEP E: final PUT (section 40) =============

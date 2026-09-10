@@ -16,11 +16,12 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.pipeline.steps._article_common import (
     article_view_json,
-    latest_article_version,
+    latest_writer_version,
     load_research_context,
     persist_review,
 )
@@ -37,13 +38,17 @@ _STYLE_PROMPT = "style_reviewer"
 
 
 def _require_version(session: Session, job: GenerationJob):
-    version = latest_article_version(session, job)
+    # H11: review the CURRENT writer draft (newest stage="writer" version),
+    # not the overall newest version — after a retry a stale revision is the
+    # max, and reviewing it (or shadowing the fresh draft's reviews) is the
+    # stale-checkpoint bug we must avoid.
+    version = latest_writer_version(session, job)
     if version is None:
         from app.core.exceptions import ErrorCode, PipelineError
 
         raise PipelineError(
             ErrorCode.ARTICLE_VALIDATION_FAILED,
-            "no article version to review — run the writer first",
+            "no article draft to review — run the writer first",
         )
     return version
 
@@ -108,7 +113,8 @@ async def run_seo_review(
             guideline_excerpt, ctx["brief"] or {}, version
         ),
         response_model=SEOReview,
-        temperature=0.2,
+        # M08: tunable via .env (LLM_TEMPERATURE_REVIEW), not hardcoded.
+        temperature=get_settings().llm_temperature_review,
     )
 
     persist_review(
@@ -163,7 +169,8 @@ async def run_fact_review(
             guideline_excerpt, ctx["brief"] or {}, version, ctx["evidence"]
         ),
         response_model=FactReview,
-        temperature=0.2,
+        # M08: tunable via .env (LLM_TEMPERATURE_REVIEW), not hardcoded.
+        temperature=get_settings().llm_temperature_review,
     )
 
     persist_review(
@@ -218,7 +225,8 @@ async def run_style_review(
             guideline_excerpt, ctx["brief"] or {}, version
         ),
         response_model=StyleReview,
-        temperature=0.2,
+        # M08: tunable via .env (LLM_TEMPERATURE_REVIEW), not hardcoded.
+        temperature=get_settings().llm_temperature_review,
     )
 
     persist_review(

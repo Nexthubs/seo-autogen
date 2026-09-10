@@ -21,8 +21,10 @@ from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.db.models.research import EvidenceNoteRow, SerpSynthesisRow
 from app.pipeline.steps._common import llm_model_name, set_llm_prompt
+from app.providers.extractor.base import ContentExtractor
 from app.providers.llm.base import LLMProvider
 from app.schemas.research import EvidenceNote
+from app.services.evidence_verification import verify_evidence_sources
 from app.services.prompt_service import PromptSpec, load_prompt
 from pydantic import BaseModel
 
@@ -57,8 +59,16 @@ async def run_evidence_research(
     llm: LLMProvider,
     *,
     prompt: PromptSpec | None = None,
+    verifier: ContentExtractor | None = None,
 ) -> list[EvidenceNote]:
-    """Generate the factual evidence notes for the job and persist them."""
+    """Generate the factual evidence notes for the job and persist them.
+
+    When ``verifier`` (an independent content-fetch channel) is provided,
+    each note's source URL is verified before the note is trusted; an
+    unverifiable source is downgraded to ``confidence="low"`` /
+    ``usage="avoid"`` (content guideline: never cite research that cannot be
+    confirmed to exist). Pass ``None`` (unit tests) to skip verification.
+    """
     prompt = prompt or load_prompt(PROMPT_NAME)
 
     job.status = JobStatus.EVIDENCE_RESEARCHING.value
@@ -85,13 +95,19 @@ async def run_evidence_research(
             "evidence research returned no notes",
         )
 
+    # H09: an LLM self-report is not proof a source exists. Verify each note's
+    # source URL through the independent extractor; unverifiable notes are
+    # downgraded to ``avoid``/``low`` so the writer cannot lean on them.
+    notes = await verify_evidence_sources(output.notes, verifier)
+    downgraded = sum(1 for n in notes if n.usage == "avoid")
+
     # One set per job: re-runs replace the previous notes.
     for row in session.scalars(
         select(EvidenceNoteRow).where(EvidenceNoteRow.job_id == job.id)
     ).all():
         session.delete(row)
 
-    for note in output.notes:
+    for note in notes:
         session.add(
             EvidenceNoteRow(
                 job_id=job.id,
@@ -114,8 +130,9 @@ async def run_evidence_research(
         extra={
             "event": "evidence_research_done",
             "job_id": str(job.id),
-            "notes": len(output.notes),
+            "notes": len(notes),
+            "downgraded_unverifiable_sources": downgraded,
             "prompt_version": prompt.version,
         },
     )
-    return output.notes
+    return notes

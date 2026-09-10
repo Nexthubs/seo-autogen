@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.enums import JobStatus
-from app.db.models.article import ArticleReviewRow, ArticleVersionRow
+from app.db.models.article import ArticleReviewRow
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
 from app.db.models.research import (
@@ -138,6 +138,12 @@ def _reset_artifacts(session: Session, job: GenerationJob) -> None:
     Most steps are replace-on-rerun, but ``competitor_analysis`` appends and
     ``serp_search`` adds a new run, so we delete the previous run's outputs
     before re-running. Per-step cleanup granularity is P9.
+
+    H11: the article ``versions`` and ``reviews`` are NOT cleared — they are
+    immutable, append-only history (spec sections 27-28, 46.13-46.14). A full
+    retry re-runs the writer/reviser and appends new versions; old versions +
+    reviews stay queryable for audit, and the current draft/final are derived
+    from the history.
     """
     session.execute(delete(SerpRun).where(SerpRun.job_id == job.id))
     session.execute(delete(JobSource).where(JobSource.job_id == job.id))
@@ -153,10 +159,6 @@ def _reset_artifacts(session: Session, job: GenerationJob) -> None:
     session.execute(delete(ContentBriefRow).where(ContentBriefRow.job_id == job.id))
     session.execute(
         delete(ArticleOutlineRow).where(ArticleOutlineRow.job_id == job.id)
-    )
-    session.execute(delete(ArticleReviewRow).where(ArticleReviewRow.job_id == job.id))
-    session.execute(
-        delete(ArticleVersionRow).where(ArticleVersionRow.job_id == job.id)
     )
     session.execute(delete(ImageRow).where(ImageRow.job_id == job.id))
     session.commit()

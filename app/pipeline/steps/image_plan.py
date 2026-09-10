@@ -195,7 +195,8 @@ async def run_image_planner(
         system_prompt=prompt.content,
         user_prompt=user_prompt,
         response_model=ImagePlanOutput,
-        temperature=0.3,
+        # M08: tunable via .env (LLM_TEMPERATURE_IMAGE_PLANNING), not hardcoded.
+        temperature=get_settings().llm_temperature_image_planning,
     )
     plan = normalize_plan(raw, ceiling)
     rows = persist_plan(session, job, plan, prompt=prompt)

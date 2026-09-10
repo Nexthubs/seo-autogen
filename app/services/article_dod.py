@@ -19,6 +19,7 @@ The check is pure read-only: it never mutates rows or commits.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import TYPE_CHECKING
 
@@ -38,23 +39,40 @@ from app.db.models.research import (
 from app.db.models.serp import SerpResult, SerpRun
 from app.db.models.source import JobSource, SourcePage
 from app.pipeline.steps._article_common import latest_article_version
+from app.schemas.research import ArticleOutline, ContentBrief
+from app.schemas.internal_link import MARKER_SYNTAX
 from app.services.image_markers import _HEADING, _normalize_heading
 from app.services.internal_link_service import validate_markers
 
 if TYPE_CHECKING:  # pragma: no cover
     from sqlalchemy.orm import Session
 
-#: H1 line in the body (the writer contract forbids any H1 —
+#: ATX H1 line in the body (the writer contract forbids any H1 —
 #: identical to ``article_writer._H1_LINE``, kept local to avoid an
 #: import cycle through the provider stack).
 _H1_LINE = re.compile(r"(?m)^#\s(?!\s)(.*)$")
+#: Setext H1: a non-blank text line followed by a ``=`` underline. A
+#: ``-`` underline is a Setext *H2*, not an H1 — matching only ``=``
+#: keeps horizontal rules (``---``) and H2 underlines out of it.
+_SETEXT_H1 = re.compile(
+    r"(?m)^[^\n`#*\s][^\n]*[^\n`\s]\n[ \t]*={2,}[ \t]*\r?$"
+)
 #: "## FAQ" heading in the final body.
 _FAQ_HEADING = re.compile(r"(?m)^##\s+(?!#)FAQ\b")
+#: Any internal-link marker attempt: the double-bracket + prefix is
+#: case-INSENSITIVE, so a malformed attempt (lowercase marker id
+#: ``[[INTERNAL_LINK:foo]]`` or a lowercase prefix ``[[internal_link:FOO]]``)
+#: is caught here. ``validate_markers``'s case-sensitive ``MARKER_SYNTAX``
+#: would skip both and let a broken marker ship.
+_INTERNAL_LINK_ANY = re.compile(r"\[\[INTERNAL_LINK:", re.IGNORECASE)
 
 MIN_SOURCES = 1
 MAX_SOURCES = 5
 MIN_IMAGES = 1
 MAX_IMAGES = 3
+#: Content guideline: the FAQ section must hold at least three real,
+#: high-frequency Q&A pairs (each a ``###`` question with an answer).
+MIN_FAQ_QUESTIONS = 3
 REQUIRED_REVIEWS = ("seo", "fact", "style")
 
 
@@ -110,6 +128,10 @@ def _check_serp(session: "Session", job: GenerationJob) -> list[str]:
 # 63.2 Research
 # ----------------------------------------------------------------------
 def _check_research(session: "Session", job: GenerationJob) -> list[str]:
+    """Research bullet (63): re-validate the stored payloads, not just the
+    row presence / persisted ``valid`` flag. A stored brief or outline must
+    round-trip through its Pydantic model, and every job source page must
+    have a competitor analysis (the step persists exactly one per source)."""
     errors: list[str] = []
     count = session.scalars(
         select(CompetitorAnalysisRow).where(
@@ -118,6 +140,19 @@ def _check_research(session: "Session", job: GenerationJob) -> list[str]:
     ).all()
     if not count:
         errors.append("research: no competitor analysis")
+    else:
+        sources = session.scalars(
+            select(SourcePage)
+            .join(JobSource, JobSource.source_page_id == SourcePage.id)
+            .where(JobSource.job_id == job.id)
+        ).all()
+        analysed = {row.source_page_id for row in count}
+        missing = [str(page.id) for page in sources if page.id not in analysed]
+        if missing:
+            errors.append(
+                "research: "
+                f"{len(missing)} source page(s) have no competitor analysis"
+            )
 
     if not session.scalars(
         select(SerpSynthesisRow).where(SerpSynthesisRow.job_id == job.id)
@@ -130,18 +165,37 @@ def _check_research(session: "Session", job: GenerationJob) -> list[str]:
     if not evidence:
         errors.append("research: no evidence notes")
 
-    if not session.scalars(
+    brief_row = session.scalars(
         select(ContentBriefRow).where(ContentBriefRow.job_id == job.id)
-    ).first():
+    ).first()
+    if brief_row is None:
         errors.append("research: no content brief")
+    else:
+        try:
+            ContentBrief.model_validate(brief_row.brief or {})
+        except Exception:
+            errors.append(
+                "research: stored content brief fails ContentBrief validation"
+            )
 
     outlines = session.scalars(
         select(ArticleOutlineRow).where(ArticleOutlineRow.job_id == job.id)
     ).all()
     if not outlines:
         errors.append("research: no article outline")
-    elif not any(o.valid for o in outlines):
-        errors.append("research: latest article outline failed validation")
+    else:
+        latest = outlines[-1]
+        # ``valid`` is persisted by the outline step (it re-repairs on a
+        # failed validation). Re-validate the payload itself too: a stored
+        # outline that does not round-trip through ArticleOutline is invalid
+        # regardless of the flag.
+        if not latest.valid:
+            errors.append("research: latest article outline failed validation")
+        else:
+            try:
+                ArticleOutline.model_validate(latest.outline or {})
+            except Exception:
+                errors.append("research: latest article outline failed validation")
     return errors
 
 
@@ -156,27 +210,61 @@ def _check_article(
     if version is None:
         return ["article: no article version persisted"], None
 
+    # H11: the shipped (latest) version must be the reviser's output, not a
+    # bare writer draft. A writer retry appends a new draft after a stale
+    # revision; if the reviser never re-ran, the latest version would be a
+    # writer draft and the job is NOT done — it must not be silently shipped.
+    if version.stage != "revision":
+        errors.append(
+            "article: latest version v"
+            f"{version.version} is stage '{version.stage}', expected "
+            "'revision' — the reviser has not produced the final version"
+        )
+
+    body = version.body_markdown or ""
     if not (version.title or "").strip():
         errors.append("article: title is empty")
-    if _H1_LINE.search(version.body_markdown or ""):
+    if _H1_LINE.search(body):
         errors.append("article: body_markdown contains an H1 line")
+    if _SETEXT_H1.search(body):
+        errors.append(
+            "article: body_markdown contains a Setext H1 (= underline)"
+        )
     if not (version.seo_title or "").strip():
         errors.append("article: seo_title is empty")
     if not (version.meta_description or "").strip():
         errors.append("article: meta_description is empty")
     if not (version.slug or "").strip():
         errors.append("article: slug is empty")
-    if not _FAQ_HEADING.search(version.body_markdown or ""):
+    if not _FAQ_HEADING.search(body):
         errors.append("article: no FAQ section in body_markdown")
+    else:
+        faq_questions = _faq_question_count(body)
+        if faq_questions < MIN_FAQ_QUESTIONS:
+            errors.append(
+                "article: FAQ section has "
+                f"{faq_questions} question(s), at least {MIN_FAQ_QUESTIONS} "
+                "Q&A pairs are required (content guideline)"
+            )
 
     errors.extend(_check_cta(session, job, version))
 
-    validation = validate_markers(session, version.body_markdown or "")
+    validation = validate_markers(session, body)
     if not validation.valid:
         details = ", ".join(
             list(validation.unknown_markers) + list(validation.inactive_markers)
         )
         errors.append(f"article: invalid internal link markers ({details})")
+    #: ``validate_markers`` only recognises well-formed uppercase marker
+    #: ids; a malformed attempt (wrong case / bad marker body) slips past
+    #: it and would ship raw. Scan the raw text case-insensitively.
+    malformed = _malformed_internal_link_markers(body)
+    if malformed:
+        errors.append(
+            "article: malformed internal link marker syntax ("
+            + ", ".join(malformed)
+            + ")"
+        )
 
     #: Pipeline order: writer v(N) -> reviewers (reviews land on v(N))
     #: -> reviser v(N+1) -> FINAL anti-copy on v(N+1). So seo/fact/style
@@ -218,21 +306,91 @@ def _check_cta(
     if outline_row is None:
         return []  # missing outline is already reported under research
     outline = outline_row.outline or {}
+    sections = outline.get("sections")
+    if not isinstance(sections, list):
+        return []  # malformed outline is already reported under research
     cta_sections = [
         s.get("heading")
-        for s in outline.get("sections") or []
-        if s.get("cta_slot") and s.get("heading")
+        for s in sections
+        if isinstance(s, dict) and s.get("cta_slot") and s.get("heading")
     ]
     if not cta_sections:
         return ["article: outline has no cta_slot section"]
+    body = version.body_markdown or ""
     body_headings = set()
-    for line in (version.body_markdown or "").splitlines():
+    for line in body.splitlines():
         m = _HEADING.match(line)
         if m:
             body_headings.add(_normalize_heading(m.group(2)))
-    if not any(_normalize_heading(h) in body_headings for h in cta_sections):
+    present = [h for h in cta_sections if _normalize_heading(h) in body_headings]
+    if not present:
         return ["article: none of the outline's cta_slot sections appear in the body"]
+    #: A cta_slot section must not be an empty heading: the CTA content
+    #: rule (content guideline) needs actual call-to-action text under it.
+    for heading in present:
+        if not _section_has_content(body, heading):
+            return [
+                f"article: cta_slot section {heading!r} has no CTA content "
+                "under the heading"
+            ]
     return []
+
+
+def _section_has_content(body: str, heading: str) -> bool:
+    """True when the section body between ``heading`` and the next
+    ``##``-level heading contains a non-blank, non-heading line."""
+    lines = body.splitlines()
+    for idx, line in enumerate(lines):
+        m = _HEADING.match(line)
+        if m and _normalize_heading(m.group(2)) == _normalize_heading(heading):
+            for rest in lines[idx + 1 :]:
+                rest_m = _HEADING.match(rest)
+                if rest_m and len(rest_m.group(1)) == 2:
+                    break  # next level-2 heading: the section ends
+                if rest_m:
+                    continue  # a heading (e.g. ### sub) is not body text
+                if rest.strip():
+                    return True
+            return False
+    return False
+
+
+def _faq_question_count(body: str) -> int:
+    """Count ``###`` questions inside the FAQ section (each is one Q&A
+    pair; the content guideline requires at least three real questions)."""
+    lines = body.splitlines()
+    for idx, line in enumerate(lines):
+        m = _HEADING.match(line)
+        if not (m and m.group(1) == "##" and _normalize_heading(m.group(2)) == "faq"):
+            continue
+        count = 0
+        for rest in lines[idx + 1 :]:
+            rest_m = _HEADING.match(rest)
+            if rest_m and rest_m.group(1) == "##":
+                break  # next level-2 heading ends the FAQ section
+            if rest_m and rest_m.group(1) == "###":
+                count += 1
+        return count
+    return 0
+
+
+def _malformed_internal_link_markers(body: str) -> list[str]:
+    """Case-insensitive scan for marker attempts the case-sensitive
+    ``MARKER_SYNTAX`` extractor skipped (wrong case / bad marker body).
+    Any attempt that is not a well-formed ``[[INTERNAL_LINK:<A-Z0-9_>]]``
+    token is malformed. Returns the offending raw tokens (deduped)."""
+    malformed: list[str] = []
+    for m in _INTERNAL_LINK_ANY.finditer(body):
+        start = m.start()
+        end = body.find("]]", start)
+        if end == -1:
+            malformed.append(body[start : start + 32] + "…")
+            continue
+        token = body[start : end + 2]
+        if not MARKER_SYNTAX.fullmatch(token):
+            malformed.append(token)
+    # Drop duplicates, keep order.
+    return list(dict.fromkeys(malformed))
 
 
 # ----------------------------------------------------------------------
@@ -277,6 +435,11 @@ def _check_images(
             )
     if not (hero.alt_text or "").strip():
         errors.append("images: hero image has no alt_text")
+    if not _image_file_exists(hero.local_path):
+        errors.append(
+            "images: hero image local_path is missing "
+            f"(expected a generated file at {hero.local_path!r})"
+        )
     if hero.filename != "hero.webp":
         errors.append(
             f"images: hero filename is {hero.filename!r}, expected 'hero.webp'"
@@ -320,6 +483,11 @@ def _check_images(
                 f"images: inline image sort_order {img.sort_order} has "
                 "no alt_text"
             )
+        if not _image_file_exists(img.local_path):
+            errors.append(
+                f"images: inline image sort_order {img.sort_order} local_path "
+                f"is missing (expected a generated file at {img.local_path!r})"
+            )
         if body and img.section_heading and _normalize_heading(
             img.section_heading
         ) not in body_headings:
@@ -328,3 +496,15 @@ def _check_images(
                 "is not in the article body"
             )
     return errors
+
+
+def _image_file_exists(local_path: str | None) -> bool:
+    """A generated image row must point at a real file on disk.
+
+    ``local_path`` is set by ``image_generate`` for every generated image;
+    a missing (or dangling) path means the step did not actually produce
+    the file, so the article would ship a reference to nothing.
+    """
+    if not local_path:
+        return False
+    return os.path.isfile(local_path)

@@ -310,6 +310,75 @@ async def test_frontend_renders_main_image_false_prepends_hero(db, tmp_path):
     assert body.startswith(f"![Hero alt]({BASE}/uploads/hero.webp)")
 
 
+# --------------------------------------------------------------------- H07
+# The final body PUT to Strapi must carry NO raw [[INTERNAL_LINK:*]] or
+# [[IMAGE:*]] markers — the shared renderer (section 21 + 33) resolves both
+# before the body leaves the pipeline.
+async def test_h07_sync_body_resolves_internal_link_markers(db, tmp_path):
+    from app.schemas.internal_link import InternalLinkRule as _Rule
+    from app.services.internal_link_service import upsert_rule
+
+    job = _job(db)
+    upsert_rule(
+        db,
+        _Rule(
+            marker="ATTACHMENT_TEST",
+            anchor_text="attachment test",
+            target_url="https://example.com/attachment-test",
+        ),
+    )
+    version = db.scalars(select(ArticleVersionRow)).one()
+    version.body_markdown = (
+        "## What is anxious attachment\n\n"
+        "First paragraph. Take the "
+        "[[INTERNAL_LINK:ATTACHMENT_TEST]] "
+        "before reaching out, long enough to anchor.\n\n"
+        "## Why no contact feels impossible\n\n"
+        "Second paragraph about the behavior, long enough to anchor.\n"
+    )
+    db.commit()
+
+    provider = FakeStrapiProvider()
+    await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+
+    # STEP E: the final body PUT carries the resolved link, no raw markers
+    body = provider.updates[-1][1]["data"]["body"]
+    assert "[attachment test](https://example.com/attachment-test)" in body
+    assert "[[INTERNAL_LINK:" not in body
+    assert "[[IMAGE:" not in body
+    # image markers also resolved
+    assert BASE + "/uploads/inline-1.webp" in body
+    assert job.status == JobStatus.STRAPI_DRAFT_CREATED.value
+
+
+async def test_h07_sync_unknown_internal_link_marker_fails(db, tmp_path):
+    """H07: an unresolvable link marker blocks the sync — never PUT raw."""
+    job = _job(db)
+    version = db.scalars(select(ArticleVersionRow)).one()
+    version.body_markdown = (
+        "## What is anxious attachment\n\n"
+        "First paragraph. "
+        "[[INTERNAL_LINK:GHOST_MARKER]] "
+        "that does not exist in the rules, long enough to anchor.\n\n"
+        "## Why no contact feels impossible\n\n"
+        "Second paragraph about the behavior, long enough to anchor.\n"
+    )
+    db.commit()
+
+    provider = FakeStrapiProvider()
+    with pytest.raises(PipelineError) as excinfo:
+        await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+
+    assert excinfo.value.error_code == ErrorCode.ARTICLE_VALIDATION_FAILED
+    # the final body PUT never happened (failure at STEP D)
+    assert provider.updates == []
+    # the draft + media were already checkpointed — documentId is kept
+    assert job.status == JobStatus.STRAPI_SYNCING.value
+    row = db.scalars(select(StrapiSyncRow)).first()
+    assert row.sync_status == StrapiSyncStatus.FAILED.value
+    assert row.strapi_document_id == "doc-42"
+
+
 # ------------------------------------------------------------- slug collision
 async def test_slug_conflict_other_entry_blocks_sync(db, tmp_path):
     other = _Entry(77, "doc-other", slug="p7test-slug", status="published")

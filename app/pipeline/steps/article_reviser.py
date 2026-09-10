@@ -16,12 +16,13 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.pipeline.steps._article_common import (
     article_view_json,
-    latest_article_version,
     latest_review,
+    latest_writer_version,
     load_research_context,
     persist_article_version,
 )
@@ -81,7 +82,10 @@ async def run_article_reviser(
     job.current_step = "article_revising"
     session.flush()
 
-    draft = latest_article_version(session, job)
+    # H11: revise the CURRENT writer draft (newest stage="writer" version),
+    # not the overall newest version — after a retry a stale revision is the
+    # max, and revising it (or reusing its reviews) would ship the wrong draft.
+    draft = latest_writer_version(session, job)
     if draft is None:
         from app.core.exceptions import ErrorCode, PipelineError
 
@@ -109,7 +113,8 @@ async def run_article_reviser(
             draft_anticopy.model_dump(mode="json"),
         ),
         response_model=ArticleDraftOutput,
-        temperature=0.5,
+        # M08: tunable via .env (LLM_TEMPERATURE_REVISION), not hardcoded.
+        temperature=get_settings().llm_temperature_revision,
     )
 
     doc = build_article_document(

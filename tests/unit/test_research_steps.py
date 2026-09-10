@@ -37,6 +37,7 @@ from app.pipeline.steps.content_brief import run_content_brief
 from app.pipeline.steps.evidence_research import run_evidence_research
 from app.pipeline.steps.outline import run_outline
 from app.pipeline.steps.serp_synthesis import run_serp_synthesis
+from app.providers.extractor.base import ContentExtractor
 from app.providers.llm.openai_compatible import OpenAICompatibleLLMProvider
 from app.schemas.research import (
     ArticleOutline,
@@ -44,6 +45,7 @@ from app.schemas.research import (
     ContentBrief,
     SERPSynthesis,
 )
+from app.schemas.sources import ExtractedPage
 from app.services.outline_validator import validate_outline
 from app.services.prompt_service import load_prompt
 
@@ -484,6 +486,135 @@ async def test_evidence_research_empty_notes_fails(db, job):
 
 
 # ============================================================
+# evidence source verification (H09 — content guideline section 28)
+#
+# An LLM self-report is not proof a source exists. When an independent
+# content-extractor channel is wired, each note's source URL is fetched; a
+# source that cannot be fetched, or that returns empty content, is downgraded
+# to ``confidence="low"`` / ``usage="avoid"`` before the note is persisted.
+# ============================================================
+class _FakeVerifier(ContentExtractor):
+    """Scripted extractor: ``behaviour`` maps url -> page | exception | None."""
+
+    def __init__(self, behaviour: dict):
+        self.behaviour = behaviour
+
+    async def extract(self, urls: list[str]) -> list[ExtractedPage]:
+        pages: list[ExtractedPage] = []
+        for url in urls:
+            action = self.behaviour.get(url)
+            if action is None:  # url not scripted at all → "unreachable"
+                continue
+            if isinstance(action, BaseException):
+                raise action
+            pages.append(
+                ExtractedPage(
+                    url=url,
+                    normalized_url=url,
+                    title="V",
+                    content_markdown=action,
+                    extracted_at=datetime.now(timezone.utc),
+                    extractor="fake",
+                )
+            )
+        return pages
+
+    async def health_check(self) -> bool:
+        return True
+
+
+async def _prep_research(db, job):
+    await run_competitor_analysis(
+        db, job, FakeLLM([_analysis_payload(i) for i in range(5)])
+    )
+    await run_serp_synthesis(db, job, FakeLLM([json.dumps(SYNTHESIS)]))
+
+
+async def test_evidence_research_no_verifier_keeps_notes(db, job):
+    # No verifier (focused unit caller): notes persist untouched.
+    await _prep_research(db, job)
+    llm = FakeLLM([json.dumps({"notes": EVIDENCE_NOTES})])
+    try:
+        notes = await run_evidence_research(db, job, llm)
+    finally:
+        await llm.aclose()
+    assert notes[0].confidence == "high"
+    assert notes[0].usage == "supported"
+    assert notes[1].confidence == "low"
+    assert notes[1].usage == "avoid"
+
+
+async def test_evidence_research_verified_source_kept(db, job):
+    # Reachable source with real content → note kept as reported.
+    await _prep_research(db, job)
+    url = EVIDENCE_NOTES[0]["source_url"]
+    verifier = _FakeVerifier({url: "Real study content found."})
+    llm = FakeLLM([json.dumps({"notes": EVIDENCE_NOTES[:1]})])
+    try:
+        notes = await run_evidence_research(db, job, llm, verifier=verifier)
+    finally:
+        await llm.aclose()
+    assert notes[0].confidence == "high"
+    assert notes[0].usage == "supported"
+    assert notes[0].note == "cite properly"  # unchanged
+    row = db.scalars(
+        select(EvidenceNoteRow).where(EvidenceNoteRow.job_id == job.id)
+    ).first()
+    assert row.usage == "supported"
+    assert row.confidence == "high"
+
+
+async def test_evidence_research_unreachable_source_downgraded(db, job):
+    # Source not fetched at all → downgraded to low/avoid with a marker.
+    await _prep_research(db, job)
+    url = EVIDENCE_NOTES[0]["source_url"]
+    verifier = _FakeVerifier({})  # url unknown → unreachable
+    llm = FakeLLM([json.dumps({"notes": EVIDENCE_NOTES[:1]})])
+    try:
+        notes = await run_evidence_research(db, job, llm, verifier=verifier)
+    finally:
+        await llm.aclose()
+    assert notes[0].confidence == "low"
+    assert notes[0].usage == "avoid"
+    assert "source_unverified" in (notes[0].note or "")
+    row = db.scalars(
+        select(EvidenceNoteRow).where(EvidenceNoteRow.job_id == job.id)
+    ).first()
+    assert row.usage == "avoid"
+    assert row.confidence == "low"
+
+
+async def test_evidence_research_empty_content_downgraded(db, job):
+    # Source fetched but empty body → downgraded.
+    await _prep_research(db, job)
+    url = EVIDENCE_NOTES[0]["source_url"]
+    verifier = _FakeVerifier({url: "   "})
+    llm = FakeLLM([json.dumps({"notes": EVIDENCE_NOTES[:1]})])
+    try:
+        notes = await run_evidence_research(db, job, llm, verifier=verifier)
+    finally:
+        await llm.aclose()
+    assert notes[0].usage == "avoid"
+    assert notes[0].confidence == "low"
+    assert "empty content" in (notes[0].note or "")
+
+
+async def test_evidence_research_fetch_exception_downgraded(db, job):
+    # Verifier raises (network/404) → treated as unreachable, not fatal.
+    await _prep_research(db, job)
+    url = EVIDENCE_NOTES[0]["source_url"]
+    verifier = _FakeVerifier({url: httpx.ConnectError("boom")})
+    llm = FakeLLM([json.dumps({"notes": EVIDENCE_NOTES[:1]})])
+    try:
+        notes = await run_evidence_research(db, job, llm, verifier=verifier)
+    finally:
+        await llm.aclose()
+    assert notes[0].usage == "avoid"
+    assert notes[0].confidence == "low"
+    assert "fetch failed" in (notes[0].note or "")
+
+
+# ============================================================
 # content brief
 # ============================================================
 async def test_content_brief_happy_path(db, job):
@@ -516,6 +647,31 @@ async def test_content_brief_happy_path(db, job):
 
     db.refresh(job)
     assert job.status == JobStatus.OUTLINE_GENERATING.value
+
+
+async def test_content_brief_prompt_carries_job_strategy(db, job):
+    """M08: job.strategy previously never reached the brief prompt."""
+    await run_competitor_analysis(
+        db, job, FakeLLM([_analysis_payload(i) for i in range(5)])
+    )
+    await run_serp_synthesis(db, job, FakeLLM([json.dumps(SYNTHESIS)]))
+    await run_evidence_research(
+        db, job, FakeLLM([json.dumps({"notes": EVIDENCE_NOTES})])
+    )
+
+    job.strategy = "low_kd"
+    db.flush()
+
+    llm = FakeLLM([json.dumps(BRIEF)])
+    try:
+        await run_content_brief(db, job, llm)
+    finally:
+        await llm.aclose()
+
+    user = llm.calls[0]["user"]
+    assert "Content strategy: low_kd" in user
+    # the meaning of the strategy must be explained to the model
+    assert "lower-competition angle" in user
 
 
 async def test_content_brief_strips_unallowed_markers(db, job):

@@ -8,16 +8,23 @@ This module turns those rows into the queryable map P9 needs:
 - :func:`first_incomplete_step` — the resume-from-checkpoint boundary
   ("Resume from checkpoint": skip every done step, re-run from the first
   step that is not done).
-- :func:`reset_from_step` — delete ONLY the outputs of the given step and
-  every later step ("Retry by step": a step re-run must start from a clean
-  state for its own outputs, because several steps *append* instead of
-  replacing — ``serp_search`` adds a new run, ``competitor_analysis`` and
-  the article writer/reviser append rows; see the per-step idempotency
-  notes in the docstrings).
+- :func:`reset_from_step` — drop ONLY the *re-runnable* outputs of the given
+  step and every later step ("Retry by step": a step re-run must start from a
+  clean state for its own per-run artifacts, e.g. a fresh SERP run or a new
+  competitor-analysis batch).
 
-Deletions are done explicitly (not left to ORM/FK cascades) so they behave
-identically on PostgreSQL (``ondelete=CASCADE``) and SQLite (no foreign
-key pragma in unit tests).
+H11 — immutable article history: the article ``versions`` and ``reviews``
+rows are an append-only, immutable log (spec sections 27-28, 46.13-46.14).
+A retry re-runs the writer/reviser and APPENDS a new version rather than
+deleting the old one, so :func:`reset_from_step` deliberately does NOT touch
+``article_versions`` / ``article_reviews``. The "current valid" draft is
+DERIVED from that history (the newest ``stage="writer"`` version; the newest
+version overall is the final shipped one) — see the ``step_done`` notes below.
+
+Other per-run rows (SERP, sources, research, outline, images, LLM usage) are
+deleted explicitly (not left to ORM/FK cascades) so reset behaves identically
+on PostgreSQL (``ondelete=CASCADE``) and SQLite (no foreign key pragma in unit
+tests).
 """
 
 from __future__ import annotations
@@ -159,10 +166,13 @@ def step_done(session: Session, job: GenerationJob, step_name: str) -> bool:
     - ``source_extract`` checkpoints ``job_sources`` links; none means the
       step never finished (it raises ``SOURCE_EMPTY`` otherwise).
     - the three review steps attach one row per reviewed version; they are
-      done when the review row exists on the *writer* version that the
-      reviews target (a revision version, if present, makes the reviews
-      stale anyway).
-    - ``article_reviser`` is done when a ``revision``-stage version exists.
+      done when the review row exists on the *current writer draft* (newest
+      ``stage="writer"`` version) that the reviews target. An older draft's
+      reviews (kept as immutable history, H11) do not count.
+    - ``article_reviser`` is done only when a ``revision``-stage version
+      exists that is NEWER than the current writer draft: after a writer
+      retry the draft is a new writer version, so any older (stale) revision
+      no longer marks the step done.
     - ``image_plan`` is done when plan rows exist; ``image_generate`` is
       done only when EVERY plan row has a ``local_path`` (partial
       generation survives as a partial checkpoint by design, spec section
@@ -219,7 +229,19 @@ def step_done(session: Session, job: GenerationJob, step_name: str) -> bool:
             session, version, step_name.split("_")[0]
         )
     if step_name == "article_reviser":
-        return _version_exists(session, job, "revision")
+        # H11: a stale revision (older than the current writer draft, kept as
+        # immutable history after a writer retry) does NOT mark this step
+        # done — resume must re-revise from the fresh draft.
+        writer = _writer_version(session, job)
+        if writer is None:
+            return False
+        return _count(
+            session,
+            ArticleVersionRow,
+            ArticleVersionRow.job_id == job.id,
+            ArticleVersionRow.stage == "revision",
+            ArticleVersionRow.version > writer.version,
+        ) > 0
     if step_name == "image_plan":
         return _count(session, ImageRow, ImageRow.job_id == job.id) > 0
     if step_name == "image_generate":
@@ -267,22 +289,24 @@ def reset_from_step(
     itself is NOT re-run here — the orchestrator runs it after this reset.
     Returns the number of steps covered (``15 - step_index + 1``).
 
-    Deletion is scope-correct per the steps' idempotency model:
+    Deletion is scope-correct per the steps' idempotency model — only the
+    per-run, re-runnable artifacts are dropped:
 
     - ``serp_search`` (2) adds a run whose results cascade — delete both
       explicitly.
     - ``source_extract`` (3) owns the ``job_sources`` links.
-    - ``article_writer`` (9) owns ALL versions (a fresh draft invalidates
-      the revision and every review).
-    - the review steps (10-12) and ``article_reviser`` (13) only invalidate
-      the ``revision``-stage version (and its reviews): re-running a review
-      or the revision keeps the writer draft and the other two reviews.
     - ``image_plan`` (14) owns the plan rows; ``image_generate`` (15) is
       partial-idempotent (per-image ``local_path`` overwrite) so a 15-reset
       deletes nothing.
     - ``llm_usage`` (P9-B1) rows are owned by the step that made the call:
       a re-run re-makes its calls, so their usage rows are deleted with
       the rest of the step outputs (steps 4 and 7-14 carry LLM calls).
+
+    The article ``versions`` and ``reviews`` (steps 9-13) are NOT deleted:
+    they are immutable, append-only history (H11, spec sections 27-28,
+    46.13-46.14). A retry re-runs the writer/reviser and appends a new
+    version; the current draft/final is derived from the history, and old
+    versions + reviews stay queryable for audit.
     """
     if not 1 <= step_index <= len(STEP_NAMES):
         raise ValueError(
@@ -328,42 +352,11 @@ def reset_from_step(
             delete(ArticleOutlineRow).where(ArticleOutlineRow.job_id == job.id)
         )
 
-    # Version rows: a writer reset (<=9) invalidates everything; a review /
-    # reviser reset (10..13) only the revision stage. Reviews of the
-    # deleted versions are removed explicitly (cross-dialect, see module
-    # docstring).
-    if step_index <= 13:
-        if step_index <= 9:
-            version_ids = (
-                select(ArticleVersionRow.id).where(
-                    ArticleVersionRow.job_id == job.id
-                )
-            )
-        else:
-            version_ids = (
-                select(ArticleVersionRow.id).where(
-                    ArticleVersionRow.job_id == job.id,
-                    ArticleVersionRow.stage == "revision",
-                )
-            )
-        session.execute(
-            delete(ArticleReviewRow).where(
-                ArticleReviewRow.article_version_id.in_(version_ids)
-            )
-        )
-        if step_index <= 9:
-            session.execute(
-                delete(ArticleVersionRow).where(
-                    ArticleVersionRow.job_id == job.id
-                )
-            )
-        else:
-            session.execute(
-                delete(ArticleVersionRow).where(
-                    ArticleVersionRow.job_id == job.id,
-                    ArticleVersionRow.stage == "revision",
-                )
-            )
+    # H11: article_versions and article_reviews are IMMUTABLE append-only
+    # history (spec sections 27-28, 46.13-46.14) — a retry appends new
+    # versions rather than deleting the old ones, so we never delete them
+    # here. The current draft/final are derived from the history (see
+    # step_done), and stale older versions/reviews stay queryable for audit.
     if step_index <= 14:
         session.execute(delete(ImageRow).where(ImageRow.job_id == job.id))
 
