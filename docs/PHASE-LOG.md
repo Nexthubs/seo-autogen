@@ -18,7 +18,7 @@
 | P7 | Strapi Integration | ✅ | Draft 同步(仅 Draft,发布永远手动)、slug、图片上传 |
 | P8 | Web UI | ✅ | 全部 Web 页面 + API、HTMX 轮询、cancel/retry、文章预览 |
 | P9 | Reliability / Production Hardening | ✅ | P9-A ✅ / P9-B ✅(B1 ✅, B2 ✅, B3 ✅)/ P9-C ✅ |
-| 审计修复 B1–B7 | CODEX audit 全量收口(30 项) | ✅ | B1 `cf85665` · B2 `c50c235` · B3 `c6a4b83` · B4 `9462af0` · B5 `8af9212` · B6 `52d3643` · B7 HEAD |
+| 审计修复 B1–B7 | CODEX audit 全量收口(30 项) | ✅ | B1 `cf85665` · B2 `c50c235` · B3 `c6a4b83` · B4 `9462af0` · B5 `8af9212` · B6 `52d3643` · B7 `12871b0` |
 
 > **口径诚实声明(L03)**:P0–P9 全部功能已实现;上述审计 B1–B7 把 CODEX 审计
 > 报告(commit `c5c7101`,0 Critical / 12 High / 15 Medium / 3 Low,共 30 项)
