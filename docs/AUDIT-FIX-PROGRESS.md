@@ -23,7 +23,7 @@
 |---|---|---|---|
 | B1 | P0 / P1 | M04, H08, L02, M09, M11 | ✅ 完成（见下） |
 | B2 | P2 | H01, H02, M15 | ✅ 完成（见下） |
-| B3 | P3 | H04, M05 | ⏳ 待办 |
+| B3 | P3 | H04, M05 | ✅ 完成（见下） |
 | B4 | P4 / P5 | H09, H06, H07, H11, M08 | ⏳ 待办 |
 | B5 | P6 | H05, H10, M06, M07, L01 | ⏳ 待办 |
 | B6 | P7 | H03, M01, M02 | ⏳ 待办 |
@@ -65,12 +65,14 @@
 >
 > **M12 前置子项（B2 顺手完成）**：`_extract_cost()` 改读官方 `cost`（USD，task 级优先、顶层兜底），不再读 `credits`——这是 B7 M12 的“读错字段”部分；M12 的“不可变请求账本 + cache-hit 零计”主体仍在 B7。
 
-### B3 — P3（⏳）
+### B3 — P3 ✅
 
-| ID | 级别 | 问题摘要 | 计划 | 状态 |
-|---|---|---|---|---|
-| H04 | High | 同步 `prepare_keyword` 返回 `KeywordMetrics` 被 orchestrator lambda 当非 awaitable，已知词必然 TypeError | 步骤改 async（或统一 adapter 合同）；已知词 / 未知词完整 orchestrator 用例 | ⏳ |
-| M05 | Med | `autoflush=False` 下重复新词导入 IntegrityError；`ilike` 未转义 `%`/`_` | 导入前去重 + flush / DB upsert；case-fold 精确比较；生产同款 session 测试 | ⏳ |
+| ID | 级别 | 问题摘要 | 修复内容 | 关键文件 | 测试证据 | 状态 |
+|---|---|---|---|---|---|---|
+| H04 | High | 同步 `prepare_keyword` 是 15 个步骤中唯一的 sync 步骤：orchestrator 统一 `await` 每个 runner，**已知词**返回非 None 的 `KeywordMetrics`（非 awaitable）→ `TypeError` → job 必然失败；**未知词**返回 `None` 侥幸通过，所以既有集成测试（直接同步调用 + SERP-only 全链路）从未暴露 | `prepare_keyword` 改为 `async def`（对齐其余 14 个步骤的 async 合同；body 不变）；`content_brief` 本就自查 `lookup_metrics`，返回值无其它消费者，改动安全；两处直接调用集成测试改 `async def` + `await` | `app/pipeline/steps/keyword_prepare.py`、`tests/integration/test_keyword_dataset.py`（2 处调用点） | **新增 orchestrator 级回归** `tests/integration/test_p9_pipeline.py::test_known_keyword_full_run_reaches_ready`：dataset 内关键词（`prepare_keyword` 返回非 None）跑完整 15 步 fake-provider 链，断言 `ready` + `keyword_metrics_available=True` + `error_code is None`（旧代码此路径必 `TypeError`/FAILED）；既有 SERP-only 全链路用例继续覆盖未知词路径 | ✅ |
+| M05 | Med | ① 生产 session `autoflush=False`：同一 sheet 内仅大小写不同的重复**新词**（如 "SEO Tips"/"seo tips"）双双通过 DB 查重 → 双插入 → commit 触发 `UNIQUE(cluster_id, keyword)` → IntegrityError；② `lookup_metrics`/`import_workbook`/`query_dataset` 用 `ilike(裸串)`，关键词含 `%`/`_` 时被当通配符（`"100% seo"` 会命中 `"100 seo"`）→ 串号数据 | ① `import_workbook` 每 sheet 先按 `casefold` 内存去重（后行覆盖前行 + warning），再入库——与 flush 策略无关；② 全部关键词/簇名比较改为 `lower(col) == 字面量.lower()` 精确匹配（消除 LIKE 通配符语义，`%`/`_` 按字面量处理） | `app/services/keyword_import.py`、`app/services/keyword_service.py` | ① **生产同款 session 测试**：新增 `db_noautoflush` fixture（`sessionmaker(autoflush=False)`，与 `SessionLocal` 同策略）+ `test_duplicate_new_word_same_sheet_no_integrity_error`（旧代码必 IntegrityError）+ `test_duplicate_new_word_case_insensitive_rerun_upserts`（`%` 关键词重导入 upsert 不串号）；② `test_keyword_service.py::test_lookup_literal_percent_and_underscore`（`100%`/`100 `、`a_b`/`a b` 四组不串号）；③ 真实 PG 集成 `test_keyword_dataset.py::test_m05_duplicate_new_words_same_sheet_pg`（`SessionLocal` 直跑：3 行落库、last-row-wins、`lookup_metrics` 字面量精确） | ✅ |
+
+**B3 测试结果**：`453 passed, 1 skipped`（B2 后 448 + 新增 5：H04 全链路回归 ×1、M05 unit ×3、M05 PG 集成 ×1）。**无需新迁移**（无 schema 变更）。
 
 ### B4 — P4 / P5（⏳）
 
@@ -114,6 +116,10 @@
 
 ## 变更日志
 
+- **2026-09-17 — B3 完成**：H04 / M05 全部修复并测试（`453 passed, 1 skipped`）。
+  - **H04**：`prepare_keyword` 改 `async def`（orchestrator 统一 await，旧 sync 返回 `KeywordMetrics` 对已知词必 TypeError；未知词返回 None 侥幸通过）。新增 orchestrator 级已知词全链路回归（`test_p9_pipeline.py::test_known_keyword_full_run_reaches_ready`）。
+  - **M05**：① 导入每 sheet 先 `casefold` 内存去重（后行覆盖 + warning），消除 `autoflush=False` 下重复新词 commit IntegrityError；② 全部关键词/簇名比较改 `lower()` 字面量精确匹配，`%`/`_` 不再当 LIKE 通配符。新增生产同款 `autoflush=False` session 测试 ×2、unit 字面量匹配 ×1、真实 PG 集成 ×1。
+  - **无新迁移**（无 schema 变更）。
 - **2026-09-17 — B2 完成**：H01 / H02 / M15 全部修复并测试（`448 passed, 1 skipped`）。
   - **H01**：DataForSEO 解析按官方 Live Advanced 契约重写（`result`=block 列表、`items[]` 扁平混合按 `type` 分派、rank 取 `rank_group`、PAA 嵌套 `people_also_ask_element`、related 字符串列表）；新增 **featured snippet**（`FeaturedSnippet` schema + `SerpResult.result_type='featured'` 落库，无需迁移）。`test_dataforseo_provider.py` 整文件重写（官方脱敏信封，23 用例）。
   - **H02**：Exa `extract()` 显式 `text: True`（API 默认 `false` → 否则无正文 SOURCE_EMPTY）。

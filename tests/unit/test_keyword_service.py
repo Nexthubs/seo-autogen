@@ -61,6 +61,34 @@ def test_lookup_unknown_keyword_returns_none(db: Session):
     assert ks.keyword_metrics_available(db, "attachment") is True
 
 
+def test_lookup_literal_percent_and_underscore(db: Session):
+    """Audit M05: ``%``/``_`` in the query must not act as LIKE wildcards.
+
+    The old ``ilike("100% seo tips")`` pattern matched BOTH "100% seo tips"
+    and "100 seo tips" (``%`` = any string). The lookup must return the
+    literal keyword only — whichever of the two rows happens to sort first
+    under the old code was nondeterministic strategy data.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import Keyword
+
+    cluster = db.scalars(select(KeywordCluster)).first()
+    for kw, vol in (("100% seo tips", 111), ("100 seo tips", 222), ("a_b test", 333), ("a b test", 444)):
+        db.add(
+            Keyword(
+                cluster_id=cluster.id, keyword=kw, volume=vol,
+                kd=None, cpc=None, intent=None, source="excel",
+            )
+        )
+    db.commit()
+
+    assert ks.lookup_metrics(db, "100% seo tips").volume == 111
+    assert ks.lookup_metrics(db, "100 seo tips").volume == 222
+    assert ks.lookup_metrics(db, "a_b test").volume == 333
+    assert ks.lookup_metrics(db, "a b test").volume == 444
+
+
 def test_strategy_high_volume(db: Session):
     res = ks.query_dataset(db, KeywordDatasetQuery(min_volume=1000))
     assert [r.keyword for r in res] == ["attachment"]

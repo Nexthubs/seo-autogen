@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 
 from app.core.enums import JobStatus
 from app.db.models import GenerationJob, InternalLinkRule, Keyword, KeywordCluster
@@ -29,6 +29,7 @@ from app.pipeline.steps.keyword_prepare import prepare_keyword
 from app.schemas.internal_link import InternalLinkRule as Rule
 from app.services import internal_link_service as ils
 from app.services.keyword_import import import_workbook
+from app.services.keyword_service import lookup_metrics
 
 pytestmark = pytest.mark.skipif(
     not check_database(), reason="PostgreSQL not reachable"
@@ -247,7 +248,7 @@ def _make_job(keyword: str) -> GenerationJob:
         return job
 
 
-def test_keyword_in_dataset_sets_metrics_available(tmp_path: Path):
+async def test_keyword_in_dataset_sets_metrics_available(tmp_path: Path):
     wb = Workbook()
     ws = wb.active
     ws.title = "p3test-p3"
@@ -261,14 +262,14 @@ def test_keyword_in_dataset_sets_metrics_available(tmp_path: Path):
     job = _make_job("p3test in-dataset keyword")
     with SessionLocal() as session:
         dbjob = session.get(GenerationJob, job.id)
-        metrics = prepare_keyword(session, dbjob)
+        metrics = await prepare_keyword(session, dbjob)
         assert metrics is not None
         assert metrics.volume == 4200
         assert dbjob.keyword_metrics_available is True
         assert dbjob.status == JobStatus.SERP_SEARCHING.value
 
 
-def test_keyword_not_in_dataset_is_serp_only(xlsx: Path):
+async def test_keyword_not_in_dataset_is_serp_only(xlsx: Path):
     with SessionLocal() as session:
         import_workbook(session, xlsx, file_name="semrush.xlsx")
 
@@ -277,11 +278,60 @@ def test_keyword_not_in_dataset_is_serp_only(xlsx: Path):
     with SessionLocal() as session:
         dbjob = session.get(GenerationJob, job.id)
         assert dbjob.status == JobStatus.QUEUED.value
-        metrics = prepare_keyword(session, dbjob)
+        metrics = await prepare_keyword(session, dbjob)
         assert metrics is None
         assert dbjob.keyword_metrics_available is False
         # job continues, not failed
         assert dbjob.status == JobStatus.SERP_SEARCHING.value
+
+
+# ============================================================
+# audit M05: production-session (autoflush=False) duplicate new-word
+# import must not hit UNIQUE(cluster_id, keyword), and literal
+# %/_ keywords must not cross-match as LIKE wildcards.
+# ============================================================
+def test_m05_duplicate_new_words_same_sheet_pg(tmp_path: Path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "p3test-m05"
+    ws.append(["Keyword", "Volume", "KD", "CPC", "Intent"])
+    ws.append(["p3test SEO Tips for Beginners", 1000, 20, 1.0, "Informational"])
+    # Case-variant of the same NEW word: under autoflush=False the old code
+    # inserted both rows and the commit violated the unique constraint.
+    ws.append(["p3test seo tips for beginners", 900, 18, 0.9, "Informational"])
+    # Wildcard-bearing pair: old ilike() would have matched both.
+    ws.append(["p3test 100% off deals", 500, 15, 0.7, "Commercial"])
+    ws.append(["p3test 100 off deals", 400, 12, 0.5, "Commercial"])
+    path = tmp_path / "m05.xlsx"
+    wb.save(str(path))
+
+    with SessionLocal() as session:  # autoflush=False, same as production
+        report = import_workbook(session, path, file_name="m05.xlsx")
+        assert report.keywords_created == 3  # dup folded, not 4
+        assert any("duplicate keyword" in w for w in report.warnings)
+
+        count = session.scalar(
+            text(
+                "SELECT COUNT(*) FROM keywords WHERE cluster_id IN "
+                "(SELECT id FROM keyword_clusters WHERE sheet_name = :s)"
+            ),
+            {"s": "p3test-m05"},
+        )
+        assert count == 3
+
+        # Last-row-wins on the case-folded duplicate.
+        dup = session.scalars(
+            select(Keyword).where(
+                func.lower(Keyword.keyword) == "p3test seo tips for beginners"
+            )
+        ).one()
+        assert dup.volume == 900
+
+        # Literal lookup: no wildcard cross-matching (audit M05).
+        assert lookup_metrics(session, "p3test 100% off deals").volume == 500
+        assert lookup_metrics(session, "p3test 100 off deals").volume == 400
+        assert lookup_metrics(session, "p3test seo tips for beginners").volume == 900
+        assert lookup_metrics(session, "p3test SEO Tips for Beginners").volume == 900
 
 
 # ============================================================

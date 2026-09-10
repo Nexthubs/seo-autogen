@@ -21,8 +21,17 @@ from app.services import keyword_service
 logger = logging.getLogger(__name__)
 
 
-def prepare_keyword(session: Session, job: GenerationJob) -> KeywordMetrics | None:
+async def prepare_keyword(
+    session: Session, job: GenerationJob
+) -> KeywordMetrics | None:
     """Run the keyword-prepare step and checkpoint the job.
+
+    **Async to match the orchestrator's uniform step contract** (audit H04):
+    every step runner is awaited, so a sync step that returned a value
+    (the ``KeywordMetrics`` for a *known* keyword) made the orchestrator
+    raise ``TypeError`` — a known keyword always failed. Unknown keywords
+    returned ``None`` and slipped through. This step now returns a coroutine
+    like the other 14 steps.
 
     Returns the resolved metrics (None = SERP-only mode) so the next step
     can embed them in the research brief. The job advances to

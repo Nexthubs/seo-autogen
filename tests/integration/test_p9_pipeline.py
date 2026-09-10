@@ -41,6 +41,7 @@ from app.core.exceptions import PipelineError
 from app.db.models.article import ArticleReviewRow, ArticleVersionRow
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
+from app.db.models.keyword import Keyword, KeywordCluster
 from app.db.models.research import (
     ArticleOutlineRow,
     CompetitorAnalysisRow,
@@ -847,3 +848,68 @@ async def test_cost_tracking_records_usage_and_provider_costs(job, tmp_path):
         # The one planned/generated image carries the image-provider cost.
         img = session.scalars(select(ImageRow).where(ImageRow.job_id == job)).one()
         assert float(img.provider_cost) == pytest.approx(0.10)
+
+
+# ---------------------------------------------------------------------------
+# H04 regression: a DATASET (known) keyword must run the full chain to ready.
+#
+# Before the fix, prepare_keyword was the only SYNC step. The orchestrator
+# awaits every step runner and treats a non-None, non-awaitable return as a
+# bug -> TypeError -> the job failed with error_code UNEXPECTED. That only
+# happened for a KNOWN keyword (the metrics value); unknown keywords returned
+# None and slipped through, so the SERP-only path looked fine in tests.
+# ---------------------------------------------------------------------------
+async def test_known_keyword_full_run_reaches_ready(job, tmp_path):
+    """A keyword present in the imported dataset completes to ``ready``.
+
+    This is the exact H04 path: ``prepare_keyword`` returns a
+    :class:`KeywordMetrics` (not None). With the sync step that value tripped
+    the orchestrator's await; with the async step it resolves cleanly.
+    """
+    from decimal import Decimal
+
+    cluster = KeywordCluster(name="h04test cluster", sheet_name="h04test")
+    with SessionLocal() as session:
+        session.add(cluster)
+        session.commit()
+        session.refresh(cluster)
+        cluster_id = cluster.id
+
+    try:
+        with SessionLocal() as session:
+            session.add(
+                Keyword(
+                    cluster_id=cluster_id,
+                    keyword=KEYWORD,
+                    volume=4200,
+                    kd=Decimal("21.00"),
+                    cpc=Decimal("1.5000"),
+                    intent="Informational",
+                    source="h04test",
+                )
+            )
+            session.commit()
+
+        providers, llm, _, _, _, settings = _providers(tmp_path, _payloads())
+        with SessionLocal() as session:
+            job_row = session.get(GenerationJob, job)
+            result = await _full_run(session, job_row, providers, settings)
+
+        # The job must reach ready — NOT fail with UNEXPECTED (the old
+        # TypeError from awaiting the sync step's KeywordMetrics return).
+        assert result.status == JobStatus.READY.value
+        assert result.error_code is None
+
+        with SessionLocal() as session:
+            fresh = session.get(GenerationJob, job)
+            assert fresh.keyword_metrics_available is True
+            assert fresh.status == JobStatus.READY.value
+    finally:
+        with SessionLocal() as session:
+            session.execute(
+                sa_delete(Keyword).where(Keyword.cluster_id == cluster_id)
+            )
+            session.execute(
+                sa_delete(KeywordCluster).where(KeywordCluster.id == cluster_id)
+            )
+            session.commit()

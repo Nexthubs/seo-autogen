@@ -15,7 +15,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from openpyxl import load_workbook
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.models.keyword import Keyword, KeywordCluster
@@ -210,13 +210,36 @@ def import_workbook(session: Session, path: Path | str, file_name: str | None = 
             cluster_name=cluster.name,
             warnings=list(shell.warnings),
         )
-        for row in rows_by_sheet.get(shell.sheet_name, []):
-            # Case-insensitive match so re-imports never duplicate.
+        # Audit M05 — in-sheet dedup before insert. The production session
+        # runs with ``autoflush=False``: two rows in the same sheet whose
+        # keywords differ only in case (e.g. "SEO Tips" / "seo tips") are
+        # both "new" on the DB lookup, both get added, and the final commit
+        # hits ``UNIQUE(cluster_id, keyword)`` → IntegrityError. Deduping
+        # case-insensitively in memory (last row wins, a warning is emitted)
+        # makes the insert safe regardless of flush policy.
+        rows = rows_by_sheet.get(shell.sheet_name, [])
+        deduped: dict[str, int] = {}
+        for idx, row in enumerate(rows):
+            key = row.keyword.casefold()
+            if key in deduped:
+                first = rows[deduped[key]]
+                sheet_result.warnings.append(
+                    f"duplicate keyword '{row.keyword}' in sheet "
+                    f"'{shell.sheet_name}' — using last value "
+                    f"(first seen: '{first.keyword}')"
+                )
+            deduped[key] = idx
+        for idx, row in enumerate(rows):
+            if deduped[row.keyword.casefold()] != idx:
+                continue  # superseded by a later case-insensitive duplicate
+            # Case-insensitive *exact* match so re-imports never duplicate
+            # and literal ``%``/``_`` in keywords are not treated as LIKE
+            # wildcards (audit M05 — the old ``.ilike(keyword)`` was both).
             existing = session.scalar(
                 select(Keyword)
                 .where(
                     Keyword.cluster_id == cluster.id,
-                    Keyword.keyword.ilike(row.keyword),
+                    func.lower(Keyword.keyword) == row.keyword.lower(),
                 )
                 .limit(1)
             )

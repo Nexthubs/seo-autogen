@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
 from app.db.models import Keyword
@@ -119,6 +119,93 @@ def test_parse_missing_keyword_column_warns(tmp_path):
     shells, rows_by_sheet = parse_workbook_with_rows(path)
     assert rows_by_sheet["NoKeyword"] == []
     assert any("Keyword" in w for w in shells[0].warnings)
+
+
+# ============================================================
+# audit M05: duplicate *new* words in one sheet under autoflush=False
+# (the production session policy, app/db/session.py)
+# ============================================================
+@pytest.fixture()
+def db_noautoflush():
+    """Session with ``autoflush=False`` — the exact production policy.
+
+    Under this policy a DB lookup in ``import_workbook`` cannot see a
+    pending in-session insert, so two rows whose keywords differ only in
+    case ("SEO Tips" / "seo tips") are both treated as new and both
+    inserted → the final commit violates ``UNIQUE(cluster_id, keyword)``
+    (PostgreSQL folds case on TEXT UNIQUE) and raises IntegrityError.
+    """
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False)
+    with session_factory() as session:
+        yield session
+    engine.dispose()
+
+
+def test_duplicate_new_word_same_sheet_no_integrity_error(tmp_path, db_noautoflush):
+    """Audit M05: case-differing duplicates of a NEW word in one sheet.
+
+    Old code: both rows "new" → two inserts → IntegrityError at commit.
+    New code: in-sheet case-fold dedup → one insert, one warning.
+    """
+    from app.services.keyword_import import import_workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "M05"
+    ws.append(["Keyword", "Volume", "KD", "CPC", "Intent"])
+    ws.append(["SEO Tips for Beginners", 1000, 20, 1.0, "Informational"])
+    ws.append(["seo tips for beginners", 900, 18, 0.9, "Informational"])
+    path = tmp_path / "m05.xlsx"
+    wb.save(str(path))
+
+    report = import_workbook(db_noautoflush, path, file_name="m05.xlsx")
+
+    # Last row wins: the later (lowercase) metrics are the ones stored.
+    assert report.clusters_created == 1
+    assert report.keywords_created == 1
+    assert report.keywords_updated == 0
+    assert len(report.warnings) == 1
+    assert "duplicate keyword" in report.warnings[0]
+
+    rows = db_noautoflush.scalars(
+        select(Keyword).where(Keyword.keyword.ilike("seo tips%"))
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].keyword == "seo tips for beginners"
+    assert rows[0].volume == 900
+
+
+def test_duplicate_new_word_case_insensitive_rerun_upserts(tmp_path, db_noautoflush):
+    """Audit M05: re-import after a case-variant insert still upserts,
+    and literal ``%``/``_`` keywords are not cross-matched as wildcards."""
+    from app.services.keyword_import import import_workbook
+
+    def make(path, keywords):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "M05"
+        ws.append(["Keyword", "Volume"])
+        for kw in keywords:
+            ws.append([kw, 10])
+        wb.save(str(path))
+
+    # First file: a wildcard-bearing keyword plus a plain sibling that the
+    # OLD ilike("100% off") pattern would also have matched.
+    make(tmp_path / "a.xlsx", ["100% off deals", "100 off deals"])
+    r1 = import_workbook(db_noautoflush, tmp_path / "a.xlsx", file_name="a.xlsx")
+    assert r1.keywords_created == 2
+
+    # Second file: the case-variant of the first keyword must UPDERT the
+    # existing row, not insert a third one — even with autoflush off.
+    make(tmp_path / "b.xlsx", ["100% OFF DEALS", "100 off deals"])
+    r2 = import_workbook(db_noautoflush, tmp_path / "b.xlsx", file_name="b.xlsx")
+    assert r2.keywords_created == 0
+    assert r2.keywords_updated == 2
+
+    rows = db_noautoflush.scalars(select(Keyword)).all()
+    assert len(rows) == 2
 
 
 # ============================================================
