@@ -36,6 +36,3 @@ class SERPResponse(BaseModel):
     #: Cost (credits) reported by the paid SERP provider (spec section 54).
     #: None when the provider reports no cost (or the response lacks it).
     provider_cost: float | None = None
-    #: Cost (credits) reported by the paid SERP provider (spec section 54).
-    #: None when the provider reports no cost (or the response lacks it).
-    provider_cost: float | None = None

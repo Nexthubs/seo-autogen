@@ -262,11 +262,13 @@ def test_api_job_error_payload_derives_first_incomplete_step(client: TestClient)
         "advice": payload["error"]["advice"],
         "last_failed_step": 2,
         "last_failed_step_label": "SERP search",
+        # Audit M11: raw failure detail is exposed for debugging.
+        "error_raw": None,
     }
     # Exact key set (code/message stay for the machine-readable contract).
     assert set(payload["error"]) == {
         "code", "message", "category", "reason", "advice",
-        "last_failed_step", "last_failed_step_label",
+        "last_failed_step", "last_failed_step_label", "error_raw",
     }
 
 

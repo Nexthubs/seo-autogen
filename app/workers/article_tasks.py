@@ -87,11 +87,15 @@ def enqueue_job(
     ``None`` keeps the P8 full-run contract: the options dict rides as the
     2nd positional arg, so ``process_job`` is called exactly as before.
     """
-    queue = get_queue()
+    settings = get_settings()
+    queue = get_queue(settings)
     queue.enqueue(
         "app.workers.article_tasks.process_job",
         str(job_id),
         options or {},
+        # RQ's default job timeout (180s) is shorter than a full pipeline
+        # run, so it must be set explicitly per job (audit H08).
+        timeout=settings.rq_job_timeout_seconds,
     )
 
 
@@ -100,9 +104,12 @@ def enqueue_strapi_sync(job_id: str | uuid.UUID) -> None:
 
     Uses the dotted RQ 2.x task path (see :func:`enqueue_job`).
     """
-    queue = get_queue()
+    settings = get_settings()
+    queue = get_queue(settings)
     queue.enqueue(
-        "app.workers.article_tasks.sync_strapi_draft", str(job_id)
+        "app.workers.article_tasks.sync_strapi_draft",
+        str(job_id),
+        timeout=settings.rq_job_timeout_seconds,
     )
 
 

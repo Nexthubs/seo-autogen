@@ -658,3 +658,42 @@ class TestRetryRouteModes:
         assert route_client.post(
             f"/api/jobs/{job_id}/retry", data={"mode": "step", "step": "5"}
         ).status_code == 409
+
+
+class TestErrorRawLifecycle:
+    """Audit M11: error_raw is stored on failure, exposed in the error
+    payload, and cleared on retry."""
+
+    def test_error_raw_exposed_in_get_job(self, route_client):
+        job_id = route_client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+        _set_status(route_client, job_id, "failed")
+        with route_client.db_session() as session:
+            job = session.get(GenerationJob, uuid.UUID(job_id))
+            job.error_raw = "Traceback (most recent call last):\n  raw detail"
+            session.commit()
+
+        body = route_client.get(f"/api/jobs/{job_id}").json()
+        assert body["error"]["error_raw"].endswith("raw detail")
+
+    def test_error_raw_null_when_absent(self, route_client):
+        job_id = route_client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+        _set_status(route_client, job_id, "failed")
+        body = route_client.get(f"/api/jobs/{job_id}").json()
+        assert body["error"]["error_raw"] is None
+
+    def test_retry_clears_error_raw(self, route_client):
+        job_id = route_client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+        _set_status(route_client, job_id, "failed")
+        with route_client.db_session() as session:
+            job = session.get(GenerationJob, uuid.UUID(job_id))
+            job.error_raw = "stale traceback"
+            session.commit()
+
+        route_client.post(f"/api/jobs/{job_id}/retry")
+
+        with route_client.db_session() as session:
+            job = session.get(GenerationJob, uuid.UUID(job_id))
+            assert job.status == "queued"
+            assert job.error_code is None
+            assert job.error_message is None
+            assert job.error_raw is None

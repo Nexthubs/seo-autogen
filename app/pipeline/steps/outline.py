@@ -25,7 +25,7 @@ from app.db.models.research import (
     EvidenceNoteRow,
     SerpSynthesisRow,
 )
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.providers.llm.base import LLMProvider
 from app.schemas.research import ArticleOutline, ContentBrief
 from app.services.prompt_service import PromptSpec, load_prompt
@@ -124,6 +124,7 @@ async def run_outline(
         ).all()
     ]
 
+    set_llm_prompt(llm, prompt)
     outline = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_user_prompt(guideline_excerpt, brief, synthesis, evidence),
@@ -143,6 +144,10 @@ async def run_outline(
                 "errors": len(errors),
             },
         )
+        # The repair prompt produces the (re-)written outline, so the meter
+        # records the repair prompt's provenance for these calls (audit M09:
+        # a repaired outline must not be attributed to the generator prompt).
+        set_llm_prompt(llm, repair_prompt)
         outline = await llm.generate_structured(
             system_prompt=repair_prompt.content,
             user_prompt=build_repair_prompt(brief, outline, errors),
@@ -164,13 +169,18 @@ async def run_outline(
         session.delete(existing)
         session.flush()
 
+    # The persisted row records the prompt that produced the FINAL outline:
+    # the generator's, or the repair prompt's when a repair round was needed
+    # (audit M09: a repaired outline must not be stamped with the initial
+    # generator's hash).
+    effective = repair_prompt if repair_count > 0 else prompt
     session.add(
         ArticleOutlineRow(
             job_id=job.id,
             outline=outline.model_dump(mode="json"),
             model=llm_model_name(llm),
-            prompt_version=prompt.version,
-            prompt_hash=prompt.prompt_hash,
+            prompt_version=effective.version,
+            prompt_hash=effective.prompt_hash,
             valid=True,
             repair_count=repair_count,
         )

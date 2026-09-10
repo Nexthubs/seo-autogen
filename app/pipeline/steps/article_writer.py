@@ -25,7 +25,7 @@ from app.pipeline.steps._article_common import (
     load_research_context,
     persist_article_version,
 )
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.providers.llm.base import LLMProvider
 from app.schemas.article import ArticleDocument, ArticleDraftOutput
 from app.services.article_renderer import normalize_slug
@@ -141,6 +141,7 @@ async def run_article_writer(
             "cannot write an article without a validated outline",
         )
 
+    set_llm_prompt(llm, prompt)
     raw: ArticleDraftOutput = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_user_prompt(

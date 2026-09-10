@@ -25,7 +25,7 @@ from app.pipeline.steps._article_common import (
     article_view_json,
     latest_article_version,
 )
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.providers.llm.base import LLMProvider
 from app.schemas.images import ImagePlan, ImagePlanItem, ImagePlanOutput
 from app.services.image_count_service import image_ceiling
@@ -190,6 +190,7 @@ async def run_image_planner(
         article_view_json(version), guideline, word_count, ceiling
     )
 
+    set_llm_prompt(llm, prompt)
     raw: ImagePlanOutput = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=user_prompt,

@@ -20,7 +20,7 @@ from app.db.models.research import (
     SerpSynthesisRow,
 )
 from app.db.models.internal_link import InternalLinkRule
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.providers.llm.base import LLMProvider
 from app.schemas.research import ContentBrief
 from app.services.keyword_service import lookup_metrics
@@ -109,6 +109,7 @@ async def run_content_brief(
     metrics = lookup_metrics(session, job.keyword)
     metrics_dict = metrics.model_dump(mode="json") if metrics else None
 
+    set_llm_prompt(llm, prompt)
     brief = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_user_prompt(

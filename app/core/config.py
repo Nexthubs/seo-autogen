@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     # ======================================================
     redis_url: str = "redis://redis:6379/0"
     rq_queue_name: str = "seo"
+    #: Per-job RQ worker timeout. The default RQ timeout (180s) is shorter
+    #: than a full 15-step pipeline run (many LLM calls + image generation),
+    #: so every enqueue passes this explicitly (audit H08).
+    rq_job_timeout_seconds: int = 3600
 
     # ======================================================
     # LLM

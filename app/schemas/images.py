@@ -34,9 +34,6 @@ class GeneratedImage(BaseModel):
     #: Cost reported by the image provider (spec section 54). Most image
     #: APIs report no per-request cost — stays None then.
     provider_cost: float | None = None
-    #: Cost reported by the image provider (spec section 54). Most image
-    #: APIs report no per-request cost — stays None then.
-    provider_cost: float | None = None
 
 
 class ImagePlanItem(BaseModel):

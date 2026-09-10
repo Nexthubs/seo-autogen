@@ -49,6 +49,11 @@ class GenerationJob(Base):
 
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Verbatim raw failure detail kept for debugging (spec section 49).
+    #: The user-facing cause/advice is derived from ``error_code`` /
+    #: ``error_message``; this field never surfaces in the normal UI panel —
+    #: it is stored so a failed run can be diagnosed after the fact.
+    error_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = created_at_column()
     started_at: Mapped[datetime | None] = mapped_column(

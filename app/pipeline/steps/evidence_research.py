@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.db.models.research import EvidenceNoteRow, SerpSynthesisRow
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.providers.llm.base import LLMProvider
 from app.schemas.research import EvidenceNote
 from app.services.prompt_service import PromptSpec, load_prompt
@@ -70,6 +70,7 @@ async def run_evidence_research(
     ).first()
     context = synthesis_row.synthesis if synthesis_row is not None else {}
 
+    set_llm_prompt(llm, prompt)
     output = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_user_prompt(job.keyword, context),

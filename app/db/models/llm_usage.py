@@ -45,6 +45,12 @@ class LLMUsageRow(Base):
     #: Wall duration of the logical call in milliseconds (including any
     #: structured-output repair attempts).
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: Prompt provenance of the call (spec section 48: record prompt_name /
+    #: prompt_version / prompt_hash per LLM call). None for calls made
+    #: without a named prompt (e.g. raw text generation).
+    prompt_name: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(VARCHAR(32), nullable=True)
+    prompt_hash: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True)
 
     created_at: Mapped[datetime] = created_at_column()
 

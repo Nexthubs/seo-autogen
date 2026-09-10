@@ -210,6 +210,88 @@ class TestMeter:
         assert row.step == "article_writer"
         assert (row.input_tokens, row.output_tokens) == (7, 9)
 
+    async def test_records_prompt_provenance_when_set(self, db):
+        """Spec 48 / audit M09: usage rows carry prompt_name / version / hash
+        for calls made under a named prompt."""
+        job = _make_job(db)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _json_response("ok", None)
+
+        meter = MeteredLLMProvider(_llm(handler), db, job.id, settings=_settings())
+        meter.current_step = "content_brief"
+        meter.current_prompt = ("content_brief", "1.0.0", "abc123")
+        await meter.generate_text(system_prompt="s", user_prompt="u")
+        meter.current_prompt = ("outline_repair", "2.1.0", "def456")
+        meter.current_step = "outline"
+        await meter.generate_text(system_prompt="s", user_prompt="u")
+        db.commit()
+
+        rows = {
+            r.step: r
+            for r in db.scalars(
+                select(LLMUsageRow).where(LLMUsageRow.job_id == job.id)
+            ).all()
+        }
+        assert (
+            rows["content_brief"].prompt_name,
+            rows["content_brief"].prompt_version,
+            rows["content_brief"].prompt_hash,
+        ) == ("content_brief", "1.0.0", "abc123")
+        assert (
+            rows["outline"].prompt_name,
+            rows["outline"].prompt_version,
+            rows["outline"].prompt_hash,
+        ) == ("outline_repair", "2.1.0", "def456")
+        for r in rows.values():
+            assert r.model == "test-model"
+
+    async def test_prompt_columns_null_when_unset(self, db):
+        job = _make_job(db)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _json_response("ok", None)
+
+        meter = MeteredLLMProvider(_llm(handler), db, job.id)
+        meter.current_step = "article_writer"
+        await meter.generate_text(system_prompt="s", user_prompt="u")
+        db.commit()
+
+        row = (
+            db.scalars(select(LLMUsageRow).where(LLMUsageRow.job_id == job.id)).one()
+        )
+        assert row.prompt_name is None
+        assert row.prompt_version is None
+        assert row.prompt_hash is None
+
+
+# ---------------------------------------------------------------------------
+# set_llm_prompt helper (audit M09)
+# ---------------------------------------------------------------------------
+class TestSetLLMPrompt:
+    def test_sets_tuple_on_meter(self):
+        from app.pipeline.steps._common import set_llm_prompt
+        from app.services.prompt_service import PromptSpec
+
+        class FakeMeter:
+            current_prompt = None
+
+        meter = FakeMeter()
+        spec = PromptSpec(name="outline_generator", version="1.0.0",
+                          content="c", prompt_hash="h1")
+        set_llm_prompt(meter, spec)
+        assert meter.current_prompt == ("outline_generator", "1.0.0", "h1")
+
+    def test_noop_for_bare_provider_and_none(self):
+        from app.pipeline.steps._common import set_llm_prompt
+        from app.services.prompt_service import PromptSpec
+
+        class Bare:  # no current_prompt attribute
+            pass
+
+        set_llm_prompt(Bare(), PromptSpec("n", "v", "c", "h"))  # no exception
+        set_llm_prompt(Bare(), None)  # no exception
+
 
 # ---------------------------------------------------------------------------
 # DataForSEO cost passthrough

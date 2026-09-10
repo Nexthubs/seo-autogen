@@ -18,7 +18,7 @@ from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.db.models.research import CompetitorAnalysisRow, SerpSynthesisRow
 from app.db.models.serp import SerpResult, SerpRun
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.providers.llm.base import LLMProvider
 from app.schemas.research import SERPSynthesis
 from app.services.prompt_service import PromptSpec, load_prompt
@@ -98,6 +98,7 @@ async def run_serp_synthesis(
 
     paa, related = _serp_context(session, job)
 
+    set_llm_prompt(llm, prompt)
     synthesis = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_user_prompt(

@@ -20,7 +20,7 @@ from app.db.models.research import CompetitorAnalysisRow
 from app.db.models.source import JobSource, SourcePage
 from app.providers.llm.base import LLMProvider
 from app.schemas.research import CompetitorAnalysis
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.services.prompt_service import PromptSpec, load_prompt
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,7 @@ async def run_competitor_analysis(
         if page.id in already_analysed:
             continue
         content = page.content_markdown[:MAX_COMPETITOR_CHARS]
+        set_llm_prompt(llm, prompt)
         analysis = await llm.generate_structured(
             system_prompt=prompt.content,
             user_prompt=build_user_prompt(

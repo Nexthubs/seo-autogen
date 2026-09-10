@@ -30,6 +30,7 @@ and the RQ task can supply the real, configured providers.
 from __future__ import annotations
 
 import logging
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -165,7 +166,7 @@ async def _run_steps(
     # call records one llm_usage row (tokens + duration) in this session.
     # The step commits its own rows; the meter only tracks the current step
     # name, set in the loop below before each runner executes.
-    meter = MeteredLLMProvider(providers.llm, session, job.id)
+    meter = MeteredLLMProvider(providers.llm, session, job.id, settings=settings)
     llm = meter
 
     steps: list[tuple[str, object]] = [
@@ -443,6 +444,10 @@ async def run_job_pipeline(
         job.current_step = "failed"
         job.error_code = error.error_code.value
         job.error_message = error.message
+        # Raw failure detail kept for debugging (spec section 49): the
+        # provider's verbatim output / exception text, when the raising
+        # step attached one.
+        job.error_raw = error.raw
         job.completed_at = datetime.now(timezone.utc)
         session.commit()
         logger.error(
@@ -460,6 +465,10 @@ async def run_job_pipeline(
         job.current_step = "failed"
         job.error_code = "UNEXPECTED"
         job.error_message = str(error)
+        # Keep the full traceback for debugging an unexpected crash.
+        job.error_raw = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
         job.completed_at = datetime.now(timezone.utc)
         session.commit()
         logger.exception(

@@ -33,6 +33,7 @@ def test_generation_jobs_table_matches_spec_46_1():
         "keyword_metrics_available",
         "error_code",
         "error_message",
+        "error_raw",
         "created_at",
         "started_at",
         "completed_at",

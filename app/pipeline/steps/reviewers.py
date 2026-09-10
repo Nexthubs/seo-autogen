@@ -24,7 +24,7 @@ from app.pipeline.steps._article_common import (
     load_research_context,
     persist_review,
 )
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.providers.llm.base import LLMProvider
 from app.schemas.article import FactReview, SEOReview, StyleReview
 from app.services.prompt_service import PromptSpec, load_prompt
@@ -101,6 +101,7 @@ async def run_seo_review(
     version = _require_version(session, job)
     ctx = load_research_context(session, job)
 
+    set_llm_prompt(llm, prompt)
     review = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_seo_review_prompt(
@@ -155,6 +156,7 @@ async def run_fact_review(
     version = _require_version(session, job)
     ctx = load_research_context(session, job)
 
+    set_llm_prompt(llm, prompt)
     review = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_fact_review_prompt(
@@ -209,6 +211,7 @@ async def run_style_review(
     version = _require_version(session, job)
     ctx = load_research_context(session, job)
 
+    set_llm_prompt(llm, prompt)
     review = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_style_review_prompt(

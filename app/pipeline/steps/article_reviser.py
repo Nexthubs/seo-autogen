@@ -25,7 +25,7 @@ from app.pipeline.steps._article_common import (
     load_research_context,
     persist_article_version,
 )
-from app.pipeline.steps._common import llm_model_name
+from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.pipeline.steps.anti_copy_step import (
     REVIEW_TYPE as ANTICOPY_TYPE,
 )
@@ -101,6 +101,7 @@ async def run_article_reviser(
     ctx = load_research_context(session, job)
     brief = ctx["brief"] or {}
 
+    set_llm_prompt(llm, prompt)
     revised: ArticleDraftOutput = await llm.generate_structured(
         system_prompt=prompt.content,
         user_prompt=build_user_prompt(

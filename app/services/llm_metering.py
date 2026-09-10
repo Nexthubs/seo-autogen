@@ -51,15 +51,29 @@ class MeteredLLMProvider(LLMProvider):
         inner: LLMProvider,
         session: Session,
         job_id: object,
+        settings: object | None = None,
     ) -> None:
         self._inner = inner
         self._session = session
         self._job_id = job_id
         #: Set by the orchestrator before each step's runners execute.
         self.current_step: str = ""
+        #: The wrapper is the LLMProvider the pipeline steps see, so it must
+        #: expose ``_settings`` itself: ``llm_model_name`` in step code reads
+        #: ``llm._settings.llm_model`` off whatever object it is handed. The
+        #: orchestrator passes the pipeline settings here; without it the
+        #: recorded model name was always None (audit M09).
+        self._settings = settings
+        #: Provenance of the prompt of the current logical call, set by the
+        #: step runner right before it calls the LLM (spec section 48:
+        #: record prompt_name / prompt_version / prompt_hash per call).
+        self.current_prompt: tuple[str, str, str] | None = None
         self._model = _model_name(inner)
 
     def _record(self, duration_ms: int, usage: tuple[int, int] | None) -> None:
+        prompt_name, prompt_version, prompt_hash = (
+            self.current_prompt or (None, None, None)
+        )
         row = LLMUsageRow(
             job_id=self._job_id,
             step=self.current_step,
@@ -67,6 +81,9 @@ class MeteredLLMProvider(LLMProvider):
             input_tokens=usage[0] if usage else None,
             output_tokens=usage[1] if usage else None,
             duration_ms=duration_ms,
+            prompt_name=prompt_name,
+            prompt_version=prompt_version,
+            prompt_hash=prompt_hash,
         )
         self._session.add(row)
 

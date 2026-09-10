@@ -278,12 +278,16 @@ def _error_payload(session: Session, job: GenerationJob) -> dict | None:
         if last_failed_step
         else None
     )
-    return explain_error(
+    payload = explain_error(
         job.error_code,
         job.error_message,
         last_failed_step=last_failed_step,
         step_label=step_label,
     )
+    # Spec section 49 / audit M11: expose the raw failure detail (model raw
+    # output or exception traceback) for debugging; null when absent.
+    payload["error_raw"] = job.error_raw
+    return payload
 
 
 def _parse_retry_options(data: dict) -> tuple[str, int | None, bool]:
@@ -367,6 +371,7 @@ async def api_retry_job(
     job.current_step = None
     job.error_code = None
     job.error_message = None
+    job.error_raw = None
     job.started_at = None
     job.completed_at = None
     session.commit()
