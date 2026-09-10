@@ -62,6 +62,7 @@ from app.providers.extractor.base import ContentExtractor
 from app.providers.image.base import ImageProvider
 from app.providers.llm.base import LLMProvider
 from app.providers.serp.base import SERPProvider
+from app.services.article_dod import validate_article_done
 from app.services.image_count_service import IMAGE_MAX_COUNT, IMAGE_MIN_COUNT
 from app.services.llm_metering import MeteredLLMProvider
 from app.services.prompt_service import seo_guideline_excerpt
@@ -409,6 +410,18 @@ async def run_job_pipeline(
             # override it with a success transition.
             return job
         session.refresh(job)
+        # DoD gate (section 63) — the single point of admission to READY
+        # for every pipeline run (fresh run, retry, resume, and the
+        # no-rework backfill where the image step already marked READY):
+        # every SERP / Research / Article / Images bullet must hold.
+        # Failure -> FAILED with ARTICLE_VALIDATION_FAILED; checkpoints
+        # stay intact, so retrying a step recovers (section 9).
+        dod_errors = validate_article_done(session, job)
+        if dod_errors:
+            raise PipelineError(
+                ErrorCode.ARTICLE_VALIDATION_FAILED,
+                "Definition of Done not met: " + "; ".join(dod_errors),
+            )
         if job.status != JobStatus.READY.value:
             # A resume that found every step already checkpointed (e.g. the
             # run was cancelled after step 15) ends ready without rework.

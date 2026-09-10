@@ -183,6 +183,13 @@ REVISER_DRAFT = {
         "## Practical steps for p8test\n\n"
         "Set a realistic boundary and write down your feelings each evening. "
         "Follow the " + MARKER + " guide for a concrete no contact routine.\n"
+        "## FAQ\n\n"
+        "### What is avoidant attachment?\n\n"
+        "A pattern where closeness feels unsafe and the person keeps distance.\n"
+        "### Can avoidant people learn to be closer?\n\n"
+        "Yes. Slow, repeated safe experiences with a consistent partner help.\n"
+        "### How long does the no contact approach take?\n\n"
+        "Most people feel the first shift in a few weeks of steady practice.\n"
     ),
     "seo_title": "Anxious Attachment No Contact (Revised)",
     "meta_description": "Revised practical guide.",
@@ -505,6 +512,54 @@ async def test_full_pipeline_reaches_ready(job, tmp_path):
     job_dir = Path(tmp_path) / "articles" / str(job)
     assert (job_dir / "article.md").exists()
     assert (job_dir / "article.json").exists()
+
+
+async def test_dod_gate_fails_ready_without_faq(job, tmp_path):
+    """H-1 end-to-end: a pipeline run whose final article is missing the
+    FAQ section must NOT reach READY — the orchestrator gate lands the
+    job at FAILED with ARTICLE_VALIDATION_FAILED and every earlier
+    checkpoint stays intact (retryable, section 9)."""
+    payloads = list(_payloads())
+    # 5 competitor analyses, then synthesis/notes/brief/outline/writer +
+    # 3 reviews, then the reviser draft (index TOP_N + 8).
+    reviser_idx = TOP_N + 8
+    reviser = dict(payloads[reviser_idx])
+    reviser["body_markdown"] = reviser["body_markdown"].split("## FAQ")[0]
+    assert "## FAQ" not in reviser["body_markdown"]
+    payloads[reviser_idx] = reviser
+
+    providers, _, _, _, _, settings = _providers(tmp_path, payloads=payloads)
+    with SessionLocal() as session:
+        job_row = session.get(GenerationJob, job)
+        with pytest.raises(Exception):
+            await run_job_pipeline(
+                session, job_row, providers, settings=settings
+            )
+        session.refresh(job_row)
+        assert job_row.status == JobStatus.FAILED.value
+        assert job_row.error_code == "ARTICLE_VALIDATION_FAILED"
+        assert "Definition of Done not met" in job_row.error_message
+        assert "FAQ" in job_row.error_message
+        # Checkpoints are untouched: the image step already exported, the
+        # article revisions and reviews are all still persisted.
+        assert (
+            session.scalar(select(SerpRun).where(SerpRun.job_id == job))
+            is not None
+        )
+        assert (
+            session.scalars(
+                select(ArticleVersionRow).where(ArticleVersionRow.job_id == job)
+            ).all()
+        )
+        assert (
+            session.scalar(
+                select(ImageRow).where(
+                    ImageRow.job_id == job, ImageRow.role == "hero"
+                )
+            )
+            is not None
+        )
+        session.close()
 
 
 async def test_pipeline_persists_failure_on_llm_exhaustion(job, tmp_path):

@@ -172,6 +172,11 @@ table.kv td { padding: 6px 0; }
 .badge-terminal { background: #eef1f4; color: var(--muted); }
 .badge-queued { background: #fff4e0; color: var(--warn); }
 .badge-done { background: #e3f5ee; color: var(--ok); }
+/* provider status (spec 57) */
+.status-connected { background: #e3f5ee; color: var(--ok); }
+.status-configured { background: #e8efff; color: var(--accent-dark); }
+.status-missing { background: #fff4e0; color: var(--warn); }
+.status-failed { background: #fdeaea; color: #c0392b; }
 
 /* progress */
 .progress-track {

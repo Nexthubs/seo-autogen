@@ -17,7 +17,13 @@ P0 → P1 → … → P9.
 
 ## Current phase
 
-**P0–P9 全部完成 ✅**(P9 可靠性 / 生产化收口:P9-A 核心可靠性、P9-B1 成本、P9-B2 prompt 版本看板、P9-B3 错误 UI、P9-C 运维)。
+**P0–P9 全部实现完成 ✅**(P9 可靠性 / 生产化收口:P9-A 核心可靠性、P9-B1 成本、P9-B2 prompt 版本看板、P9-B3 错误 UI、P9-C 运维)。
+
+实现口径:全部阶段的功能已落地并通过自动化测试(`python3 -m pytest`,
+含 fake providers 的单元/集成/E2E 路径)。**运行验收**是指用真实外部服务
+(真实 LLM / DataForSEO / Exa / Image / Strapi / PostgreSQL / Redis)跑通
+一整篇 READY 文章并人工抽查,属于上线前的部署验收步骤,与本仓库的
+测试基线相互独立——`/settings` 页面可先行核对各依赖的连通状态。
 
 P9-C 运维提供两个手动 CLI(默认 dry-run,幂等,无自动/后台删除):
 
@@ -53,8 +59,18 @@ uvicorn app.main:app --reload --port 8080
 python -m app.workers.article_worker
 
 # 6. tests
-pytest
+python3 -m pytest            # full suite (baseline: 415 passed, 1 skipped)
 ```
+
+> **Migrations (concurrency note).** Schema changes are pure Alembic and are
+> applied by an operator (`alembic upgrade head`), never by the web/worker
+> processes at import or request time — there is no in-process DDL. Running
+> `alembic upgrade head` twice (or against an already-migrated DB) is a safe
+> no-op, and a single migration process is always safe to run; what to avoid
+> is two *concurrent* `alembic upgrade head` invocations against the same
+> database, since Alembic does not coordinate them (each process re-checks
+> `alembic_version` on connect; a stale reader could re-apply a revision).
+> Keep migrations single-process: run one operator command at a time.
 
 ## Docker
 

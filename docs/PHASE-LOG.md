@@ -211,6 +211,39 @@
 
 ---
 
+## 审计修复批(CODEX audit 全量收口)✅(已完成)
+
+**范围** —— 针对 CODEX 审计报告的全量修复,按优先级 H-1 → M-3 → M-1 → M-2 → L-1(H-2 仅回复说明,无代码改动)。
+
+- **H-1 — READY 前统一 DoD 门禁**:✅(已完成)。**无 Migration**。
+  - 新模块 `app/services/article_dod.py`:`validate_article_done(session, job) -> list[str]`(空列表 = 通过),纯只读,覆盖 spec §63 DoD 全部条款:SERP(run 存 raw_response、organic 结果、1–5 个来源且 `normalized_url` 唯一)、Research(竞品分析/综合/证据/简报/大纲 `valid=True`)、文章(标题/H1/seo_title/meta/slug/FAQ/CTA slot/`[[INTERNAL_LINK:*]]` 标记可解析/三审齐全/终版 anticopy 无严重重叠)、图片(hero 在 sort_order 0 且无 insertion marker、`hero.webp`/`inline-N.webp` 命名、alt_text、inline 标题存在于正文、1–3 张)。
+  - **单一门禁点**:只挂在 `app/pipeline/orchestrator.py` —— `_run_steps` 成功、`_cancelled` 检查之后无条件执行,覆盖 fresh run / retry / resume / READY backfill 全部路径;不落在 `image_generate` 步骤内(步骤级直调单测/集成测用最小 fixture,天然豁免)。
+  - 失败语义:抛 `PipelineError(ErrorCode.ARTICLE_VALIDATION_FAILED, "Definition of Done not met: " + 明细)` → job FAILED(`error_code`/`error_message` 落库),**检查点不动** → 可按步重试。
+- **M-3 — Strapi author/category 端点可配置**:✅(已完成)。
+  - `app/core/config.py` 新增 `strapi_author_plural_api_id`(默认 `authors`)/`strapi_category_plural_api_id`(默认 `categories`),对齐既有 `strapi_blog_plural_api_id` 模式;`strapi_cms.py` 的 `list_authors`/`list_categories` 改用配置端点;`.env.example` 补 `STRAPI_AUTHOR_PLURAL_API_ID` / `STRAPI_CATEGORY_PLURAL_API_ID`。
+- **M-1 — `/settings` 页(spec §57)**:✅(已完成)。
+  - `app/routes/web.py` 新增 `GET /settings`(nav 新增 "Settings" 链接,`app/templates/settings.html` + 4 个状态 badge CSS 类)。
+  - 七行:LLM / DataForSEO / Exa / Image API / Strapi / PostgreSQL / Redis;每行只报四种状态词之一(§57):`Missing`(未配置)/ `Connected`(已配置且可达)/ `Failed`(已配置但不可达);`Configured` 保留在状态枚举内(已配置但未探测时使用,当前实现凡已配置必探测)。
+  - 复用 `build_providers(settings)` + best-effort never-raise 模式(与 `app/routes/providers.py` 一致);DB 用 `check_database()`;Redis 用 `check_redis(settings.redis_url)` —— 该函数从 `app/main.py` 移到 `app/db/session.py`(避免 web→main 循环导入,`/health` 行为不变)。**不回显任何 secret(spec §60)**。
+- **M-2 — 迁移并发说明(仅文档)**:✅(已完成)。
+  - 事实:迁移是纯 Alembic、操作员手动 `alembic upgrade head`,web/worker 进程无任何 in-process DDL;单进程升级安全且幂等,需避免的是**两个并发** `alembic upgrade head`。README Quick start 段下新增 Migrations 注释框说明。
+- **L-1 — README 措辞**:✅(已完成)。
+  - "Current phase" 段改为"全部**实现**完成",并显式区分**实现口径**(全部功能落地 + `python3 -m pytest` 全绿)与**运行验收**(真实外部服务跑通一篇 READY 文章 + 人工抽查,属部署验收,与测试基线独立)。
+  - 测试命令改为可复现的 `python3 -m pytest` 并注明基线数量。
+- **H-2 — 审计方环境缺依赖(仅回复,无代码)**:✅(回复)。
+  - 审计方环境无 `pytest`/`httpx`/`SQLAlchemy`/`openpyxl`,其"测试不可运行"结论是环境性假象;本环境全量绿,见下。
+
+**测试**
+
+- 新增 `tests/unit/test_article_dod.py`(20 个:合规 job 通过 + 只读性 / 6 个文章字段缺失参数化 / 缺 style 审 / 缺终版 anticopy / 严重重叠 / 未知 INTERNAL_LINK 标记 / SERP run 缺失(来源留存)/ 重复 normalized_url / 6 个来源 / 大纲 invalid / 删光 Research 四行 / 坏图片计划 4 错 / 无图片 / 无版本)。
+- 新增 `tests/integration/test_p8_pipeline.py::test_dod_gate_fails_ready_without_faq`(e2e:reviser 稿缺 FAQ → `run_job_pipeline` → job FAILED + `ARTICLE_VALIDATION_FAILED` + "Definition of Done not met",且 SerpRun/文章版本/hero 图检查点全部留存)。
+- 新增 `tests/unit/test_strapi_cms_provider.py::test_author_and_category_api_ids_are_configurable`(自定义 `writers`/`tags` 端点被命中,默认端点不被访问)。
+- 新增 `tests/unit/test_p8_routes.py::test_web_settings_page_statuses_only`(七行齐全、仅四种状态词、4 Missing + 2 Connected + 1 Failed 断言,无 secret 回显)。
+- 配套 fixture 修正:p8 `REVISER_DRAFT` 补 FAQ 段(DoD 合规);p9 fixture 早已合规。
+- 全量:**415 passed, 1 skipped**(基线 392 + 新增 23)。
+
+---
+
 ## 关键工程约定(跨阶段速查)
 
 - Python 3.10,命令用 `python3`(PATH 无 `python`);测试 `python3 -m pytest -q`。
@@ -218,4 +251,8 @@
 - `_cancelled`(orchestrator)是 DB-truth,能看到 web 路由独立 session 的提交。
 - `reset_from_step` 删除映射:≤2 删 SerpRun/SerpResult;≤3 删 JobSource;**SourcePage 从不删**(TTL 缓存跨 retry 存活);reset 15 不删(部分幂等)。
 - 集成测试用真实 PostgreSQL;`check_database()` 失败时 skip。
+- DoD 门禁(§63)只有一个点:orchestrator `_run_steps` 成功后无条件执行
+  `validate_article_done`(fresh/retry/resume/backfill 全覆盖);步骤级直调(如
+  `run_image_generation`)天然豁免。门禁失败 = FAILED +
+  `ARTICLE_VALIDATION_FAILED`,检查点不动、可按步重试。
 - 交付节奏:每子批次交付中文报告(修改文件/实现说明/Migration/测试方法/测试结果/未解决问题),等用户确认再进入下一批。

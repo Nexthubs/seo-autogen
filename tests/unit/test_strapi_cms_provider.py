@@ -124,6 +124,31 @@ async def test_list_authors_and_categories(fake, provider):
     assert categories[0]["documentId"] == "c1"
 
 
+async def test_author_and_category_api_ids_are_configurable(fake):
+    """M-3: the collection endpoints are configurable per deployment —
+    a custom Strapi with ``writers`` / ``tags`` collection types is hit
+    at ``/api/{custom}``, not the hardcoded ``authors`` / ``categories``.
+    """
+    settings = _settings()
+    settings.strapi_author_plural_api_id = "writers"
+    settings.strapi_category_plural_api_id = "tags"
+    client = httpx.AsyncClient(
+        base_url="http://strapi.test", transport=httpx.MockTransport(fake)
+    )
+    provider = StrapiCMSProvider(
+        settings=settings, client=client, backoff_seconds=FAST_BACKOFF
+    )
+    authors = await provider.list_authors()
+    categories = await provider.list_categories()
+    assert authors == []
+    assert categories == []
+    # Both calls went to the configured endpoints, never the defaults.
+    assert fake.calls("GET", "/api/writers")
+    assert fake.calls("GET", "/api/tags")
+    assert not fake.calls("GET", "/api/authors")
+    assert not fake.calls("GET", "/api/categories")
+
+
 # ---------------------------------------------------------------- slug search
 async def test_find_blogs_by_slug_checks_both_statuses(fake, provider):
     fake.routes[("GET", "/api/blogs")] = httpx.Response(

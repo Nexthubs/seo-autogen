@@ -88,14 +88,16 @@ class StrapiCMSProvider(CMSProvider):
     # ------------------------------------------------------------
     async def list_authors(self, page_size: int = 10) -> list[dict]:
         data = await self._get(
-            "/api/authors", {"pagination[pageSize]": page_size},
+            f"/api/{self._settings.strapi_author_plural_api_id}",
+            {"pagination[pageSize]": page_size},
             code=ErrorCode.STRAPI_AUTH_FAILED,
         )
         return data.get("data") or []
 
     async def list_categories(self, page_size: int = 10) -> list[dict]:
         data = await self._get(
-            "/api/categories", {"pagination[pageSize]": page_size},
+            f"/api/{self._settings.strapi_category_plural_api_id}",
+            {"pagination[pageSize]": page_size},
             code=ErrorCode.STRAPI_AUTH_FAILED,
         )
         return data.get("data") or []

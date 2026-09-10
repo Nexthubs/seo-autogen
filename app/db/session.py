@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 
+import redis
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -37,6 +38,16 @@ def check_database() -> bool:
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+
+
+def check_redis(redis_url: str) -> bool:
+    """Return True if Redis answers PING (best-effort, never raises)."""
+    try:
+        client = redis.Redis.from_url(redis_url, socket_connect_timeout=3)
+        client.ping()
         return True
     except Exception:
         return False

@@ -1,19 +1,23 @@
 """Web UI routes (P8 — SEO-AUTO-DEV-SPEC.md section 43).
 
-Five pages, deliberately minimal (43: "V1 只做必要页面"):
+Pages, deliberately minimal (43: "V1 只做必要页面"):
 
 * ``/``                  — New Article (43.1)
 * ``/jobs``              — Job list (43.2)
 * ``/jobs/{id}``         — Job detail + HTMX 2-3s polling (43.3)
 * ``/articles/{job_id}`` — Article preview (43.4)
 * ``/keywords``          — Keyword dataset + workbook import (spec 20)
+* ``/prompts``           — Prompt version dashboard (P9-B2, spec 47/48)
+* ``/settings``          — Provider health page (spec 57)
 
-Provider status lives at ``/api/providers/status`` (44/57) and is shown on
-the job detail page, not as a standalone page.
+Provider status also lives at ``/api/providers/status`` (44/57) and is
+shown on the job detail page; ``/settings`` is the standalone page the
+spec names.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -25,7 +29,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
-from app.db.session import get_db
+from app.db.session import check_database, check_redis, get_db
 from app.pipeline.steps._article_common import latest_article_version
 from app.routes.datasets import api_import_keywords, _strategy_query
 from app.routes.jobs import (
@@ -48,6 +52,7 @@ from app.schemas.job import (
 from app.services.internal_link_service import resolve_markers
 from app.services.keyword_service import query_dataset
 from app.services.prompt_dashboard import prompt_dashboard_payload
+from app.workers.article_tasks import build_providers
 
 router = APIRouter(tags=["web"])
 
@@ -399,4 +404,83 @@ def prompts_page(request: Request, session: Session = Depends(get_db)) -> HTMLRe
             "nav": "prompts",
             **payload,
         },
+    )
+
+
+# ----------------------------------------------------------------------
+# 57  Settings / provider health page
+# ----------------------------------------------------------------------
+def _provider_statuses(settings) -> list[dict]:
+    """Seven status rows (spec 57): LLM, DataForSEO, Exa, Image API,
+    Strapi, PostgreSQL, Redis.
+
+    Each row reports exactly one of ``Configured`` / ``Missing`` /
+    ``Connected`` / ``Failed`` and NEVER a secret (spec 60 — no key,
+    token or URL value is echoed). The check is best-effort and tolerant
+    (same pattern as ``app.routes.providers``): unconfigured → Missing,
+    configured + reachable → Connected, configured + unreachable →
+    Failed. The page itself must never raise.
+    """
+    providers = build_providers(settings)
+    specs = (
+        ("LLM", "llm", settings.llm_configured),
+        ("DataForSEO", "serp", settings.dataforseo_configured),
+        ("Exa", "extractor", settings.exa_configured),
+        ("Image API", "image", settings.image_configured),
+        ("Strapi", "cms", settings.strapi_configured),
+    )
+
+    async def _probe() -> dict:
+        reachable: dict = {}
+        for name, attr, configured in specs:
+            provider = getattr(providers, attr)
+            try:
+                if configured:
+                    reachable[name] = bool(await provider.health_check())
+                else:
+                    reachable[name] = False
+            except Exception:  # noqa: BLE001 - status must never raise
+                reachable[name] = False
+            finally:
+                try:
+                    await provider.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        return reachable
+
+    reachable = asyncio.run(_probe())
+
+    rows: list[dict] = []
+    for name, _attr, configured in specs:
+        if not configured:
+            status = "Missing"
+        elif reachable.get(name):
+            status = "Connected"
+        else:
+            status = "Failed"
+        rows.append({"name": name, "status": status})
+
+    rows.append(
+        {
+            "name": "PostgreSQL",
+            "status": "Connected" if check_database() else "Failed",
+        }
+    )
+    rows.append(
+        {
+            "name": "Redis",
+            "status": "Connected" if check_redis(settings.redis_url) else "Failed",
+        }
+    )
+    return rows
+
+
+@router.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request) -> HTMLResponse:
+    """Provider + infrastructure health (spec 57)."""
+    settings = get_settings()
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        {"request": request, "nav": "settings", "rows": _provider_statuses(settings)},
     )

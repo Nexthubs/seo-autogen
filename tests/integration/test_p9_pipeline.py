@@ -186,6 +186,8 @@ STYLE_REVIEW = {
 }
 REVISER_DRAFT = {
     "title": "should be ignored",
+    # DoD-compliant final body (section 63 / writer contract): no H1,
+    # CTA slot section, and a ## FAQ section.
     "body_markdown": (
         "## What is avoidant attachment\n\n"
         "Attachment styles shape how adults pursue closeness in their "
@@ -193,6 +195,13 @@ REVISER_DRAFT = {
         "## Practical steps for p9test\n\n"
         "Set a realistic boundary and write down your feelings each evening. "
         "Follow the " + MARKER + " guide for a concrete recovery routine.\n"
+        "## FAQ\n\n"
+        "### q1?\n\n"
+        "A short, original p9 answer to the first question.\n\n"
+        "### q2?\n\n"
+        "A short, original p9 answer to the second question.\n\n"
+        "### q3?\n\n"
+        "A short, original p9 answer to the third question.\n"
     ),
     "seo_title": "Anxious Attachment Recovery (Revised)",
     "meta_description": "Revised practical guide.",

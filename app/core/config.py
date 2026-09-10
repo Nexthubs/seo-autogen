@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     strapi_blog_plural_api_id: str = "blogs"
     strapi_blog_uid: str = "api::blog.blog"
 
+    #: Plural API ids of the author / category collections (M-3): the
+    #: ``GET /api/{pluralApiId}`` endpoints are collection-type-specific,
+    #: so both are configurable to match a given Strapi deployment.
+    strapi_author_plural_api_id: str = "authors"
+    strapi_category_plural_api_id: str = "categories"
+
     strapi_default_author_document_id: str = ""
     strapi_default_category_document_id: str = ""
 

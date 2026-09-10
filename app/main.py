@@ -10,13 +10,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import redis
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import get_settings
 from app.core.logging import setup_logging
-from app.db.session import check_database
+from app.db.session import check_database, check_redis
 from app.routes import datasets, jobs, providers, prompts, strapi, web
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -61,15 +60,6 @@ def create_app() -> FastAPI:
     )
 
     return app
-
-
-def check_redis(redis_url: str) -> bool:
-    try:
-        client = redis.Redis.from_url(redis_url, socket_connect_timeout=3)
-        client.ping()
-        return True
-    except Exception:
-        return False
 
 
 app = create_app()

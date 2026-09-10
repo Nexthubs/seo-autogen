@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Settings — SEO Auto-Gen{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<p class="muted">
+  Provider and infrastructure health (spec §57). Status values are limited
+  to <code>Configured</code>, <code>Missing</code>, <code>Connected</code>
+  and <code>Failed</code>; secrets (API keys, tokens, connection URLs) are
+  never shown here (spec §60).
+</p>
+
+<table class="data">
+  <thead>
+    <tr>
+      <th>Service</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.name }}</td>
+      <td>
+        <span class="badge status-{{ row.status | lower }}">
+          {% if row.status == 'Connected' %}✓ Connected
+          {% else %}{{ row.status }}{% endif %}
+        </span>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

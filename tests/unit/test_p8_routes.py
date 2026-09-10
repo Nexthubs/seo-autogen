@@ -381,3 +381,44 @@ def test_web_keywords_page(client):
     assert response.status_code == 200
     assert "Keyword Dataset" in response.text
     assert "Import" in response.text
+
+
+def test_web_settings_page_statuses_only(client, monkeypatch):
+    """M-1 / spec 57: /settings renders the seven health rows and shows
+    only the four allowed status words — never any secret value."""
+    # The web route imports build_providers into its own namespace; patch
+    # both so no real provider (and thus no network) is constructed.
+    monkeypatch.setattr(
+        "app.routes.web.build_providers",
+        lambda settings=None: PipelineProviders(),
+    )
+    monkeypatch.setattr("app.routes.web.check_database", lambda: True)
+    monkeypatch.setattr("app.routes.web.check_redis", lambda url: True)
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    # All seven rows are present (spec 57).
+    for name in (
+        "LLM",
+        "DataForSEO",
+        "Exa",
+        "Image API",
+        "Strapi",
+        "PostgreSQL",
+        "Redis",
+    ):
+        assert name in response.text
+    # The only status words rendered are the four allowed ones.
+    import re
+
+    statuses = re.findall(
+        r'class="badge status-(connected|configured|missing|failed)"',
+        response.text,
+    )
+    assert len(statuses) == 7
+    # The LLM is configured in the test .env (llm_base_url set) and its
+    # fake reports down → Failed; DataForSEO/Exa/Image/Strapi are
+    # unconfigured → Missing; DB and Redis are patched reachable.
+    assert statuses.count("missing") == 4
+    assert statuses.count("connected") == 2
+    assert statuses.count("failed") == 1
