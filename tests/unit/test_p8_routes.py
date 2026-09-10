@@ -109,6 +109,69 @@ def test_api_create_job_persists_clamped_image_override(client):
     assert job.image_count_override == 2
 
 
+def test_m14_enqueue_failure_degrades_and_recovers(client, monkeypatch):
+    """M14 / spec 43.3: an RQ enqueue failure (Redis down) is NOT shown as a
+    normal queued job. It persists an explicit ``ENQUEUE_FAILED`` marker, the
+    API reports ``enqueued=False`` + ``error``, and a safe re-enqueue after
+    Redis recovers does NOT create a new job row."""
+    from app.routes import jobs as jobs_routes
+
+    # ---- Redis DOWN: enqueue raises -> _enqueue returns False ----
+    monkeypatch.setattr(
+        jobs_routes, "_enqueue", lambda job_id, options=None: False
+    )
+    resp = client.post("/api/jobs", json=_new_job_payload(keyword="m14 redis down"))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "queued"          # pipeline never started -> queued
+    assert body["enqueued"] is False
+    assert body["error"]
+    job_id = body["job_id"]
+
+    # The marker is persisted on the job row.
+    with client.db_session() as session:
+        job = session.get(GenerationJob, uuid.UUID(job_id))
+        assert job.status == "queued"
+        assert job.error_code == "ENQUEUE_FAILED"
+
+    # The job list still shows it (count = 1 so far).
+    assert len(client.get("/api/jobs").json()["jobs"]) == 1
+
+    # While ENQUEUE_FAILED, the fragment offers the safe re-enqueue button
+    # (not a terminal retry) so the operator can recover after Redis is up.
+    frag = client.get(f"/jobs/{job_id}/fragment")
+    assert "/api/jobs/%s/enqueue" % job_id in frag.text
+    assert "入队失败" in frag.text
+
+    # ---- Redis UP: safe re-enqueue recovers the SAME job, no new row ----
+    monkeypatch.setattr(jobs_routes, "_enqueue", lambda job_id, options=None: True)
+    re = client.post(f"/api/jobs/{job_id}/enqueue")
+    assert re.status_code == 200
+    re_body = re.json()
+    assert re_body["enqueued"] is True
+    assert re_body["status"] == "queued"
+
+    # Error marker cleared; SAME job id; still exactly ONE job row.
+    with client.db_session() as session:
+        job = session.get(GenerationJob, uuid.UUID(job_id))
+        assert job.error_code is None
+        assert job.error_message is None
+        assert job.status == "queued"
+    assert len(client.get("/api/jobs").json()["jobs"]) == 1
+
+
+def test_m14_re_enqueue_rejects_running_job(client, monkeypatch):
+    """M14: re-enqueue is rejected once the job has left ``queued`` (would
+    double-run the pipeline)."""
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    with client.db_session() as session:
+        job = session.get(GenerationJob, uuid.UUID(job_id))
+        job.status = "serp_searching"  # the pipeline has started
+        session.commit()
+    resp = client.post(f"/api/jobs/{job_id}/enqueue")
+    assert resp.status_code == 409
+
+
 def test_api_create_job_rejects_out_of_range_image_override(client):
     # The schema enforces 1..3; 4 is rejected with 422.
     response = client.post(
@@ -428,11 +491,193 @@ def test_web_job_detail_and_fragment(client):
     assert "detail-body" in fragment.text
 
 
+def test_web_job_detail_research_and_logs(client):
+    """M13: the job detail exposes the P4 research body (competitor analyses,
+    SERP synthesis, evidence notes) and a Logs block; the fragment renders
+    them read-only (spec 43.3)."""
+    from app.db.models.research import (
+        CompetitorAnalysisRow,
+        EvidenceNoteRow,
+        SerpSynthesisRow,
+    )
+    from app.db.models.source import SourcePage
+
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    with client.db_session() as session:
+        job = session.get(GenerationJob, uuid.UUID(job_id))
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        page = SourcePage(
+            url="https://competitor.example/a",
+            normalized_url="https://competitor.example/a",
+            url_hash="a" * 64,
+            title="Competitor A",
+            domain="competitor.example",
+            content_markdown="competitor body",
+            content_hash="b" * 64,
+            extractor="mock",
+            first_seen_at=now,
+            last_fetched_at=now,
+        )
+        session.add(page)
+        session.flush()
+        session.add(CompetitorAnalysisRow(
+            job_id=job.id, source_page_id=page.id,
+            analysis={"strengths": ["x"], "gaps": ["y"]}, model="m1",
+        ))
+        session.add(SerpSynthesisRow(
+            job_id=job.id, synthesis={"theme": "how to bake sourdough"},
+        ))
+        session.add(EvidenceNoteRow(
+            job_id=job.id, claim="80% hydration is typical",
+            source_title="Competitor A", source_url="https://competitor.example/a",
+            source_type="serp", confidence="high", usage="used", note="n",
+        ))
+        session.commit()
+
+    # job_detail_payload (drives /jobs/{id} and the fragment) carries the
+    # three research sections + a Logs block (M13).
+    from app.routes.jobs import job_detail_payload
+
+    with client.db_session() as session:
+        job = session.get(GenerationJob, uuid.UUID(job_id))
+        body = job_detail_payload(session, job)
+    assert len(body["competitor_analyses"]) == 1
+    assert body["competitor_analyses"][0]["source_title"] == "Competitor A"
+    assert body["competitor_analyses"][0]["analysis"]["strengths"] == ["x"]
+    assert body["synthesis"] == {"theme": "how to bake sourdough"}
+    assert body["evidence_notes"][0]["claim"] == "80% hydration is typical"
+    assert body["evidence_notes"][0]["confidence"] == "high"
+    assert isinstance(body["logs"]["steps"], list)
+    assert body["logs"]["steps"][0]["label"]
+
+    # The fragment renders them read-only.
+    fragment = client.get(f"/jobs/{job_id}/fragment")
+    html = fragment.text
+    assert "Competitor Analyses" in html
+    assert "SERP Synthesis" in html
+    assert "Evidence Notes" in html
+    assert "Logs" in html
+    assert "how to bake sourdough" in html  # synthesis content
+    assert "80% hydration is typical" in html  # evidence claim
+
+
 def test_web_article_preview_empty(client):
     job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
     response = client.get(f"/articles/{job_id}")
     assert response.status_code == 200
     assert "Article Preview" in response.text
+
+
+# ------------------------------------------------------------ M03 (rendered preview)
+def _preview_session(client):
+    """A session on the same in-memory engine the TestClient's requests use."""
+    from app.db.session import get_db as _get_db
+
+    dep = client.app.dependency_overrides[_get_db]
+    gen = dep()  # a generator that yields a session
+    return next(gen)
+
+
+def test_web_article_preview_renders_markdown(client, tmp_path):
+    """M03: the preview shows RENDERED HTML (headings/tables), not the raw
+    Markdown source, and a hero image with its alt text."""
+    from app.db.models.article import ArticleVersionRow
+    from app.db.models.images import ImageRow
+
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    session = _preview_session(client)
+    body = (
+        "## Introduction\n\n"
+        "| Col A | Col B |\n"
+        "|-------|-------|\n"
+        "| 1 | 2 |\n\n"
+        "More text.\n"
+    )
+    session.add(ArticleVersionRow(
+        job_id=uuid.UUID(job_id), version=2, stage="revision", title="My Title",
+        body_markdown=body, seo_title="SEO T", meta_description="MD", slug="my-slug",
+    ))
+    # A hero image file so the hero <img> renders with its alt text.
+    # (_local_image_url only checks the file exists; the static route is not
+    # exercised here, so no DATA_DIR override is needed.)
+    hero_file = tmp_path / "articles" / job_id / "images" / "hero.webp"
+    hero_file.parent.mkdir(parents=True)
+    hero_file.write_bytes(b"\xff\xd8x")
+    session.add(ImageRow(
+        job_id=uuid.UUID(job_id), role="hero", sort_order=1, purpose="hero",
+        prompt="p", filename="hero.webp", alt_text="Hero caption",
+        aspect_ratio="16:9", provider="openai", local_path=str(hero_file),
+    ))
+    session.commit()
+
+    resp = client.get(f"/articles/{job_id}")
+    assert resp.status_code == 200
+    html = resp.text
+    # Rendered: an <h2> heading and a real <table>, NOT the raw markdown.
+    assert "<h2" in html
+    assert "<table" in html
+    assert "|-------|" not in html  # the raw table separator is gone
+    # Hero image with its alt text.
+    assert 'alt="Hero caption"' in html
+    session.close()
+
+
+def test_web_article_preview_escapes_malicious_html(client):
+    """M03: raw HTML in the body is ESCAPED (section 60) — a <script> tag in
+    the article body must appear as literal text, never as executable HTML."""
+    from app.db.models.article import ArticleVersionRow
+
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    session = _preview_session(client)
+    body = "## Head\n\n<script>alert('pwned')</script>\n\nok\n"
+    session.add(ArticleVersionRow(
+        job_id=uuid.UUID(job_id), version=1, stage="writer", title="T",
+        body_markdown=body, seo_title="s", meta_description="m", slug="s",
+    ))
+    session.commit()
+
+    resp = client.get(f"/articles/{job_id}")
+    assert resp.status_code == 200
+    # The script tag must be escaped, not present as live HTML.
+    assert "<script>alert('pwned')</script>" not in resp.text
+    assert "&lt;script&gt;" in resp.text
+    session.close()
+
+
+def test_web_article_preview_inline_image_marker(client, tmp_path):
+    """M03: an inline image marker is resolved to a local <img> with its alt."""
+    from app.db.models.article import ArticleVersionRow
+    from app.db.models.images import ImageRow
+
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    session = _preview_session(client)
+    body = "## Section\n\nSome paragraph.\n\n[[IMAGE:inline-1]]\n"
+    session.add(ArticleVersionRow(
+        job_id=uuid.UUID(job_id), version=1, stage="writer", title="T",
+        body_markdown=body, seo_title="s", meta_description="m", slug="s",
+    ))
+    img_file = tmp_path / "articles" / job_id / "images" / "inline-1.webp"
+    img_file.parent.mkdir(parents=True)
+    img_file.write_bytes(b"\xff\xd8y")
+    session.add(ImageRow(
+        job_id=uuid.UUID(job_id), role="inline", sort_order=1, purpose="inline",
+        prompt="p", filename="inline-1.webp", alt_text="Inline caption",
+        aspect_ratio="16:9", provider="openai",
+        section_heading="Section", insertion_marker="inline-1",
+        local_path=str(img_file),
+    ))
+    session.commit()
+
+    resp = client.get(f"/articles/{job_id}")
+    assert resp.status_code == 200
+    html = resp.text
+    assert "<img" in html
+    assert 'alt="Inline caption"' in html
+    # The raw marker is resolved away.
+    assert "[[IMAGE:inline-1]]" not in html
+    session.close()
 
 
 def test_web_keywords_page(client):

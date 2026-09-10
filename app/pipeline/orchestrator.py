@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings, get_settings
 from app.core.enums import JobStatus
 from app.core.exceptions import ErrorCode, PipelineError
+from app.core.redaction import redact
 from app.db.models.job import GenerationJob
 from app.pipeline import checkpoints
 from app.pipeline.steps.article_reviser import run_article_reviser
@@ -454,11 +455,15 @@ async def run_job_pipeline(
         job.status = JobStatus.FAILED.value
         job.current_step = "failed"
         job.error_code = error.error_code.value
-        job.error_message = error.message
+        # M10: sanitize before persisting — a provider's raw error body
+        # may echo secrets (Bearer tokens, URL query keys, JSON
+        # "api_key": "..." forms); spec 60 forbids that reaching the DB
+        # / Web. The redaction pass is idempotent on already-clean text.
+        job.error_message = redact(error.message)
         # Raw failure detail kept for debugging (spec section 49): the
         # provider's verbatim output / exception text, when the raising
-        # step attached one.
-        job.error_raw = error.raw
+        # step attached one (redacted, section 60).
+        job.error_raw = redact(error.raw) if error.raw is not None else None
         job.completed_at = datetime.now(timezone.utc)
         session.commit()
         logger.error(
@@ -475,10 +480,13 @@ async def run_job_pipeline(
         job.status = JobStatus.FAILED.value
         job.current_step = "failed"
         job.error_code = "UNEXPECTED"
-        job.error_message = str(error)
-        # Keep the full traceback for debugging an unexpected crash.
-        job.error_raw = "".join(
-            traceback.format_exception(type(error), error, error.__traceback__)
+        # M10: the crash message / traceback may embed a secret (a URL
+        # query key, a Bearer token) — sanitize before persisting.
+        job.error_message = redact(str(error))
+        # Keep the full traceback for debugging an unexpected crash
+        # (redacted, spec section 60).
+        job.error_raw = redact(
+            "".join(traceback.format_exception(type(error), error, error.__traceback__))
         )
         job.completed_at = datetime.now(timezone.utc)
         session.commit()

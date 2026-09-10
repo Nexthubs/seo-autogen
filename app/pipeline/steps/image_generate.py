@@ -138,6 +138,11 @@ async def run_image_generation(
         row.mime_type = image.mime_type
         row.provider = image.provider
         row.provider_request_id = image.provider_request_id or None
+        # M12: this is the cost of THIS (re)generation — the CURRENT cost of
+        # the row. A step re-run that REUSES an existing image (the ``reused``
+        # path above) never reaches here, so it adds ZERO incremental cost.
+        # A cost the provider did not report (None) stays None (absent), not
+        # a fabricated 0.
         row.provider_cost = image.provider_cost
         session.commit()
 

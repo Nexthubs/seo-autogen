@@ -55,3 +55,62 @@ def test_secrets_are_redacted():
     line = json.dumps(record)
     assert "abcdef1234567890" not in line
     assert "<redacted>" in line
+
+
+def test_bearer_in_event_redacted():
+    record = _capture_and_emit("Authorization: Bearer sk-abcdef0123456789")
+    line = json.dumps(record)
+    assert "sk-abcdef0123456789" not in line
+    assert "<redacted>" in line
+
+
+def test_url_query_secret_in_event_redacted():
+    record = _capture_and_emit(
+        "GET https://api.example.com/search?api_key=sk-qqqwww&limit=5 failed"
+    )
+    line = json.dumps(record)
+    assert "sk-qqqwww" not in line
+    # the non-sensitive parameter survives
+    assert "limit=5" in line
+
+
+def test_json_quoted_key_pair_redacted():
+    record = _capture_and_emit('body: {"api_key": "sk-live-abc123", "n": 1}')
+    line = json.dumps(record)
+    assert "sk-live-abc123" not in line
+    assert "<redacted>" in line
+
+
+def test_structured_extra_secret_fields_redacted():
+    """M10: a dict/list payload passed via extra= is redacted recursively,
+    and the JSON-dumped line never carries the raw secret value."""
+    record = _capture_and_emit(
+        "request failed",
+        **{
+            "payload": {
+                "api_key": "sk-live-xyz789",
+                "nested": {"token": "tok-secret-1", "ok": 1},
+            }
+        },
+    )
+    line = json.dumps(record)
+    assert "sk-live-xyz789" not in line
+    assert "tok-secret-1" not in line
+    assert record["payload"]["api_key"] == "<redacted>"
+    assert record["payload"]["nested"]["token"] == "<redacted>"
+    # non-secret siblings are preserved
+    assert record["payload"]["nested"]["ok"] == 1
+
+
+def test_non_secret_fields_not_clobbered():
+    """Redaction must not touch ordinary values that merely *mention* a
+    secret word (e.g. a human count of api keys)."""
+    record = _capture_and_emit("the api keys available count is 5")
+    assert "the api keys available count is 5" in record["event"]
+
+
+def test_kv_password_assignment_redacted():
+    record = _capture_and_emit("connect failed: password=hunter22")
+    line = json.dumps(record)
+    assert "hunter22" not in line
+    assert "<redacted>" in line

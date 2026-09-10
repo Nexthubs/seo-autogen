@@ -27,7 +27,7 @@
 | B4 | P4 / P5 | H09, H06, H07, H11, M08 | ✅ 完成（见下） |
 | B5 | P6 | H05, H10, M06, M07, L01 | ✅ 完成（见下） |
 | B6 | P7 | H03, M01, M02 | ✅ 完成（见下） |
-| B7 | P8 / P9 + 文档 | M13, M14, M12, M10, M03, H12, L03 | ⏳ 待办 |
+| B7 | P8 / P9 + 文档 | M13, M14, M12, M10, M03, H12, L03 | ✅ 完成（见下） |
 
 > 决策记录：H11（不可变文章历史，属 P5/P9）原可放 B1 的 P1 范围，
 > 但修复依赖 P4/P5 的 checkpoint/版本语义重构，故移到 B4（P4/P5 批次）一并处理。
@@ -110,20 +110,30 @@
 
 > **决策记录（§8 vs §64）**：§8 规范状态枚举未列 `strapi_sync_failed`，§64 明确"Strapi 同步失败"为独立失败语义。取 **21 值枚举**（含 `strapi_sync_failed`），且该值**不是** terminal——文章 pipeline 已成功（§41 锚点 `strapi_document_id` 必须保留以供幂等重试），只有 sync 专用通道可重试；pipeline 级 retry/cancel 与自动清理均不触碰它。`test_enums.py` 断言 21 值 + 非 terminal，防止后续漂移。
 
-### B7 — P8 / P9 + 文档（⏳）
+### B7 — P8 / P9 + 文档 ✅
 
-| ID | 级别 | 问题摘要 | 计划 | 状态 |
-|---|---|---|---|---|
-| M13 | Med | Job Detail 无 competitor/synthesis/evidence 研究正文与 Logs 区 | 结构化只读呈现 + 按步骤错误日志 | ⏳ |
-| M14 | Med | enqueue 失败被当正常 queued，UI 无恢复提示 | 显式排队失败状态 + 安全重投（outbox 语义）；Redis down→up 恢复测试 | ⏳ |
-| M12 | Med | 成本随重试删除/覆盖、缓存归属错误（读 credits 而非 cost） | 不可变请求账本 + 当前 artifact 分离；cache hit 记零新增 | ⏳ |
-| M10 | Med | JSON 序列化 secret 与异常消息脱敏不可靠 | 递归脱敏（JSON/URL 参数/Bearer/响应回显） | ⏳ |
-| M03 | Med | Preview 输出原始 Markdown，缺 inline 图片 | 安全 Markdown 渲染 + 图片 placement；heading/table/link/alt/恶意 HTML 测试 | ⏳ |
-| H12 | High | 备份含图片但 restore 不恢复图片 | restore 解包 artifacts.tar + 路径/摘要校验；全新 DATA_DIR 恢复验证 | ⏳ |
-| L03 | Low | README/PHASE-LOG “全部实现完成”口径高于实际 | 修正文档：附 commit、环境、mock/live 范围、待修复列表 | ⏳ |
+| ID | 级别 | 问题摘要 | 修复内容 | 关键文件 | 测试证据 | 状态 |
+|---|---|---|---|---|---|---|
+| M13 | Med | Job Detail 无 competitor/synthesis/evidence 研究正文与 Logs 区 | `job_detail_payload` 读时派生（无 schema 变更）：`competitor_analyses`（逐条 + 源页 title/url/analysis/model）、`synthesis`（最新 SerpSynthesisRow）、`evidence_notes`（claim/source/type/confidence/usage/note）、`logs`（`current_step` + job error code/message/raw + 全 15 步 `checkpoint_status`）；`job_fragment.html` 新增 4 卡片（Competitor Analyses / SERP Synthesis / Evidence Notes / Logs：当前步 + 错误 + 15 步进度 ol） | `app/routes/jobs.py`、`app/templates/job_fragment.html` | `tests/unit/test_p8_routes.py::test_web_job_detail_research_and_logs`（直接调 `job_detail_payload` 断言 4 字段 + fragment HTML 含 4 标题与内容） | ✅ |
+| M14 | Med | enqueue 失败被当正常 queued，UI 无恢复提示 | ① `create_job`：`_enqueue` 返回 False 时 job 保持 `queued` 并写 `error_code="ENQUEUE_FAILED"` + 中文 error_message（非 terminal，符合 §43.3 降级到手动重试）；② `CreateJobResponse` 增 `enqueued: bool = True` / `error: str \| None = None`（向后兼容）；③ 新增 `POST /api/jobs/{id}/enqueue`（**仅** `status=="queued"` 可重投，拒绝 terminal 与非 queued → 409，成功后清 error 三字段）；④ `job_fragment.html` 在 `queued + ENQUEUE_FAILED` 时显示错误告警 + "重新入队" `hx-post` 按钮 | `app/routes/jobs.py`、`app/schemas/job.py`、`app/templates/job_fragment.html` | `tests/unit/test_p8_routes.py::test_m14_enqueue_failure_degrades_and_recovers`（monkeypatch `_enqueue` False → API `enqueued=False`+error、row 有 `ENQUEUE_FAILED`、fragment 显示入队失败 + 重入队按钮；恢复 `_enqueue`→True 后重入队 200、标记清除、仍仅 1 个 job 行）+ `test_m14_re_enqueue_rejects_running_job`（`serp_searching` → 409） | ✅ |
+| M12 | Med | 成本随重试删除/覆盖、缓存归属错误（读 credits 而非 cost） | ① `llm_usage` 改**不可变 append-only 台账**（§54）：`checkpoints.reset_from_step` 删除 L363-391 的 `delete(LLMUsageRow)` 块——重试只追加新行、累加成本，不删历史（无读者按"当前 usage"求和，安全）；`llm_usage.py` model docstring 同步更正；② `source_extract`：`source_pages` 是跨 job 共享 TTL 缓存，`provider_cost` = 该页**最后一次 fresh 提取**的成本（非每 job 台账）——cache hit 路径从不改写行，零新增成本（注释明确化）；③ `image_generate`：复用（M06）路径零新增，仅真实重生成写入**当前**成本；④ `_extract_cost()` 读 `cost` 非 `credits`（B2 已改，本批核对）；⑤ None 成本保持 None（不造 0） | `app/pipeline/checkpoints.py`、`app/db/models/llm_usage.py`、`app/pipeline/steps/source_extract.py`、`app/pipeline/steps/image_generate.py` | `tests/unit/test_p9b1_cost.py::TestResetKeepsUsageLedger`（改写原 `TestResetDeletesUsage`：reset 不删任何 usage 行 / 全量 reset 保留 + 重跑累加 3 行 in=42 / None tokens 不造 0）+ `tests/unit/test_p9_reliability.py::TestM12CacheHitCost::test_cache_hit_does_not_repay_or_fabricate_cost`（fresh 提取 cost=0.25 落缓存行；cache hit 0 次调用且不改写行；None 成本经 force_refresh 落 None） | ✅ |
+| M10 | Med | JSON 序列化 secret 与异常消息脱敏不可靠 | 新增 `app/core/redaction.py`：`redact()`（Bearer → KV → URL-query 顺序，`<redacted>` 替换）/ `redact_value()`（递归 dict/list/tuple/set）/ `redact_dict()`；`JsonLogHandler.emit` 对 event、extra 非内建字段、异常文本、最终 JSON 行全部脱敏；orchestrator `PipelineError` + UNEXPECTED 分支脱敏 `error_message`/`error_raw`/traceback；`strapi_sync` 两条失败路径脱敏（token 不进日志/web，§60） | `app/core/redaction.py`（新增）、`app/core/logging.py`、`app/pipeline/orchestrator.py`、`app/pipeline/steps/strapi_sync.py` | `tests/unit/test_logging.py`（9 用例：Bearer/KV/URL-query 替换、递归嵌套、extra 非内建字段、异常文本、handler 端到端 JSON 行、`redact_dict`、非 dict 容忍、幂等、无 secret 不变） | ✅ |
+| M03 | Med | Preview 输出原始 Markdown，缺 inline 图片 | ① 渲染器改 `MarkdownIt("default")` + `linkify=False`（**非** commonmark——后者透传原始 HTML）：转义原始 HTML（`<script>`→`&lt;script&gt;`）与属性值（`&quot;`/`%22`）、渲染 GFM 表格、绝不发 `javascript:` 链接（保留字面文本）→ 输出可安全 `\|safe`；② 新增 `_local_image_url(job,row)`（`local_path` 文件存在 → `/static/job-images/{job.id}/{filename}`）与 `_resolve_preview_body(session,job,version)`：`resolve_markers`（未知 marker 保留字面 → 容错）→ 查 `ImageRow`（sort_order）→ hero = 首个 role=="hero" → inline 图仅本地文件存在时按 `insertion_marker` 内联 → `insert_image_markers` → `resolve_image_markers` → `_render_md`；③ preview 路由传 `hero_alt` | `app/routes/web.py`、`app/templates/article_preview.html` | `tests/unit/test_p8_routes.py` 新增 3 用例：`test_web_article_preview_renders_markdown`（h2+表格渲染、原始 `|-------|` 不出现、`alt="Hero caption"`，写真实 tmp 图片文件）、`test_web_article_preview_escapes_malicious_html`（`&lt;script&gt;` 出现、活标签不出现）、`test_web_article_preview_inline_image_marker`（img+alt 内联、marker 已解析） | ✅ |
+| H12 | High | 备份含图片但 restore 不恢复图片 | ① `restore_archive(archive, target_engine, *, clear=False, data_dir=None) -> {"tables","artifacts","image_files","missing_images"}`：**写库前**解包 `artifacts.tar` 到 `{data_dir}/.restore_staging` → 校验 image 行的 `local_path` 重锚后文件齐全（缺失 → `BackupError`，**DB 完全不动**）→ 提升为 `{data_dir}/articles` → 单事务导入 DB；② `validate_archive`：image 行>0 但归档无 artifacts → 报错（OSError/tar/json/ValueError 包装为 `BackupError`）；③ `_remap_local_path` 重锚 `articles/` 段；④ CLI `restore` 增 `--data-dir` | `app/ops/backup.py` | `tests/unit/test_p9c_ops.py` 新增 5 用例（归档布局含 artifacts / 写库前缺文件 → BackupError 且目标库零行 / 全新 data_dir round-trip 图片文件落位 + DB 行路径重锚 / image 行无 artifacts → 校验报错 / staging 清理）+ 既有 restore round-trip 断言扩展 | ✅ |
+| L03 | Low | README/PHASE-LOG “全部实现完成”口径高于实际 | ① `README.md` "Current phase" 段改写：P0–P9 实现 + 审计 B1–B7 全部修复，逐批 **commit 表**（B1 `cf85665` … B6 `52d3643` / B7 HEAD）+ 诚实口径声明——测试口径（fake providers + 本地 PG，不调真实付费 API / 不写真实 Strapi）vs live 运行验收（真实服务跑通整篇 READY + 人工抽查，**独立上线前步骤，尚未完成**）；测试基线注更新为 `520 passed`；② `docs/PHASE-LOG.md`：总览表增审计行（含 7 个 commit）、总览段诚实口径声明、新增"B1–B7 审计修复"详节（逐批修复项 + 测试基线演进 415→520） | `README.md`、`docs/PHASE-LOG.md` | 静态核对（文档）；与 `git log` 7 个批次 commit 一一对应 | ✅ |
+
+**B7 测试结果**：`520 passed, 1 skipped`（B6 后 501 + 净增 19：M03 ×3、M13 ×1、M14 ×2、M12 新增 ×3 + 改写 ×2、M10 ×9、H12 ×5；另有多条既有断言按 M12 台账语义改写）。**无新迁移**（M13 读时派生、M14 复用现有列）。
 
 ## 变更日志
 
+- **2026-09-17 — B7 完成**：M13 / M14 / M12 / M10 / M03 / H12 / L03 全部修复并测试（`520 passed, 1 skipped`，净增 19 用例）。**无新迁移**。至此 CODEX 审计报告 30 项（0 Critical / 12 High / 15 Medium / 3 Low）全部在 B1–B7 收口。
+  - **M13**：Job Detail 读时派生（无 schema 变更）研究正文 + Logs——`competitor_analyses`（逐条 + 源页 title/url/analysis/model）、`serp_synthesis`、`evidence_notes`、`logs`（current_step + job error + 全 15 步 checkpoint）；`job_fragment.html` 新增 4 卡片。
+  - **M14**：enqueue 失败降级 + 安全重投——入队失败 job 保持 `queued` + `error_code="ENQUEUE_FAILED"`（非 terminal，§43.3 降级手动重试）；`CreateJobResponse` 增 `enqueued/error`；新增 `POST /jobs/{id}/enqueue`（仅 `status=="queued"` 可重投，其余 409，成功后清 error 标记）；fragment 红色告警 + "重新入队" `hx-post` 按钮。
+  - **M12**：`llm_usage` 改**不可变 append-only 台账**（§54）——`reset_from_step` 不再删 usage 行（重试累加、保留历史）；`source_pages` 共享缓存 `provider_cost` = 最后一次 fresh 提取成本（cache hit 零新增）；`image_generate` 复用零新增；`_extract_cost` 读 `cost` 非 `credits`（B2 已改）；None 成本保持 None（不造 0）。
+  - **M10**：新增 `app/core/redaction.py`（Bearer → KV → URL-query 顺序递归脱敏）；`JsonLogHandler` / orchestrator 异常路径 / strapi_sync 失败路径全部脱敏，secret 不进日志/web（§60）。
+  - **M03**：预览安全渲染 + 图片 placement——`MarkdownIt("default", linkify=False)`（转义原始 HTML/属性值、GFM 表格、不发 `javascript:` 链接）；`_resolve_preview_body()` 内链 → hero → inline（仅本地文件存在）→ 渲染；fragment 传 `alt`。
+  - **H12**：`restore_archive` 写库前解包 `artifacts.tar` 并校验图片文件齐全（缺失 → `BackupError`，DB 不动），重锚 `articles/` 后单事务导入；`validate_archive` 对"有 image 行但无 artifacts"报错；CLI 增 `--data-dir`。
+  - **L03**：诚实文档——`README.md` 现状段改 B1–B7 逐批 commit 表 + mock/live 验收边界声明；`docs/PHASE-LOG.md` 总览表增审计行、新增 B1–B7 详节、测试基线更新至 `520 passed`。
 - **2026-09-17 — B6 完成**：H03 / M01 / M02 全部修复并测试（`501 passed, 1 skipped`，净增 15 用例）。**无新迁移**。
   - **H03**：`StrapiCMSProvider` 解析改 Strapi 5 REST 契约——entry 扁平 `data`（无 `attributes` 包裹，`id/documentId` 必填否则 `STRAPI_SCHEMA_MISMATCH`）、`/api/upload` 的 `data` **数组**取 `[0]`、`get_draft` 带 `populate[author]/* [category]/* [mainImage]/*`；v4 嵌套/单对象形状全部保留为兜底（§35）。schema 放宽 relation/media 为 `str|int|dict|None`，新增 `relation_document_id()/media_url()/media_id()` 统一 helper；`routes/strapi.py::_items` 扁平优先。
   - **M01**：新增非 terminal 状态 `strapi_sync_failed`（§64）——pre-sync 前置检查 / 中途失败 / 缺本地图片文件三条路径全部落统一持久化状态（job + sync row FAILED，**保留 `strapi_document_id`** 幂等锚）；同步重试走 sync 专用通道（`_SYNCABLE_STATUSES`/UI Push-Update/`can_update`），pipeline retry/cancel 维持 409，自动清理永不扫；UI 红色 `badge-error` 徽章 + Strapi 卡片 "Sync failed" 告警区。§8 枚举缺此值 → 以 §64 为准取 21 值（决策已记录，`test_enums.py` 防漂移）。

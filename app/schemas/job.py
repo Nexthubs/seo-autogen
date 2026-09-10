@@ -77,3 +77,8 @@ class CreateJobResponse(BaseModel):
 
     job_id: str
     status: str = "queued"
+    # M14: whether the RQ run was actually enqueued. ``False`` means the job
+    # was persisted but degraded to manual retry (see ``error``); a safe
+    # re-enqueue is available via POST /api/jobs/{id}/enqueue.
+    enqueued: bool = True
+    error: str | None = None

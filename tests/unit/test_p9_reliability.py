@@ -390,6 +390,56 @@ class TestForceRefresh:
 
 
 # ===========================================================================
+# M12 / spec section 54: source cache hits are zero-incremental cost
+# ===========================================================================
+class TestM12CacheHitCost:
+    @pytest.mark.asyncio
+    async def test_cache_hit_does_not_repay_or_fabricate_cost(self, db):
+        settings = _settings()
+        settings.source_cache_ttl_hours = 168
+        job = _make_job(db)
+        _seed_serp(db, job)
+        cache = SourceCache(settings)
+
+        class CostingExtractor(_CountingExtractor):
+            def __init__(self, cost, **kw):
+                super().__init__(**kw)
+                self.cost = cost
+
+            async def extract(self, urls):
+                pages = await super().extract(urls)
+                for p in pages:
+                    p.provider_cost = self.cost
+                return pages
+
+        # Fresh extraction pays once and stamps the shared cache row.
+        ext = CostingExtractor(0.25)
+        await run_source_extract(db, job, ext, cache=cache, settings=settings,
+                                 max_sources=5, force_refresh=False)
+        row = cache.find_fresh(db, "https://one.example.com")
+        assert row is not None
+        assert float(row.provider_cost) == 0.25
+
+        # A cache hit makes zero extractor calls: it re-pays NOTHING and
+        # must NOT overwrite the row with the (unpaid) new cost.
+        ext2 = CostingExtractor(0.99)
+        await run_source_extract(db, job, ext2, cache=cache, settings=settings,
+                                 max_sources=5, force_refresh=False)
+        assert ext2.calls == 0
+        row = cache.find_fresh(db, "https://one.example.com")
+        assert float(row.provider_cost) == 0.25  # last FRESH cost, unchanged
+
+        # A cost the provider never reports stays None (absent) — never a
+        # fabricated 0.
+        ext3 = CostingExtractor(None)
+        await run_source_extract(db, job, ext3, cache=cache, settings=settings,
+                                 max_sources=5, force_refresh=True)
+        assert ext3.calls == 2
+        row = cache.find_fresh(db, "https://one.example.com")
+        assert row.provider_cost is None
+
+
+# ===========================================================================
 # orchestrator validation (no DB round-trip needed for the guard clauses)
 # ===========================================================================
 class TestOrchestratorValidation:

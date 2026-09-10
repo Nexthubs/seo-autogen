@@ -181,8 +181,14 @@ async def run_source_extract(
                 continue
             row = cache.upsert(session, page, url)
             # Record the fresh extraction's cost on the cache row (spec
-            # section 54). Cache hits never re-pay: their rows keep the
-            # cost of the last fresh extraction (or None).
+            # section 54). M12: ``source_pages`` is a TTL cache SHARED across
+            # jobs, so ``provider_cost`` is the cost of the LAST *fresh*
+            # extraction of that page — NOT a per-job ledger. A cache hit
+            # above never reaches this line: it performs zero extractor calls
+            # and therefore adds ZERO incremental cost to this job (the job
+            # consumes the already-payed-for page). A fresh extraction pays
+            # once and the shared row is refreshed. A missing/None cost stays
+            # None (absent), never coalesced into 0.
             row.provider_cost = page.provider_cost
 
         # Content dedup (section 14.1): same content at different URLs

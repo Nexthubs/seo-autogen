@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings, get_settings
 from app.core.enums import JobStatus, StrapiSyncStatus
 from app.core.exceptions import ErrorCode, PipelineError
+from app.core.redaction import redact
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
 from app.db.models.strapi_syncs import StrapiSyncRow
@@ -105,11 +106,13 @@ def _fail_pre_sync(
         )
         session.add(row)
     row.sync_status = StrapiSyncStatus.FAILED.value
-    row.error_message = str(error)
+    # M10: sanitize before persisting (spec 60) — a provider error body
+    # may echo a Bearer token / URL query key / JSON secret form.
+    row.error_message = redact(str(error))
     job.status = JobStatus.STRAPI_SYNC_FAILED.value
     job.current_step = "strapi_sync"
     job.error_code = error.error_code.value
-    job.error_message = error.message
+    job.error_message = redact(error.message)
     job.completed_at = job.completed_at or datetime.now(timezone.utc)
     session.commit()
     raise error
@@ -441,11 +444,13 @@ async def run_strapi_sync(
                 )
                 session.add(row)
         row.sync_status = StrapiSyncStatus.FAILED.value
-        row.error_message = str(error)
+        # M10: sanitize before persisting (spec 60) — see the
+        # first-precheck failure path above.
+        row.error_message = redact(str(error))
         job.status = JobStatus.STRAPI_SYNC_FAILED.value
         job.current_step = "strapi_sync"
         job.error_code = error.error_code.value
-        job.error_message = error.message
+        job.error_message = redact(error.message)
         job.completed_at = job.completed_at or datetime.now(timezone.utc)
         session.commit()
         logger.warning(

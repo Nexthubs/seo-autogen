@@ -15,6 +15,19 @@
     <span class="badge badge-{{ 'error' if st == 'strapi_sync_failed' else 'terminal' if st in ('ready','failed','cancelled') else 'running' if st not in ('queued','strapi_draft_created') else ('done' if st in ('ready','strapi_draft_created') else 'queued') }}">{{ st.replace('_', ' ') }}</span>
   </div>
 
+  {# ---- M14: enqueue failed (degrade to manual retry) ---- #}
+  {% if d.job.status == 'queued' and d.job.error_code == 'ENQUEUE_FAILED' %}
+  <div class="alert alert-error" role="alert">
+    <strong>入队失败</strong> — {{ d.job.error_message or 'RQ 入队失败' }}
+    <span class="muted">（任务已保存，状态仍为 queued；Redis 恢复后可安全重新入队，不会重建或重跑已生成的内容）</span>
+    <div class="actions">
+      <button class="btn btn-primary" hx-post="/api/jobs/{{ d.job.id }}/enqueue" hx-swap="none">
+        重新入队
+      </button>
+    </div>
+  </div>
+  {% endif %}
+
   {% if d.error %}
   <div class="error-panel" role="alert">
     <div class="error-panel-head">
@@ -115,6 +128,52 @@
         </tbody>
       </table>
       {% else %}<p class="muted">No extracted sources yet.</p>{% endif %}
+    </section>
+
+    {# ---- Competitor analyses (M13 / P4) ---- #}
+    <section class="card">
+      <h2>Competitor Analyses</h2>
+      {% if d.competitor_analyses %}
+        {% for c in d.competitor_analyses %}
+        <details class="review" {% if loop.first %}open{% endif %}>
+          <summary>
+            {% if c.source_title %}{{ c.source_title }}{% else %}{{ c.source_url or ('analysis ' ~ loop.index) }}{% endif %}
+            {% if c.model %}<span class="muted"> · {{ c.model }}</span>{% endif %}
+          </summary>
+          <pre class="review-body">{{ c.analysis }}</pre>
+        </details>
+        {% endfor %}
+      {% else %}<p class="muted">No competitor analyses yet.</p>{% endif %}
+    </section>
+
+    {# ---- SERP synthesis (M13 / P4) ---- #}
+    <section class="card">
+      <h2>SERP Synthesis</h2>
+      {% if d.synthesis %}
+        <pre class="review-body">{{ d.synthesis }}</pre>
+      {% else %}<p class="muted">No SERP synthesis yet.</p>{% endif %}
+    </section>
+
+    {# ---- Evidence notes (M13 / P4) ---- #}
+    <section class="card">
+      <h2>Evidence Notes</h2>
+      {% if d.evidence_notes %}
+      <table class="data">
+        <thead><tr><th>Claim</th><th>Source</th><th>Type</th><th>Confidence</th><th>Usage</th><th>Note</th></tr></thead>
+        <tbody>
+          {% for e in d.evidence_notes %}
+          <tr>
+            <td>{{ e.claim }}</td>
+            <td><a href="{{ e.source_url }}" target="_blank" rel="noopener">{{ e.source_title or e.source_url }}</a></td>
+            <td>{{ e.source_type }}</td>
+            <td>{{ e.confidence }}</td>
+            <td>{{ e.usage }}</td>
+            <td class="muted">{{ e.note or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="muted">No evidence notes yet.</p>{% endif %}
     </section>
 
     {# ---- Content brief ---- #}
@@ -236,6 +295,37 @@
       <a class="btn btn-link" href="{{ d.strapi.admin_url }}" target="_blank" rel="noopener">Open in Strapi</a>
       {% endif %}
     </div>
+  </section>
+
+  {# ---- Logs (M13 / 43.3) ---- #}
+  <section class="card">
+    <h2>Logs</h2>
+    <table class="kv">
+      <tr><th>Current step</th><td>{{ d.logs.current_step or '—' }}</td></tr>
+      {% if d.logs.job_error %}
+      <tr><th>Job error</th>
+        <td>
+          <span class="error-code">{{ d.logs.job_error.code or '—' }}</span>
+          {% if d.logs.job_error.message %} · {{ d.logs.job_error.message }}{% endif %}
+        </td>
+      </tr>
+      {% if d.logs.job_error.raw %}
+      <tr><th>Raw</th><td><pre class="review-body">{{ d.logs.job_error.raw }}</pre></td></tr>
+      {% endif %}
+      {% else %}
+      <tr><th>Job error</th><td class="muted">none</td></tr>
+      {% endif %}
+    </table>
+    <h3 class="outline-title muted">Steps</h3>
+    <ol class="serp-list">
+      {% for s in d.logs.steps %}
+      <li>
+        <span class="rank">{{ s.index }}</span>
+        <span class="{{ 'muted' if s.done else '' }}">{{ s.label }}</span>
+        <span class="badge {{ 'badge-done' if s.done else 'badge-running' }}">{{ 'done' if s.done else 'pending' }}</span>
+      </li>
+      {% endfor %}
+    </ol>
   </section>
 
   {# ---- Retry options (P9-A: full / by-step / resume / force refresh) ---- #}

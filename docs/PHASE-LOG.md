@@ -18,6 +18,13 @@
 | P7 | Strapi Integration | ✅ | Draft 同步(仅 Draft,发布永远手动)、slug、图片上传 |
 | P8 | Web UI | ✅ | 全部 Web 页面 + API、HTMX 轮询、cancel/retry、文章预览 |
 | P9 | Reliability / Production Hardening | ✅ | P9-A ✅ / P9-B ✅(B1 ✅, B2 ✅, B3 ✅)/ P9-C ✅ |
+| 审计修复 B1–B7 | CODEX audit 全量收口(30 项) | ✅ | B1 `cf85665` · B2 `c50c235` · B3 `c6a4b83` · B4 `9462af0` · B5 `8af9212` · B6 `52d3643` · B7 HEAD |
+
+> **口径诚实声明(L03)**:P0–P9 全部功能已实现;上述审计 B1–B7 把 CODEX 审计
+> 报告(commit `c5c7101`,0 Critical / 12 High / 15 Medium / 3 Low,共 30 项)
+> 全部修复并回归。自动化测试用 **fake providers + 本地 PostgreSQL** 验证逻辑
+> 正确性(不调真实付费 API / 不写真实 Strapi)。**live 运行验收**(真实外部
+> 服务跑通一整篇 READY 并人工抽查)是独立的上线前部署验收步骤,尚未完成。
 
 ---
 
@@ -241,6 +248,85 @@
 - 新增 `tests/unit/test_p8_routes.py::test_web_settings_page_statuses_only`(七行齐全、仅四种状态词、4 Missing + 2 Connected + 1 Failed 断言,无 secret 回显)。
 - 配套 fixture 修正:p8 `REVISER_DRAFT` 补 FAQ 段(DoD 合规);p9 fixture 早已合规。
 - 全量:**415 passed, 1 skipped**(基线 392 + 新增 23)。
+
+---
+
+## 审计修复批 B1–B7(CODEX audit 全量收口,30 项)✅(已完成)
+
+> 依据 `CODEX-AUDIT-REPORT.md`(审计 commit `c5c7101`;结论:整体验收不通过,
+> 0 Critical / 12 High / 15 Medium / 3 Low,共 30 项)。按 AGENTS.md 的 P0→P9
+> 阶段约束与报告 §11 建议分批;每批次:修复 → 测试 → 完整回归 → 更新文档 →
+> 单 commit。测试口径不变:**fake providers + 本地 PostgreSQL**,不调真实付费
+> API / 不写真实 Strapi。逐项明细见 `docs/AUDIT-FIX-PROGRESS.md`。
+>
+> 测试基线演进:审计前 `415 passed, 1 skipped` → B1 `426` → B2 `448` → B3 `453`
+> → B4 `478` → B5 `486` → B6 `501` → **B7 `520 passed, 1 skipped`**。
+> 新增迁移仅 B1 的 `0011_error_raw_usage_prompt`;B2–B7 均无 schema 变更。
+
+| 批次 | 阶段 | 修复项(H=High, M=Med, L=Low) | commit | 批次测试 |
+|---|---|---|---|---|
+| B1 | P0 / P1 | M04, H08, L02, M09, M11 | `cf85665` | 426 passed |
+| B2 | P2 | H01, H02, M15 | `c50c235` | 448 passed |
+| B3 | P3 | H04, M05 | `c6a4b83` | 453 passed |
+| B4 | P4 / P5 | H09, H06, H07, H11, M08 | `9462af0` | 478 passed |
+| B5 | P6 | H05, H10, M06, M07, L01 | `8af9212` | 486 passed |
+| B6 | P7 | H03, M01, M02 | `52d3643` | 501 passed |
+| B7 | P8 / P9 + 文档 | M13, M14, M12, M10, M03, H12, L03 | HEAD | 520 passed |
+
+### B1 — P0 / P1(commit `cf85665`)
+
+- **M04** Dockerfile 补拷 `alembic.ini`(容器内可执行迁移)。
+- **H08** RQ 长 pipeline 超时:新增 `rq_job_timeout_seconds=3600`,`enqueue_*` 显式传 timeout。
+- **L02** schema 去重:删除 `serp.py`/`sources.py`/`images.py` 重复 `provider_cost`。
+- **M09** LLM 计量溯源:`llm_usage` 增 `prompt_name/version/hash`(迁移 0011)+ `set_llm_prompt()` helper 贯通 13 处 LLM 调用;`model` 不再恒 None。
+- **M11** 失败 raw 持久化:`generation_jobs.error_raw`(迁移 0011),orchestrator 两分支写 raw/traceback,`/api/jobs/{id}` 暴露,retry 清空。
+- 迁移:`0011_error_raw_usage_prompt`。
+
+### B2 — P2(commit `c50c235`)
+
+- **H01** DataForSEO 解析按官方 Live Advanced 契约重写(`result`=block 列表、`items[]` 扁平混合按 `type` 分派、rank 取 `rank_group`、PAA 嵌套、related 字符串)+ 新增 **featured snippet**。`test_dataforseo_provider.py` 整文件重写(23 用例)。
+- **H02** Exa `extract()` 显式 `text: True`(API 默认 false → 否则无正文)。
+- **M15** 三家 provider `health_check()` 严格化,消除 401/403 假阳性(DataForSEO 付费 SERP + `status_code==20000`;Exa 零成本"非法 body 认证探测";Tavily 付费探测 + 形状校验)。
+- **M12 前置子项**:`_extract_cost()` 改读官方 `cost`(USD),弃用 `credits`(主体在 B7)。
+
+### B3 — P3(commit `c6a4b83`)
+
+- **H04** `prepare_keyword` 改 `async def`(orchestrator 统一 await;旧 sync 对已知词必 TypeError)。新增 orchestrator 级已知词全链路回归。
+- **M05** 导入每 sheet 先 `casefold` 内存去重(消除 `autoflush=False` 下重复新词 IntegrityError);全部关键词比较改 `lower()` 字面量精确(`%`/`_` 不当 LIKE 通配符)。
+
+### B4 — P4 / P5(commit `9462af0`)
+
+- **H09** 新增 `evidence_verification.py`——证据来源 URL 由独立提取器通道核实,不可达/空正文 → `usage="avoid"` + `confidence="low"` + `source_unverified:` 标记。
+- **H06** DoD gate 重写为 Markdown 结构解析完整性门禁(Setext H1、FAQ 逐题、CTA 正文、图片文件存在性、marker 大小写不敏感、研究/审核/竞品分析关联完整性)。
+- **H07** 新增 `final_body.py::render_final_body`——内链→图片两级解析 + 残留 marker 响亮失败;本地导出与 Strapi 同步两条终稿路径统一走共享渲染器。
+- **H11** 文章 versions/reviews 改**不可变 append-only 历史**——reset/retry 不删,当前草稿由 `latest_writer_version()` 派生;DoD 新增"最新版本必须为 revision 阶段"门禁。
+- **M08** `job.strategy`(六种策略语义)贯通进 Brief prompt;writer/reviser/image_plan 温度改读 Settings。
+
+### B5 — P6(commit `8af9212`)
+
+- **H05** `ready` 状态归属改到 orchestrator(`validate_article_done` 通过后同事务置 `ready`);`POST /jobs/{id}/sync-strapi` 加服务端状态门禁(非 syncable → 409)。
+- **H10** `OpenAIImageProvider._download()` 去 `Authorization` 头,Images API key 不随响应 URL(第三方 CDN / 预签名)外泄。
+- **M06** image step 重跑复用已通过 M07 校验的 `local_path`,仅重做缺失/损坏/格式不符的行。
+- **M07** 新增 `image_storage.py` 图像契约层:`.webp` 文件名强制真 WebP(Pillow 转码)+ 魔数/解码/扩展名一致性;测试 fixture 换真实可解码 PNG。**新增依赖 `pillow>=10.0`**。
+- **L01** 新增 `job_artifacts.py::export_research_artifacts`,§34 目录补全 `content-brief/outline/serp/review/sources.json`。
+
+### B6 — P7(commit `52d3643`)
+
+- **H03** Strapi 5 REST 契约解析:entry 扁平 `data`(无 `attributes` 包裹)、`/api/upload` `data` **数组**取 `[0]`、`get_draft` 带 `populate[...]`;v4 形状保留为兜底。新增 `relation_document_id()/media_url()/media_id()`。
+- **M01** 新增非 terminal 状态 `strapi_sync_failed`(§64)——pre-sync / 中途失败 / 缺本地图片三条路径落统一持久化状态(保留 `strapi_document_id` 幂等锚);同步重试走 sync 专用通道,自动清理永不扫;UI 红色 `badge-error` + "Sync failed" 告警区。
+- **M02** STEP F GET verify 升级为**逐字段值比对**(id/documentId/draft 状态/title/slug/终稿 body/meta/规范化 keywords/relations/mainImage URL 路径),问题合并为单条 `STRAPI_SCHEMA_MISMATCH`。
+
+### B7 — P8 / P9 + 文档(commit HEAD)
+
+- **M13** Job Detail 补研究正文 + Logs 区:`competitor_analyses`(逐条 + 源页 title/url/analysis/model)、`serp_synthesis`(最新 synthesis)、`evidence_notes`(claim/source/type/confidence/usage/note)、`logs`(current_step + job error + 全 15 步 `checkpoint_status`);`job_fragment.html` 新增 4 个卡片,全部**读时派生、无 schema 变更**。
+- **M14** enqueue 失败降级 + 安全重投:入队失败 job 保持 `queued` 并写 `error_code="ENQUEUE_FAILED"`(非 terminal,符合 §43.3 降级到手动重试);`CreateJobResponse` 增 `enqueued/error`;新增 `POST /jobs/{id}/enqueue`(仅 `status==queued` 可重投,拒绝 terminal 与非 queued,成功后清 error 标记)。
+- **M12** 成本账本(`llm_usage`)改**不可变 append-only 台账**(§54):`reset_from_step` 不再删 usage 行——重试只追加新行、累加成本,不删历史;`source_extract` 缓存命中零新增成本(不重刷 `provider_cost`)、`image_generate` 复用零新增;`_extract_cost()` 读 `cost` 非 `credits`;None 成本保持 None(不造 0)。
+- **M10** JSON 序列化 secret 脱敏:`redact()/redact_value()/redact_dict()`(Bearer → KV → URL-query 顺序);`JsonLogHandler`、orchestrator 异常路径、strapi_sync 失败路径全部脱敏(`error_message`/`error_raw`/traceback),secret 不进日志/web(§60)。
+- **M03** 预览安全渲染 + 图片 placement:`MarkdownIt("default", linkify=False)`(转义原始 HTML / 属性值,渲染 GFM 表格,不发 `javascript:` 链接 → 输出可安全 `|safe`);`_resolve_preview_body()` 解析内链 → hero 图(role==hero)→ inline 图(仅本地文件存在时插入)→ 渲染;preview 路由与 `article_preview.html` 传 `alt`。
+- **H12** 备份含图片但 restore 不恢复 → `restore_archive` 解包 `artifacts.tar`,**写库前校验图片文件**(缺失 → `BackupError`,DB 不动),`_remap_local_path` 重锚 `articles/`,`validate_archive`(有 image 行但无 artifacts → 报错);CLI `restore --data-dir`。
+- **L03** 诚实文档:`README.md` 现状段改为 B1–B7 逐批 commit 表 + mock/live 验收边界声明(测试全绿 = 逻辑正确性;live 运行验收为独立上线前步骤,尚未完成);`docs/PHASE-LOG.md` 总览表增审计行、新增本节、测试基线更新至 `520 passed`。
+
+**B7 测试结果**:`520 passed, 1 skipped`(B6 后 501 + 净增 19:M03 ×3、M13 ×1、M14 ×2、M12 ×4(3 新 + 2 改写)、M10 ×9、H12 ×5 等,含既有断言按新语义改写)。**无新迁移**。
 
 ---
 

@@ -17,13 +17,33 @@ P0 → P1 → … → P9.
 
 ## Current phase
 
-**P0–P9 全部实现完成 ✅**(P9 可靠性 / 生产化收口:P9-A 核心可靠性、P9-B1 成本、P9-B2 prompt 版本看板、P9-B3 错误 UI、P9-C 运维)。
+**P0–P9 功能全部实现并通过自动化测试 ✅**,随后按 `CODEX-AUDIT-REPORT.md`
+(commit `c5c7101`,审计结论:整体验收不通过,0 Critical / 12 High /
+15 Medium / 3 Low)逐批修复了全部 30 项审计问题——**B1–B7 已全部完成
+并回归测试**(逐项进度、测试证据见 `docs/AUDIT-FIX-PROGRESS.md`):
 
-实现口径:全部阶段的功能已落地并通过自动化测试(`python3 -m pytest`,
-含 fake providers 的单元/集成/E2E 路径)。**运行验收**是指用真实外部服务
-(真实 LLM / DataForSEO / Exa / Image / Strapi / PostgreSQL / Redis)跑通
-一整篇 READY 文章并人工抽查,属于上线前的部署验收步骤,与本仓库的
-测试基线相互独立——`/settings` 页面可先行核对各依赖的连通状态。
+| 批次 | 阶段 | 修复项 | commit |
+|---|---|---|---|
+| B1 | P0 / P1 | M04, H08, L02, M09, M11 | `cf85665` |
+| B2 | P2 | H01, H02, M15 | `c50c235` |
+| B3 | P3 | H04, M05 | `c6a4b83` |
+| B4 | P4 / P5 | H09, H06, H07, H11, M08 | `9462af0` |
+| B5 | P6 | H05, H10, M06, M07, L01 | `8af9212` |
+| B6 | P7 | H03, M01, M02 | `52d3643` |
+| B7 | P8 / P9 + 文档 | M13, M14, M12, M10, M03, H12, L03 | 本提交(HEAD) |
+
+实现口径与验收边界(诚实声明):
+
+- **代码实现 + 审计修复**:P0–P9 全部阶段功能已落地;上述 30 项审计问题已在
+  B1–B7 逐批修复并回归。完整测试套件(unit + integration,本地 PostgreSQL +
+  fake providers)全绿。
+- **mock 范围(测试口径)**:自动化测试使用 **fake providers**(fake LLM /
+  SERP / Extractor / Image / Strapi)+ 本地 PostgreSQL 验证**逻辑正确性**,
+  不调用真实付费 API、不写真实 Strapi(本仓库约定,见 `AGENTS.md`)。
+- **live 运行验收(独立步骤,尚未完成)**:用真实外部服务(真实 LLM /
+  DataForSEO / Exa / Image / Strapi / PostgreSQL / Redis)跑通一整篇 READY
+  文章并人工抽查,属于**上线前的部署验收**,与本仓库测试基线相互独立。
+  `/settings` 页面可先行核对各依赖的连通状态。
 
 P9-C 运维提供两个手动 CLI(默认 dry-run,幂等,无自动/后台删除):
 
@@ -59,7 +79,7 @@ uvicorn app.main:app --reload --port 8080
 python -m app.workers.article_worker
 
 # 6. tests
-python3 -m pytest            # full suite (baseline: 415 passed, 1 skipped)
+python3 -m pytest            # full suite (current: 520 passed, 1 skipped)
 ```
 
 > **Migrations (concurrency note).** Schema changes are pure Alembic and are

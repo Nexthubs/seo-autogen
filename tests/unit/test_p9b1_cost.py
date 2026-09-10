@@ -437,17 +437,23 @@ class TestImageCost:
 # ---------------------------------------------------------------------------
 # reset_from_step deletes the retried steps' llm_usage rows
 # ---------------------------------------------------------------------------
-class TestResetDeletesUsage:
-    def test_reset_step8_keeps_earlier_deletes_later(self, db):
+class TestResetKeepsUsageLedger:
+    """M12 / spec section 54: ``llm_usage`` is an immutable, append-only
+    cost/telemetry ledger. A retry's ``reset_from_step`` APPENDS new rows
+    for the re-makes but NEVER deletes the earlier run's — cost history must
+    accumulate across retries, not be erased (the old delete-on-reset
+    behaviour destroyed the cost history section 54 asks us to keep).
+    """
+
+    def test_reset_does_not_delete_any_usage(self, db):
         job = _make_job(db)
-        for step in ("content_brief", "outline", "article_writer"):
+        for step in ("competitor_analysis", "content_brief", "outline"):
             db.add(LLMUsageRow(job_id=job.id, step=step, input_tokens=1,
                                output_tokens=1, duration_ms=10))
-        # An earlier step's usage that must SURVIVE a step-8 reset.
-        db.add(LLMUsageRow(job_id=job.id, step="competitor_analysis",
-                           input_tokens=1, output_tokens=1, duration_ms=10))
         db.commit()
 
+        # A step-8 reset re-runs outline (8) and every later step, but the
+        # whole usage ledger — earlier AND later steps alike — survives.
         checkpoints.reset_from_step(db, job, 8)
         db.commit()
 
@@ -457,22 +463,47 @@ class TestResetDeletesUsage:
                 select(LLMUsageRow).where(LLMUsageRow.job_id == job.id)
             ).all()
         }
-        # content_brief (7) and competitor_analysis (4) survive (< 8);
-        # outline (8) and article_writer (9) are deleted.
-        assert remaining == {"content_brief", "competitor_analysis"}
+        assert remaining == {"competitor_analysis", "content_brief", "outline"}
 
-    def test_full_reset_deletes_all_usage(self, db):
+    def test_full_reset_keeps_usage_and_retrials_accumulate(self, db):
         job = _make_job(db)
+        # Run 1: two calls.
         db.add(LLMUsageRow(job_id=job.id, step="competitor_analysis",
-                           input_tokens=1, output_tokens=1, duration_ms=10))
+                           input_tokens=10, output_tokens=5, duration_ms=10))
         db.add(LLMUsageRow(job_id=job.id, step="content_brief",
-                           input_tokens=1, output_tokens=1, duration_ms=10))
+                           input_tokens=20, output_tokens=8, duration_ms=10))
         db.commit()
 
+        # A full reset wipes per-run artifacts but NOT the cost ledger.
         checkpoints.reset_from_step(db, job, 1)
         db.commit()
 
-        remaining = db.scalars(
+        run1 = db.scalars(
             select(LLMUsageRow).where(LLMUsageRow.job_id == job.id)
         ).all()
-        assert remaining == []
+        assert len(run1) == 2
+
+        # Run 2 (the re-make) APPENDS — the cost accumulates rather than
+        # the old rows being deleted.
+        db.add(LLMUsageRow(job_id=job.id, step="competitor_analysis",
+                           input_tokens=12, output_tokens=6, duration_ms=10))
+        db.commit()
+        rows = db.scalars(
+            select(LLMUsageRow).where(LLMUsageRow.job_id == job.id)
+        ).all()
+        # 3 total: the 2 original + 1 re-made; none deleted.
+        assert len(rows) == 3
+        total_in = sum(r.input_tokens for r in rows)
+        assert total_in == 10 + 20 + 12  # accumulated, not reset to run-2
+
+    def test_none_tokens_not_coalesced_to_zero(self, db):
+        """M12: an absent (None) token count stays None, never a fabricated 0."""
+        job = _make_job(db)
+        db.add(LLMUsageRow(job_id=job.id, step="competitor_analysis",
+                           input_tokens=None, output_tokens=None, duration_ms=10))
+        db.commit()
+        row = db.scalar(
+            select(LLMUsageRow).where(LLMUsageRow.job_id == job.id)
+        )
+        assert row.input_tokens is None
+        assert row.output_tokens is None

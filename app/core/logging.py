@@ -11,11 +11,12 @@ secret pattern.
 
 import json
 import logging
-import re
 import sys
 import time
 from contextvars import ContextVar
 from typing import Any
+
+from app.core.redaction import redact, redact_value
 
 # Context variables carrying the standard log fields. Pipeline steps set
 # these via log_context(); the handler reads them at emit time so any
@@ -33,18 +34,12 @@ RESERVED_KEYS = {
     "error_code",
 }
 
-_SECRET_PATTERNS = [
-    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+"), r"\1<redacted>"),
-    (re.compile(r"(?i)(password\s*[:=]\s*)[^\s,;]+"), r"\1<redacted>"),
-    (re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+"), r"\1<redacted>"),
-    (re.compile(r"(?i)(token\s*[:=]\s*)[^\s,;]+"), r"\1<redacted>"),
-]
-
-
+#: Every structured ``extra=`` field is passed through this redaction pass
+#: (audit M10) before it is serialized, so a provider payload that carries
+#: ``"api_key": "sk-..."`` (JSON shape), a Bearer echo or a URL with a
+#: sensitive query parameter can never reach the log file verbatim.
 def _redact(value: str) -> str:
-    for pattern, repl in _SECRET_PATTERNS:
-        value = pattern.sub(repl, value)
-    return value
+    return redact(value)
 
 
 def log_context(
@@ -72,7 +67,7 @@ class JsonLogHandler(logging.Handler):
             "timestamp": self.format_timestamp(record.created),
             "level": record.levelname,
             "logger": record.name,
-            "event": record.getMessage(),
+            "event": _redact(record.getMessage()),
         }
         # Standard fields (context first, record attributes override if set)
         for key in ("job_id", "step", "provider", "duration_ms", "error_code"):
@@ -82,12 +77,14 @@ class JsonLogHandler(logging.Handler):
             if value is not None:
                 payload[key] = value
         # Extra structured fields attached via extra=...
+        # M10: walk each field recursively (dicts/lists/strings) so a
+        # provider payload carrying a JSON ``"api_key"`` or a URL with a
+        # sensitive query parameter is redacted BEFORE serialization.
+        _builtin_keys = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__)
         for key, value in record.__dict__.items():
-            if key in RESERVED_KEYS or key in logging.LogRecord(
-                "", 0, "", 0, "", (), None
-            ).__dict__:
+            if key in RESERVED_KEYS or key in _builtin_keys:
                 continue
-            payload[key] = value
+            payload[key] = redact_value(value)
         if record.exc_info:
             payload["exception"] = _redact(self.format(record))
         try:

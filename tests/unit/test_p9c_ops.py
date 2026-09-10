@@ -34,6 +34,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import models  # noqa: F401 - register all models on Base
 from app.db.base import Base
+from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
 from app.db.models.llm_usage import LLMUsageRow
 from app.db.models.research import EvidenceNoteRow
@@ -125,6 +126,24 @@ def _shared_page(session, job: GenerationJob) -> SourcePage:
     session.add(JobSource(job_id=job.id, source_page_id=page.id))
     session.flush()
     return page
+
+
+def _image(session, job: GenerationJob, *, local_path: str) -> "ImageRow":
+    row = ImageRow(
+        job_id=job.id,
+        role="hero",
+        sort_order=1,
+        purpose="hero",
+        prompt="p",
+        filename="a.webp",
+        alt_text="alt",
+        aspect_ratio="16:9",
+        provider="openai",
+        local_path=local_path,
+    )
+    session.add(row)
+    session.flush()
+    return row
 
 
 # ------------------------------------------------------------ cleanup
@@ -358,7 +377,7 @@ def test_backup_restore_round_trip(db, tmp_path):
     arch = backup.create_backup(fake_settings(data), engine=engine)
 
     target, t_session = fresh_sqlite()
-    counts = backup.restore_archive(arch, target)
+    counts = backup.restore_archive(arch, target)["tables"]
     assert counts["generation_jobs"] == 1
     assert counts["serp_results"] == 1
     assert counts["serp_runs"] == 1
@@ -412,7 +431,7 @@ def test_backup_restore_clear_removes_stray_rows(db, tmp_path):
         s.add(GenerationJob(keyword="stray", status="ready"))
         s.commit()
 
-    counts = backup.restore_archive(arch, target, clear=True)
+    counts = backup.restore_archive(arch, target, clear=True)["tables"]
     assert counts["generation_jobs"] == 1
     with t_session() as s:
         keywords = {r.keyword for r in s.scalars(select(GenerationJob))}
@@ -439,6 +458,139 @@ def test_backup_restore_replaces_changed_row(db, tmp_path):
         rows = s.scalars(select(GenerationJob)).all()
         assert len(rows) == 1
         assert rows[0].keyword == "v1"
+
+
+# ------------------------------------------------------------ H12 (image restore)
+def test_backup_archive_with_image_layout(db, tmp_path):
+    """H12: a job with a generated image packs the image into artifacts.tar."""
+    session_factory, engine = db
+    data = Path(tmp_path) / "data"
+    with session_factory() as session:
+        job = _job(session, keyword="img", status="ready", completed_at=NOW)
+        _full_job_chain(session, job)
+        session.commit()
+        job_id = job.id
+    img_dir = data / "articles" / str(job_id) / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "a.webp").write_bytes(b"\xff\xd8fake-bytes")
+    with session_factory() as session:
+        _image(session, session.get(GenerationJob, job_id),
+               local_path=str(img_dir / "a.webp"))
+        session.commit()
+
+    arch = backup.create_backup(fake_settings(data), engine=engine)
+    # validate_archive must now see both the image rows and the artifact files.
+    info = backup.validate_archive(arch)
+    assert info["artifact_files"]
+    assert any(n.endswith("a.webp") for n in info["artifact_files"])
+
+
+def test_backup_restore_recovers_images_into_fresh_dir(db, tmp_path):
+    """H12 core: backup → delete source → restore into a fresh DATA_DIR +
+    empty DB. The image file must exist at the new location and the restored
+    DB row's local_path must point at it (path mapping + file check)."""
+    session_factory, engine = db
+    src_data = Path(tmp_path) / "src"
+    with session_factory() as session:
+        job = _job(session, keyword="rec", status="ready", completed_at=NOW)
+        _full_job_chain(session, job)
+        session.commit()
+        job_id = job.id
+    img_dir = src_data / "articles" / str(job_id) / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "a.webp").write_bytes(b"\xff\xd8hero-image-bytes")
+    with session_factory() as session:
+        _image(session, session.get(GenerationJob, job_id),
+               local_path=str(img_dir / "a.webp"))
+        session.commit()
+
+    arch = backup.create_backup(fake_settings(src_data), engine=engine)
+
+    # Preserve the archive OUTSIDE the source dir, then simulate the loss:
+    # delete the whole source data dir (DB rows + image files are gone).
+    saved_arch = tmp_path / arch.name
+    shutil.move(str(arch), str(saved_arch))
+    shutil.rmtree(src_data)
+
+    # Restore into a brand-new, separate data dir + empty DB.
+    dst_data = Path(tmp_path) / "dst"
+    target, t_session = fresh_sqlite()
+    result = backup.restore_archive(saved_arch, target, data_dir=dst_data)
+
+    # The image file was written into the new data dir...
+    restored_file = dst_data / "articles" / str(job_id) / "images" / "a.webp"
+    assert restored_file.is_file()
+    assert restored_file.read_bytes() == b"\xff\xd8hero-image-bytes"
+    # ...and the digest was reported.
+    assert result["image_files"] and all(result["image_files"])
+    assert list(result["image_files"]) == [str(restored_file)]
+    # The restored DB row's local_path was re-anchored onto the new data dir.
+    with t_session() as s:
+        img = s.scalars(select(ImageRow)).first()
+        assert img is not None
+        assert img.local_path == str(restored_file)
+        assert Path(img.local_path).is_file()
+
+
+def test_backup_restore_out_of_sync_fails_without_db_change(db, tmp_path):
+    """H12: an image row whose file is absent from the artifact tree (e.g. it
+    was deleted after the DB was written) must fail the restore BEFORE the DB
+    is touched — no half-restore, no dangling local_path."""
+    session_factory, engine = db
+    src_data = Path(tmp_path) / "src"
+    with session_factory() as session:
+        job = _job(session, keyword="oos", status="ready", completed_at=NOW)
+        session.commit()
+        job_id = job.id
+    # A real file keeps the artifact tar non-empty, but the image ROW points
+    # at a file that does not exist → the archive is out of sync with its DB.
+    img_dir = src_data / "articles" / str(job_id) / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "real.webp").write_bytes(b"decoy")
+    with session_factory() as session:
+        _image(session, session.get(GenerationJob, job_id),
+               local_path=str(img_dir / "missing.webp"))
+        session.commit()
+    arch = backup.create_backup(fake_settings(src_data), engine=engine)
+
+    dst_data = Path(tmp_path) / "dst"
+    target, t_session = fresh_sqlite()
+    with pytest.raises(backup.BackupError):
+        backup.restore_archive(arch, target, data_dir=dst_data)
+    # No half-restore: the target DB was left untouched.
+    with t_session() as s:
+        assert s.scalar(select(func.count()).select_from(GenerationJob)) == 0
+        assert s.scalar(select(func.count()).select_from(ImageRow)) == 0
+
+
+def test_backup_validate_rejects_truncated_archive(db, tmp_path):
+    """H12: a corrupt/truncated archive must be rejected up-front (H12)."""
+    session_factory, engine = db
+    data = Path(tmp_path) / "data"
+    with session_factory() as session:
+        _job(session, keyword="trunc", status="ready", completed_at=NOW)
+        session.commit()
+    arch = backup.create_backup(fake_settings(data), engine=engine)
+    raw = arch.read_bytes()
+    truncated = tmp_path / "truncated.tar.gz"
+    truncated.write_bytes(raw[: len(raw) // 2])  # chop the gzip in half
+    with pytest.raises(backup.BackupError):
+        backup.validate_archive(truncated)
+
+
+def test_backup_validate_rejects_non_backup_file(tmp_path):
+    """H12: a file that is not a backup at all must be rejected."""
+    not_a_backup = tmp_path / "not_a_backup.tar.gz"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo("db/manifest.json")
+        import os
+        payload = b"not-json"
+        info.size = len(payload)
+        tar.addfile(info, buf and io.BytesIO(payload))
+    not_a_backup.write_bytes(buf.getvalue())
+    with pytest.raises(backup.BackupError):
+        backup.validate_archive(not_a_backup)
 
 
 def test_backup_prune_keeps_newest_n(db, tmp_path):

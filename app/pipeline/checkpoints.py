@@ -37,7 +37,6 @@ from sqlalchemy.orm import Session
 from app.db.models.article import ArticleReviewRow, ArticleVersionRow
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
-from app.db.models.llm_usage import LLMUsageRow
 from app.db.models.research import (
     ArticleOutlineRow,
     CompetitorAnalysisRow,
@@ -298,9 +297,12 @@ def reset_from_step(
     - ``image_plan`` (14) owns the plan rows; ``image_generate`` (15) is
       partial-idempotent (per-image ``local_path`` overwrite) so a 15-reset
       deletes nothing.
-    - ``llm_usage`` (P9-B1) rows are owned by the step that made the call:
-      a re-run re-makes its calls, so their usage rows are deleted with
-      the rest of the step outputs (steps 4 and 7-14 carry LLM calls).
+    - ``llm_usage`` (P9-B1, spec section 54) is an IMMUTABLE, append-only
+      cost/telemetry LEDGER: a re-run APPENDS new rows (the re-makes), it
+      does NOT delete the earlier run's rows. Deleting them (the old
+      behaviour) destroyed the cost history that section 54 asks us to keep
+      "for later cost/performance analysis"; M12 requires retries to
+      accumulate, so nothing about a step's usage rows is ever deleted here.
 
     The article ``versions`` and ``reviews`` (steps 9-13) are NOT deleted:
     they are immutable, append-only history (H11, spec sections 27-28,
@@ -360,34 +362,10 @@ def reset_from_step(
     if step_index <= 14:
         session.execute(delete(ImageRow).where(ImageRow.job_id == job.id))
 
-    # LLM usage rows (P9-B1, spec section 54): one row per logical LLM
-    # call, owned by the step that made it (steps 4-14; steps 1-3 and 15
-    # make no LLM calls). A re-run re-makes those calls, so delete the
-    # rows of every re-run step.
-    llm_step_by_index = {
-        4: "competitor_analysis",
-        5: "serp_synthesis",
-        6: "evidence_research",
-        7: "content_brief",
-        8: "outline",
-        9: "article_writer",
-        10: "seo_review",
-        11: "fact_review",
-        12: "style_review",
-        13: "article_reviser",
-        14: "image_plan",
-    }
-    steps_to_delete = [
-        name
-        for idx, name in llm_step_by_index.items()
-        if idx >= step_index
-    ]
-    if steps_to_delete:
-        session.execute(
-            delete(LLMUsageRow).where(
-                LLMUsageRow.job_id == job.id,
-                LLMUsageRow.step.in_(steps_to_delete),
-            )
-        )
+    # M12 / spec section 54: LLM usage rows are an append-only cost ledger —
+    # a re-run appends new rows and NEVER deletes the earlier run's. (The
+    # old behaviour here deleted every re-run step's rows, which erased the
+    # cost history section 54 asks us to keep for later analysis.) So there
+    # is deliberately no LLMUsageRow deletion in this reset.
 
     return len(STEP_NAMES) - step_index + 1

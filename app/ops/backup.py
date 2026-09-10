@@ -49,6 +49,10 @@ logger = logging.getLogger(__name__)
 APP_MARKER = "seo-autogen"
 
 
+class BackupError(Exception):
+    """A backup/restore failure that must not leave a half-restore state."""
+
+
 # ------------------------------------------------------------ helpers
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -270,32 +274,237 @@ def _pk_value(model: type, value: Any) -> Any:
     return value
 
 
+# ------------------------------------------------------------ validation
+def _open_archive(archive: Path) -> tarfile.TarFile:
+    try:
+        return tarfile.open(archive, "r:gz")
+    except (OSError, tarfile.TarError) as error:
+        raise BackupError(f"cannot open archive {archive}: {error}") from error
+
+
+def validate_archive(archive: Path) -> dict[str, Any]:
+    """Fully open + scan the archive BEFORE restoring anything (H12).
+
+    Fails loudly (``BackupError``) on a corrupt / truncated / non-backup
+    archive so a restore can never start and leave a half state. Returns
+    ``{"tables": {name: row_count}, "artifact_files": [names]}`` so the
+    caller can preview the restore.
+    """
+    try:
+        with _open_archive(archive) as tar:
+            members = tar.getmembers()
+            manifest = None
+            table_names: list[str] = []
+            artifact_files: list[str] = []
+            for member in members:
+                if not member.isfile():
+                    continue
+                if member.name == "db/manifest.json":
+                    fh = tar.extractfile(member)
+                    if fh is None:
+                        raise BackupError("archive manifest unreadable")
+                    manifest = json.loads(fh.read().decode("utf-8"))
+                elif member.name.startswith("db/") and member.name.endswith(".jsonl"):
+                    table_names.append(member.name.removeprefix("db/").removesuffix(".jsonl"))
+                elif member.name == "artifacts.tar":
+                    # The inner tar must itself be readable — a truncated
+                    # outer archive with a broken inner tar must fail here,
+                    # not mid-restore.
+                    fh = tar.extractfile(member)
+                    if fh is None:
+                        raise BackupError("artifacts.tar unreadable")
+                    inner = io.BytesIO(fh.read())
+                    with tarfile.open(fileobj=inner, mode="r") as inner_tar:
+                        for im in inner_tar.getmembers():
+                            if im.isfile():
+                                artifact_files.append(im.name)
+            if manifest is None:
+                raise BackupError("archive is not a valid backup (missing db/manifest.json)")
+            if manifest.get("app") != APP_MARKER:
+                raise BackupError(f"archive app marker mismatch: {manifest.get('app')!r}")
+            # Every declared table file must be present.
+            declared = set(manifest.get("tables", {}).keys())
+            if declared and declared != set(table_names):
+                missing = declared - set(table_names)
+                raise BackupError(f"archive declares tables missing from db/: {sorted(missing)}")
+            # An archive that contains image rows must also ship the image
+            # tree — otherwise restore would re-import dangling local_paths.
+            if "images" in table_names:
+                fh = tar.extractfile(tar.getmember("db/images.jsonl"))
+                if fh is not None:
+                    image_rows = sum(1 for line in io.TextIOWrapper(fh, encoding="utf-8") if line.strip())
+                else:
+                    image_rows = 0
+                if image_rows and not artifact_files:
+                    raise BackupError(
+                        f"archive contains {image_rows} image rows but no artifact files — "
+                        "refusing to restore dangling image paths"
+                    )
+    except BackupError:
+        raise
+    except (OSError, EOFError, tarfile.TarError, json.JSONDecodeError, ValueError) as error:
+        raise BackupError(f"archive validation failed: {error}") from error
+    return {"tables": {t: 0 for t in table_names}, "artifact_files": artifact_files}
+
+
+def _iter_artifact_files(archive: Path) -> list[tuple[str, bytes]]:
+    """Read every file under the inner ``artifacts.tar`` as (arcname, bytes)."""
+    with _open_archive(archive) as tar:
+        member = tar.getmember("artifacts.tar")
+        fh = tar.extractfile(member)
+        if fh is None:
+            raise BackupError("artifacts.tar unreadable")
+        buf = fh.read()
+    out: list[tuple[str, bytes]] = []
+    with tarfile.open(fileobj=io.BytesIO(buf), mode="r") as inner:
+        for im in inner.getmembers():
+            if not im.isfile():
+                continue
+            fh = inner.extractfile(im)
+            if fh is None:
+                continue
+            out.append((im.name, fh.read()))
+    return out
+
+
+def _extract_artifacts(archive: Path, data_dir: Path) -> list[Path]:
+    """Write the archive's ``articles`` tree into ``data_dir`` (H12).
+
+    Files are materialized into a temp directory first and then moved into
+    place, so a failure mid-copy never leaves a half-written tree in the
+    live data dir. Returns the written file paths.
+    """
+    import shutil
+
+    files = _iter_artifact_files(archive)
+    # Strip the leading ``articles/`` arcname prefix so the tree lands at
+    # {data_dir}/articles/... (matches how create_backup packed it).
+    prefix = "articles" + "/"
+    target_root = Path(data_dir)
+    staging = target_root / ".restore_staging"
+    written: list[Path] = []
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        for arcname, data in files:
+            if not (arcname == "articles" or arcname.startswith(prefix)):
+                # Never write anything outside the articles tree.
+                continue
+            rel = arcname[len(prefix):] if arcname != "articles" else ""
+            dest = (staging / rel) if rel else staging
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+        # Promote: move staging into the live articles dir (overwriting),
+        # recording the FINAL live path of every file.
+        live_root = target_root / "articles"
+        if staging.exists():
+            live_root.mkdir(parents=True, exist_ok=True)
+            for child in sorted(staging.rglob("*")):
+                if child.is_file():
+                    rel = child.relative_to(staging)
+                    target = live_root / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(child), str(target))
+                    written.append(target)
+        return written
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _remap_local_path(local_path: str, rel_to_target: dict[str, str]) -> str:
+    """Rewrite an archived ``images.local_path`` onto the target data dir.
+
+    ``local_path`` is stored absolute (``{src}/articles/{job_id}/file``).
+    On restore the file tree is written to a *different* root, so the path
+    is re-anchored on the ``/articles/`` component and remapped to the
+    target location (or left untouched when it is not an articles path).
+    """
+    parts = Path(local_path).parts
+    if "articles" not in parts:
+        return local_path
+    rel = "/".join(parts[parts.index("articles") + 1:])
+    return rel_to_target.get(rel, local_path)
+
+
 def restore_archive(
     archive: Path,
     target_engine: Engine,
     *,
     clear: bool = False,
-) -> dict[str, int]:
-    """Re-import every table from ``archive`` into ``target_engine``.
+    data_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Re-import every table + the image artifacts from ``archive`` (H12).
 
-    Rows are replaced by primary key (existing matching rows deleted,
-    then the archived rows re-inserted), so restore is idempotent. With
-    ``clear`` every table is emptied first (children before parents).
-    Returns per-table archived row counts.
+    H12 guarantees (audit: *restore must recover the images, validate the
+    archive before touching anything, and never leave a half-restore*):
+
+    1. **Validate first** — :func:`validate_archive` fully opens the outer
+       AND inner tar and checks the manifest before a single row is
+       written, so a corrupt/truncated archive fails with
+       :class:`BackupError` and the target DB stays untouched.
+    2. **Extract + remap images** — the ``artifacts.tar`` tree is written
+       into ``{data_dir}/articles`` via :func:`_extract_artifacts` (staged
+       in a temp dir and moved into place), and every archived
+       ``images.local_path`` is re-anchored onto the target data dir so the
+       restored DB points at files that actually exist after the copy.
+    3. **Path validation before commit** — every remapped image path must
+       exist on disk *before* the DB transaction commits. A restore whose
+       images cannot be satisfied fails with :class:`BackupError` and the
+       DB is left untouched (no half-restore, no dangling ``local_path``).
+    4. **Atomic DB restore** — every table's rows are staged in ONE
+       transaction and committed once, so a mid-restore error rolls the
+       whole DB section back (the old per-table commits could leave a
+       half-restored database).
+
+    With ``clear`` every table is emptied first (children before parents).
+    Returns ``{"tables": {name: row_count}, "artifacts": [paths],
+    "image_files": {local_path: sha256}, "missing_images": [local_path]}``.
     """
+    import hashlib
+
+    # 1) Validate before touching the target at all.
+    validate_archive(archive)
+
+    # 2) Extract the image tree (if a data dir is given) and build the
+    #    rel→target map used to remap every archived local_path.
+    written: list[Path] = []
+    rel_to_target: dict[str, str] = {}
+    if data_dir is not None:
+        written = _extract_artifacts(archive, Path(data_dir))
+        rel_to_target = {
+            str(p.relative_to(Path(data_dir) / "articles")): str(p)
+            for p in written
+        }
+
+    # 3) Pre-load + remap every image local_path, then validate that each
+    #    file exists BEFORE the DB commit (fail-fast, no half-restore).
     maker = sessionmaker(bind=target_engine, expire_on_commit=False)
     by_table = {m.__tablename__: m for m in table_order()}
-    counts: dict[str, int] = {}
+    tables_in_archive = {
+        name: [_remap_row(name, r, rel_to_target) for r in rows]
+        for name, rows in iter_archive_db(archive)
+    }
+    remapped_image_paths: list[str] = []
+    for r in tables_in_archive.get("images", []):
+        lp = r.get("local_path")
+        if lp:
+            remapped_image_paths.append(lp)
 
+    missing_images = [lp for lp in remapped_image_paths if not Path(lp).is_file()]
+    if missing_images:
+        raise BackupError(
+            "restore cannot satisfy image rows before touching the DB "
+            f"({len(missing_images)} missing, e.g. {missing_images[0]}) — "
+            "the archive and the target data dir are out of sync"
+        )
+
+    # 4) Stage the whole DB section in one transaction (atomic).
+    counts: dict[str, int] = {}
     with maker() as session:
         if clear:
             for model in reversed(by_table.values()):
                 session.execute(delete(model))
-            session.commit()
-
-        # Re-order tables by FK dependency (parents first); tables the
-        # archive does not contain are skipped.
-        tables_in_archive = dict(iter_archive_db(archive))
         for table_name, model in by_table.items():
             rows = tables_in_archive.get(table_name)
             if rows is None:
@@ -308,12 +517,41 @@ def restore_archive(
             for payload in rows:
                 session.add(_restore_row(model, payload))
             counts[table_name] = len(rows)
-            session.commit()
+        session.commit()  # single commit — all-or-nothing DB restore
+
+    # Report the digest of each restored file (path-mapping + file-summary
+    # check the audit demands).
+    image_files: dict[str, str] = {
+        lp: hashlib.sha256(Path(lp).read_bytes()).hexdigest()
+        for lp in remapped_image_paths
+    }
     logger.info(
         "backup_restored",
-        extra={"event": "backup_restored", "archive": str(archive), "tables": counts},
+        extra={
+            "event": "backup_restored",
+            "archive": str(archive),
+            "tables": counts,
+            "artifacts": len(written),
+            "images": len(image_files),
+        },
     )
-    return counts
+    return {
+        "tables": counts,
+        "artifacts": [str(p) for p in written],
+        "image_files": image_files,
+        "missing_images": missing_images,
+    }
+
+
+def _remap_row(table_name: str, row: dict, rel_to_target: dict[str, str]) -> dict:
+    """Apply the ``local_path`` remap to an archived row (images only)."""
+    if table_name != "images" or not rel_to_target:
+        return row
+    lp = row.get("local_path")
+    if lp:
+        row = dict(row)
+        row["local_path"] = _remap_local_path(lp, rel_to_target)
+    return row
 
 
 # ------------------------------------------------------------ CLI
@@ -331,6 +569,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="empty every table before restoring")
     p_restore.add_argument("--target", default=None,
                            help="target SQLAlchemy URL (default: DATABASE_URL)")
+    p_restore.add_argument("--data-dir", default=None,
+                           help="target data dir for the article images (default: DATA_DIR)")
     return parser
 
 
@@ -360,9 +600,20 @@ def main(argv: list[str] | None = None) -> int:
             default_engine if target_url == settings.database_url
             else create_engine(target_url)
         )
-        counts = restore_archive(Path(args.archive), target_engine, clear=args.clear)
+        data_dir = Path(args.data_dir) if args.data_dir else Path(settings.data_dir)
+        try:
+            result = restore_archive(
+                Path(args.archive), target_engine, clear=args.clear, data_dir=data_dir
+            )
+        except BackupError as error:
+            print(f"[backup] restore failed: {error}")
+            return 1
+        counts = result["tables"]
         total = sum(counts.values())
-        print(f"[backup] restored {total} rows across {len(counts)} tables")
+        print(
+            f"[backup] restored {total} rows across {len(counts)} tables, "
+            f"{len(result['artifacts'])} artifact files, {len(result['image_files'])} images"
+        )
         return 0
 
     return 2

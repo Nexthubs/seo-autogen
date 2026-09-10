@@ -60,11 +60,75 @@ templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent.parent
 
 from markdown_it import MarkdownIt  # noqa: E402
 
-_md = MarkdownIt("commonmark")
+# M03: the preview must render Markdown to HTML, but SAFELY. The
+# "default" preset escapes raw HTML input (``<script>`` ->
+# ``&lt;script&gt;``) and does not emit raw tags, unlike "commonmark"
+# which passes raw HTML straight through. It also renders GFM tables
+# and links/images. ``linkify`` is off (the linkify extra is not
+# installed) so plain URLs are not auto-linked.
+_md = MarkdownIt("default")
+_md.options["linkify"] = False
 
 
 def _render_md(text: str) -> str:
     return _md.render(text or "")
+
+
+def _local_image_url(job: GenerationJob, row: ImageRow) -> str | None:
+    """Serve URL for a generated image, or None when the file is absent.
+
+    Images live at ``{data_dir}/articles/{job_id}/images/{filename}`` and
+    are served via ``/static/job-images/{job_id}/{filename}`` (section 34).
+    """
+    if row.local_path and Path(row.local_path).is_file():
+        return f"/static/job-images/{job.id}/{row.filename}"
+    return None
+
+
+def _resolve_preview_body(
+    session: Session, job: GenerationJob, version
+) -> tuple[str, list, ImageRow | None]:
+    """M03: render the article body to (escaped) HTML for the preview.
+
+    Reuses the SAME marker pipeline as export/sync — internal links first
+    (section 21), then image markers (section 33) — but is TOLERANT: an
+    unresolvable internal-link marker is left as literal text and an
+    image whose file is missing is simply omitted, instead of failing the
+    page (spec 43.4 is about *showing* the article, not re-validating it;
+    the pipeline's hard validation already ran before this). The final
+    Markdown is rendered with :func:`_render_md`, which escapes raw HTML
+    so a body containing ``<script>`` cannot execute (section 60).
+
+    Returns ``(html, links, hero_row)``.
+    """
+    from app.services.image_markers import (
+        insert_image_markers,
+        resolve_image_markers,
+    )
+
+    linked, links, _validation = resolve_markers(session, version.body_markdown)
+
+    planned = (
+        session.query(ImageRow)
+        .filter(ImageRow.job_id == job.id)
+        .order_by(ImageRow.sort_order)
+        .all()
+    )
+    hero_row = next((r for r in planned if r.role == "hero"), None)
+    inlines = [
+        r for r in planned if r.role == "inline" and r.insertion_marker
+    ]
+    images: dict[str, tuple[str, str]] = {}
+    for r in inlines:
+        url = _local_image_url(job, r)
+        if url:
+            images[r.insertion_marker] = (r.alt_text, url)
+
+    marked = insert_image_markers(
+        linked, [(r.insertion_marker, r.section_heading) for r in inlines]
+    )
+    resolved = resolve_image_markers(marked, images)
+    return _render_md(resolved), links, hero_row
 
 
 def _parse_uuid(value: str) -> uuid.UUID:
@@ -272,15 +336,10 @@ def article_preview(
             status_code=200,
         )
 
-    rendered, links, _validation = resolve_markers(session, version.body_markdown)
-
-    # Hero image: the first planned hero row (section 34).
-    hero_row = session.query(ImageRow).filter(
-        ImageRow.job_id == job.id, ImageRow.role == "hero"
-    ).first()
-    hero = None
-    if hero_row and hero_row.local_path and Path(hero_row.local_path).is_file():
-        hero = f"/static/job-images/{job.id}/{hero_row.filename}"
+    # M03: render the body to safe HTML (internal links + inline images
+    # resolved, raw HTML escaped) and grab the hero row for its alt text.
+    rendered, links, hero_row = _resolve_preview_body(session, job, version)
+    hero = _local_image_url(job, hero_row) if hero_row else None
 
     return templates.TemplateResponse(
         request,
@@ -298,6 +357,7 @@ def article_preview(
             },
             "links": links,
             "hero": hero,
+            "hero_alt": hero_row.alt_text if hero_row else "",
         },
     )
 

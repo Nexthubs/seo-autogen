@@ -186,6 +186,20 @@ def create_job(session: Session, payload: CreateJobRequest) -> tuple[GenerationJ
     session.commit()
     session.refresh(job)
     enqueued = _enqueue(job.id)
+    if not enqueued:
+        # M14: a Redis/enqueue failure must NOT be silently dropped and shown
+        # as a normal queued job. Per spec 43.3 the run "degrades to manual
+        # retry": the job stays ``queued`` (the pipeline never started, so no
+        # terminal failure is warranted) but we persist an explicit
+        # ``ENQUEUE_FAILED`` marker so the UI can say *why* it is waiting and
+        # offer a safe re-enqueue (POST /api/jobs/{id}/enqueue) instead of
+        # only a terminal retry.
+        job.error_code = "ENQUEUE_FAILED"
+        job.error_message = (
+            "RQ 入队失败（Redis 不可用或队列错误）。任务已保存，可手动重新入队。"
+        )
+        session.add(job)
+        session.commit()
     return job, enqueued
 
 
@@ -210,8 +224,15 @@ def _parse_uuid(value: str) -> uuid.UUID:
 def api_create_job(
     payload: CreateJobRequest, session: Session = Depends(get_db)
 ) -> CreateJobResponse:
-    job, _ = create_job(session, payload)
-    return CreateJobResponse(job_id=str(job.id), status=job.status)
+    job, enqueued = create_job(session, payload)
+    if enqueued:
+        return CreateJobResponse(job_id=str(job.id), status=job.status, enqueued=True)
+    return CreateJobResponse(
+        job_id=str(job.id),
+        status=job.status,
+        enqueued=False,
+        error=job.error_message,
+    )
 
 
 @router.get("")
@@ -407,6 +428,39 @@ def api_cancel_job(job_id: str, session: Session = Depends(get_db)) -> dict:
     return {"job_id": str(job.id), "status": job.status}
 
 
+@router.post("/{job_id}/enqueue")
+def api_re_enqueue(job_id: str, session: Session = Depends(get_db)) -> dict:
+    """M14: safe re-enqueue of a job whose original RQ enqueue failed.
+
+    This is the "manual retry" the spec 43.3 degrade path points to. It
+    re-pushes the *same* job id to the RQ queue with NO options — it does
+    NOT reset artifacts, does NOT flip the status to a fresh terminal
+    state, and does NOT delete anything. It is only valid while the pipeline
+    has not actually started (``queued`` with the ``ENQUEUE_FAILED`` marker,
+    or still ``queued`` before a worker picked it up). Once the job has
+    advanced (any non-queued status) or is already running, re-enqueue would
+    double-run it, so we reject with 409.
+    """
+    job = _get_job_or_404(session, _parse_uuid(job_id))
+    if JobStatus(job.status).is_terminal or job.status != JobStatus.QUEUED.value:
+        raise HTTPException(
+            status_code=409,
+            detail="job is not in a re-enqueueable queued state",
+        )
+    enqueued = _enqueue(job.id)
+    if enqueued:
+        job.error_code = None
+        job.error_message = None
+        job.error_raw = None
+        session.add(job)
+        session.commit()
+    return {
+        "job_id": str(job.id),
+        "status": job.status,
+        "enqueued": enqueued,
+    }
+
+
 @router.get("/{job_id}/article")
 def api_job_article(job_id: str, session: Session = Depends(get_db)) -> dict:
     job = _get_job_or_404(session, _parse_uuid(job_id))
@@ -576,6 +630,64 @@ def job_detail_payload(session: Session, job: GenerationJob) -> dict:
         select(ArticleReviewRow).where(ArticleReviewRow.job_id == job.id)
     ).all()
 
+    # M13 (P4 audit): surface the research *body* — competitor analyses, the
+    # SERP synthesis, and the evidence notes — plus a Logs block — so the
+    # job detail is auditable, not just a store of rows (spec 43.3 "Logs").
+    competitors = []
+    for ca in session.scalars(
+        select(CompetitorAnalysisRow)
+        .where(CompetitorAnalysisRow.job_id == job.id)
+        .order_by(CompetitorAnalysisRow.created_at)
+    ).all():
+        page = session.get(SourcePage, ca.source_page_id)
+        competitors.append(
+            {
+                "source_title": page.title if page else None,
+                "source_url": page.url if page else None,
+                "analysis": ca.analysis,
+                "model": ca.model,
+            }
+        )
+    synthesis_row = session.scalar(
+        select(SerpSynthesisRow)
+        .where(SerpSynthesisRow.job_id == job.id)
+        .order_by(SerpSynthesisRow.created_at.desc())
+        .limit(1)
+    )
+    synthesis = synthesis_row.synthesis if synthesis_row else None
+    evidence_notes = [
+        {
+            "claim": en.claim,
+            "source_title": en.source_title,
+            "source_url": en.source_url,
+            "source_type": en.source_type,
+            "confidence": en.confidence,
+            "usage": en.usage,
+            "note": en.note,
+        }
+        for en in session.scalars(
+            select(EvidenceNoteRow)
+            .where(EvidenceNoteRow.job_id == job.id)
+            .order_by(EvidenceNoteRow.created_at)
+        ).all()
+    ]
+    # Logs (43.3): the job-level failure (redacted by M10) + a per-step view
+    # derived from the checkpoint state (each step done/not — the first
+    # incomplete one is the failure boundary).
+    logs = {
+        "current_step": job.current_step,
+        "job_error": (
+            {
+                "code": job.error_code,
+                "message": job.error_message,
+                "raw": job.error_raw,
+            }
+            if (job.error_code or job.error_message)
+            else None
+        ),
+        "steps": checkpoints.checkpoint_status(session, job),
+    }
+
     # Retry / resume only applies to jobs that ended in a failure or a
     # cancellation. A ``ready`` job (or one already pushed to Strapi) is a
     # *successful* terminal state — showing "Retry" there would contradict
@@ -629,6 +741,11 @@ def job_detail_payload(session: Session, job: GenerationJob) -> dict:
         "reviews": [
             {"review_type": r.review_type, "review": r.review} for r in reviews
         ],
+        # M13: research body + logs (spec 43.3).
+        "competitor_analyses": competitors,
+        "synthesis": synthesis,
+        "evidence_notes": evidence_notes,
+        "logs": logs,
         "images": [
             {
                 "role": im.role,

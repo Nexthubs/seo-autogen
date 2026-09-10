@@ -7,9 +7,13 @@ JSON repair count as ONE row (tokens accumulated over the repair
 attempts) — the metering unit is the logical call, not the HTTP
 request.
 
-``step`` is the 15-step checkpoint name the call belongs to; retrying
-a step deletes its rows (see ``checkpoints.reset_from_step``) so usage
-always reflects the currently committed checkpoint outputs.
+``step`` is the 15-step checkpoint name the call belongs to. The table is an
+IMMUTABLE, append-only cost/telemetry ledger (spec section 54, M12): retrying
+a step APPENDS new rows for the re-makes and never deletes the earlier run's
+rows, so the full cost history is preserved for later analysis. Summing
+``input_tokens``/``output_tokens`` across a job therefore accumulates every
+retry (``None`` token counts are a genuine absence, not a zero — they are
+never coalesced into 0).
 """
 
 import uuid
