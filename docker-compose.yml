@@ -1,0 +1,56 @@
+services:
+
+  web:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - seo_data:/app/data
+    depends_on:
+      - postgres
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: .
+    command: python -m app.workers.article_worker
+    env_file:
+      - .env
+    volumes:
+      - seo_data:/app/data
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: seo
+      POSTGRES_USER: seo
+      POSTGRES_PASSWORD: seo
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seo -d seo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  seo_data:
+  pg_data:

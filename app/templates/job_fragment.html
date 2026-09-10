@@ -1,0 +1,281 @@
+{# Job-detail body fragment (43.3). Rendered by /jobs/{id}/fragment and
+   swapped into #job-detail (hx-swap="innerHTML"); the wrapper in
+   job_detail.html keeps the hx polling attributes. #}
+{% set d = data %}
+<section class="detail-body">
+  {% set st = d.job.status %}
+  <div class="detail-head">
+    <div>
+      <h1 class="page-title">{{ d.job.keyword }}</h1>
+      <div class="muted">
+        {{ d.job.language }} / {{ d.job.market }} &middot; strategy: {{ d.job.strategy }}
+        &middot; created {{ d.created_at }}
+      </div>
+    </div>
+    <span class="badge badge-{{ 'terminal' if st in ('ready','failed','cancelled') else 'running' if st not in ('queued','strapi_draft_created') else ('done' if st in ('ready','strapi_draft_created') else 'queued') }}">{{ st.replace('_', ' ') }}</span>
+  </div>
+
+  {% if d.error %}
+  <div class="error-panel" role="alert">
+    <div class="error-panel-head">
+      <strong>失败</strong>
+      <span class="error-code">{{ d.error.code }}</span>
+    </div>
+    <dl class="error-panel-body">
+      <dt>原因</dt><dd>{{ d.error.category }}</dd>
+      <dt>说明</dt><dd>{{ d.error.reason }}</dd>
+      <dt>处置建议</dt><dd>{{ d.error.advice }}</dd>
+      {% if d.error.message %}
+      <dt>原始信息</dt><dd class="error-raw">{{ d.error.message }}</dd>
+      {% endif %}
+    </dl>
+    {% if d.error.last_failed_step %}
+    <div class="actions error-panel-actions">
+      <form hx-post="/jobs/{{ d.job.id }}/retry" hx-swap="none">
+        <input type="hidden" name="mode" value="step">
+        <input type="hidden" name="step" value="{{ d.error.last_failed_step }}">
+        <button class="btn btn-primary" type="submit">
+          从该步重试 · Step {{ d.error.last_failed_step }} — {{ d.error.last_failed_step_label }}
+        </button>
+      </form>
+      <span class="muted">仅重跑该步骤及其后续步骤，此前已完成的检查点保持不变</span>
+    </div>
+    {% else %}
+    <div class="actions error-panel-actions">
+      <span class="muted">所有步骤均已成功完成，失败发生在 Strapi 同步阶段 — 请在下方 Strapi 区重新推送</span>
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# ---- Pipeline ---- #}
+  <section class="card">
+    <h2>Pipeline</h2>
+    <div class="progress-track" role="progressbar" aria-valuenow="{{ d.progress.pct }}" aria-valuemin="0" aria-valuemax="100">
+      <div class="progress-fill" style="width: {{ d.progress.pct }}%"></div>
+    </div>
+    <div class="progress-labels">
+      <span>{{ d.progress.stage }}/{{ d.progress.total }}</span>
+      <span class="muted">{{ d.progress.label }}</span>
+    </div>
+    {% if d.job.status == 'queued' %}
+      <p class="muted">Waiting for a worker to pick this job up (RQ queue).</p>
+    {% endif %}
+  </section>
+
+  <div class="detail-grid">
+    {# ---- Keyword ---- #}
+    <section class="card">
+      <h2>Keyword</h2>
+      <table class="kv">
+        <tr><th>Keyword</th><td>{{ d.job.keyword }}</td></tr>
+        {% if d.metrics %}
+        <tr><th>Volume</th><td>{{ d.metrics.volume if d.metrics.volume is not none else '—' }}</td></tr>
+        <tr><th>KD</th><td>{{ d.metrics.kd if d.metrics.kd is not none else '—' }}</td></tr>
+        <tr><th>CPC</th><td>{{ d.metrics.cpc if d.metrics.cpc is not none else '—' }}</td></tr>
+        <tr><th>Intent</th><td>{{ d.metrics.intent or '—' }}</td></tr>
+        {% else %}
+        <tr><th>Volume / KD / CPC</th><td class="muted">not in dataset</td></tr>
+        {% endif %}
+      </table>
+    </section>
+
+    {# ---- SERP ---- #}
+    <section class="card">
+      <h2>SERP</h2>
+      {% if d.serp %}
+        <div class="muted">{{ d.serp.provider }} — {{ d.serp.query }}</div>
+        <ol class="serp-list">
+          {% for r in d.serp.results %}
+          <li>
+            <span class="rank">{{ r.rank }}</span>
+            <a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.title or r.url }}</a>
+            {% if r.snippet %}<div class="muted snippet">{{ r.snippet[:180] }}{% if r.snippet|length > 180 %}…{% endif %}</div>{% endif %}
+          </li>
+          {% endfor %}
+        </ol>
+      {% else %}<p class="muted">No SERP data yet.</p>{% endif %}
+    </section>
+
+    {# ---- Sources ---- #}
+    <section class="card">
+      <h2>Sources</h2>
+      {% if d.sources %}
+      <table class="data">
+        <thead><tr><th>#</th><th>Domain</th><th>Title</th><th>Words</th></tr></thead>
+        <tbody>
+          {% for s in d.sources %}
+          <tr>
+            <td>{{ s.serp_rank or '—' }}</td>
+            <td>{{ s.domain }}</td>
+            <td><a href="{{ s.url }}" target="_blank" rel="noopener">{{ s.title or s.url }}</a></td>
+            <td>{{ s.word_count }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="muted">No extracted sources yet.</p>{% endif %}
+    </section>
+
+    {# ---- Content brief ---- #}
+    <section class="card">
+      <h2>Content Brief</h2>
+      {% if d.brief %}
+      <table class="kv">
+        <tr><th>Primary keyword</th><td>{{ d.brief.primary_keyword }}</td></tr>
+        <tr><th>Search intent</th><td>{{ d.brief.search_intent }}</td></tr>
+        <tr><th>Search stage</th><td>{{ d.brief.search_stage }}</td></tr>
+        <tr><th>Strategy</th><td>{{ d.brief.article_strategy }}</td></tr>
+        <tr><th>Target reader</th><td>{{ d.brief.target_reader }}</td></tr>
+        <tr><th>Core problem</th><td>{{ d.brief.core_problem }}</td></tr>
+        <tr><th>Unique angle</th><td>{{ d.brief.unique_angle }}</td></tr>
+        {% if d.brief.secondary_keywords %}
+        <tr><th>Secondary</th><td>{{ d.brief.secondary_keywords|join(', ') }}</td></tr>
+        {% endif %}
+        {% if d.brief.content_gaps %}
+        <tr><th>Content gaps</th><td>{{ d.brief.content_gaps|join(' · ') }}</td></tr>
+        {% endif %}
+      </table>
+      {% else %}<p class="muted">Brief not generated yet.</p>{% endif %}
+    </section>
+
+    {# ---- Outline ---- #}
+    <section class="card">
+      <h2>Outline</h2>
+      {% if d.outline %}
+        <h3 class="outline-title">{{ d.outline.title }}</h3>
+        <ul class="outline">
+          {% for s in d.outline.sections %}
+          <li class="{{ 'lvl3' if s.level == 3 else 'lvl2' }}">{{ s.heading }}
+            <span class="muted">— {{ s.purpose }}</span>
+          </li>
+          {% endfor %}
+        </ul>
+        {% if d.outline.faq_questions %}
+        <h3>FAQ</h3>
+        <ul class="outline">{% for q in d.outline.faq_questions %}<li>{{ q }}</li>{% endfor %}</ul>
+        {% endif %}
+      {% else %}<p class="muted">Outline not generated yet.</p>{% endif %}
+    </section>
+  </div>
+
+  {# ---- Article ---- #}
+  <section class="card">
+    <h2>Article
+      {% if d.article %}
+        <a class="btn btn-small" href="/articles/{{ d.job.id }}">Open Preview</a>
+      {% endif %}
+    </h2>
+    {% if d.article %}
+      <h3 class="outline-title">{{ d.article.title }}
+        <span class="muted">v{{ d.article.version }} / {{ d.article.stage }}</span>
+      </h3>
+      <pre class="markdown-pre">{{ d.article.body_markdown }}</pre>
+    {% else %}<p class="muted">Article not written yet.</p>{% endif %}
+  </section>
+
+  {# ---- Reviews ---- #}
+  <section class="card">
+    <h2>Reviews</h2>
+    {% if d.reviews %}
+      {% for r in d.reviews %}
+      <details class="review">
+        <summary>{{ r.review_type.replace('_', ' ') }}</summary>
+        <pre class="review-body">{{ r.review }}</pre>
+      </details>
+      {% endfor %}
+    {% else %}<p class="muted">No reviews yet.</p>{% endif %}
+  </section>
+
+  {# ---- Images ---- #}
+  <section class="card">
+    <h2>Images</h2>
+    {% if d.images %}
+    <table class="data">
+      <thead><tr><th>Role</th><th>Alt text</th><th>Provider</th><th>Aspect</th><th>File</th></tr></thead>
+      <tbody>
+        {% for im in d.images %}
+        <tr>
+          <td>{{ im.role }}</td>
+          <td>{{ im.alt_text or '—' }}</td>
+          <td>{{ im.provider or '—' }}</td>
+          <td>{{ im.aspect_ratio or '—' }}</td>
+          <td class="muted">{{ im.filename or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="muted">No images planned yet.</p>{% endif %}
+  </section>
+
+  {# ---- Strapi (43.5) ---- #}
+  <section class="card">
+    <h2>Strapi</h2>
+    {% if d.strapi.state == 'not_synced' %}
+      <p>No Strapi draft yet.</p>
+    {% elif d.strapi.state == 'syncing' %}
+      <p class="muted">Sync in progress…</p>
+    {% elif d.strapi.state == 'draft_created' %}
+      <p>Draft created in Strapi
+        {% if d.strapi.document_id %}<span class="muted">({{ d.strapi.document_id }})</span>{% endif %}.</p>
+    {% else %}
+      <p class="alert alert-error">Sync failed{% if d.strapi.error %}: {{ d.strapi.error }}{% endif %}</p>
+    {% endif %}
+    <div class="actions">
+      {% if d.strapi.can_push %}
+      <button class="btn" hx-post="/jobs/{{ d.job.id }}/sync-strapi" hx-swap="none">
+        Push Draft to Strapi
+      </button>
+      {% endif %}
+      {% if d.strapi.can_update %}
+      <button class="btn" hx-post="/jobs/{{ d.job.id }}/sync-strapi" hx-swap="none">
+        Update Existing Draft
+      </button>
+      {% endif %}
+      {% if d.strapi.admin_url %}
+      <a class="btn btn-link" href="{{ d.strapi.admin_url }}" target="_blank" rel="noopener">Open in Strapi</a>
+      {% endif %}
+    </div>
+  </section>
+
+  {# ---- Retry options (P9-A: full / by-step / resume / force refresh) ---- #}
+  {% if d.retry_available %}
+  <section class="card">
+    <h2>Retry (terminal job)</h2>
+    <div class="actions job-actions retry-options">
+      <button class="btn btn-primary" hx-post="/jobs/{{ d.job.id }}/retry" hx-swap="none">Retry (Full)</button>
+      <form hx-post="/jobs/{{ d.job.id }}/retry" hx-swap="none">
+        <input type="hidden" name="mode" value="resume">
+        <button class="btn" type="submit">Resume from checkpoint</button>
+        {% if d.resume_from_step is not none %}
+        <span class="muted">→ step {{ d.resume_from_step }}</span>
+        {% endif %}
+      </form>
+      {% if d.checkpoints %}
+      <form hx-post="/jobs/{{ d.job.id }}/retry" hx-swap="none">
+        <input type="hidden" name="mode" value="step">
+        <select name="step" aria-label="Retry step">
+          {% for cp in d.checkpoints %}
+          <option value="{{ cp.index }}">{{ cp.index }} · {{ cp.label }}{% if not cp.done %} (incomplete){% endif %}</option>
+          {% endfor %}
+        </select>
+        <button class="btn" type="submit">Retry Step</button>
+      </form>
+      {% endif %}
+      <form hx-post="/jobs/{{ d.job.id }}/retry" hx-swap="none">
+        <input type="hidden" name="mode" value="full">
+        <label class="muted"><input type="checkbox" name="force_source_refresh" value="true"> Force Refresh Sources</label>
+        <button class="btn" type="submit">Retry + Refresh</button>
+      </form>
+    </div>
+  </section>
+  {% endif %}
+
+  {# ---- Actions (43.2/43.3) ---- #}
+  <div class="actions job-actions">
+    {% if st not in ('ready', 'failed', 'cancelled') %}
+    <button class="btn btn-danger" hx-post="/jobs/{{ d.job.id }}/cancel" hx-swap="none">Cancel</button>
+    {% endif %}
+    <a class="btn btn-link" href="/jobs">Back to Jobs</a>
+  </div>
+</section>

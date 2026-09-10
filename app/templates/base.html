@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}SEO Auto-Gen{% endblock %}</title>
+  <script src="/static/htmx.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><a href="/">SEO Auto-Gen</a></div>
+    <nav class="nav">
+      <a href="/" class="{% if nav == 'new' %}active{% endif %}">New Article</a>
+      <a href="/jobs" class="{% if nav == 'jobs' %}active{% endif %}">Jobs</a>
+      <a href="/keywords" class="{% if nav == 'keywords' %}active{% endif %}">Keywords</a>
+      <a href="/prompts" class="{% if nav == 'prompts' %}active{% endif %}">Prompts</a>
+    </nav>
+  </header>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

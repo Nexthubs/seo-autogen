@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Job {{ job_id }} · SEO Auto-Gen{% endblock %}
+{% block content %}
+{% set data = job_detail_payload %}
+<div id="job-detail"
+     hx-get="/jobs/{{ job_id }}/fragment"
+     hx-target="#job-detail"
+     hx-swap="innerHTML"
+     hx-trigger="load, every 2.5s">
+  {% include "job_fragment.html" %}
+</div>
+{% endblock %}

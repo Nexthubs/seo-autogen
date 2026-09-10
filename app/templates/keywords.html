@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Keywords · SEO Auto-Gen{% endblock %}
+{% block content %}
+{% set nav = 'keywords' %}
+<div class="page-head">
+  <h1 class="page-title">Keyword Dataset</h1>
+</div>
+
+<form class="card form" method="post" action="/keywords/import" enctype="multipart/form-data">
+  <h2>Import workbook (.xlsx)</h2>
+  <p class="muted">One sheet per cluster. Columns: keyword, volume, kd, cpc, intent.</p>
+  <div class="actions">
+    <input type="file" name="file" accept=".xlsx,.xlsm" required>
+    <button type="submit" class="btn btn-primary">Import</button>
+  </div>
+
+  {% if import_error is defined and import_error %}
+  <div class="alert alert-error">{{ import_error }}</div>
+  {% endif %}
+  {% if import_report is defined and import_report %}
+  <div class="import-report">
+    <p><strong>{{ import_report.file_name }}</strong> —
+      {{ import_report.keywords_created }} created,
+      {{ import_report.keywords_updated }} updated,
+      {{ import_report.keywords_skipped }} skipped,
+      {{ import_report.clusters_created }} clusters.</p>
+    {% if import_report.warnings %}
+    <ul class="muted">{% for w in import_report.warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+    {% endif %}
+  </div>
+  {% endif %}
+</form>
+
+<div class="card">
+  <h2>Browse</h2>
+  <div class="actions filter-bar">
+    <select onchange="location.href='/keywords?strategy=' + this.value">
+      {% for value, label in strategies %}
+      <option value="{{ value }}" {% if strategy == value %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <span class="muted">{{ rows|length }} keywords</span>
+  </div>
+  {% if rows %}
+  <table class="data">
+    <thead><tr><th>Keyword</th><th>Cluster</th><th>Volume</th><th>KD</th><th>CPC</th><th>Intent</th></tr></thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.keyword }}</td>
+        <td>{{ r.cluster_name }}</td>
+        <td>{{ r.volume if r.volume is not none else '—' }}</td>
+        <td>{{ r.kd if r.kd is not none else '—' }}</td>
+        <td>{{ r.cpc if r.cpc is not none else '—' }}</td>
+        <td>{{ r.intent or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No keywords in the dataset yet — import a workbook above.</p>
+  {% endif %}
+</div>
+{% endblock %}

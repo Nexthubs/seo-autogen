@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Prompts — SEO Auto-Gen{% endblock %}
+{% block content %}
+<h1>Prompt versions</h1>
+<p class="muted">
+  Every LLM result records the prompt that produced it: <code>prompt_name</code>,
+  <code>prompt_version</code> and <code>prompt_hash</code> (SHA256 of the prompt
+  file, spec §48). Usage below is a live aggregate over the persisted result
+  tables.
+</p>
+
+<h2>Prompt inventory</h2>
+<table class="data">
+  <thead>
+    <tr>
+      <th>Prompt</th>
+      <th>Version</th>
+      <th>Step</th>
+      <th>Hash (SHA256)</th>
+      <th>Content</th>
+      <th>Result rows</th>
+      <th>Jobs</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for p in prompts %}
+    <tr>
+      <td><code>{{ p.name }}</code></td>
+      <td>{{ p.version }}</td>
+      <td>{{ p.step }}</td>
+      <td><code title="{{ p.prompt_hash }}">{{ p.prompt_hash[:12] }}…</code></td>
+      <td>{{ p.content_chars }} chars</td>
+      <td>{{ p.usage }}</td>
+      <td>{{ p.jobs }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if stale_versions %}
+<h2>Stale prompt versions</h2>
+<p class="muted">
+  Results produced with a prompt version/hash that no longer matches the
+  current file — the prompt changed after these results were written.
+</p>
+<table class="data">
+  <thead>
+    <tr>
+      <th>Prompt</th>
+      <th>Version</th>
+      <th>Recorded hash</th>
+      <th>Result rows</th>
+      <th>Jobs</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for s in stale_versions %}
+    <tr>
+      <td><code>{{ s.prompt_name }}</code></td>
+      <td>{{ s.prompt_version }}</td>
+      <td><code title="{{ s.prompt_hash }}">{{ s.prompt_hash[:12] }}…</code></td>
+      <td>{{ s.usage }}</td>
+      <td>{{ s.jobs }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>Rulebooks (unversioned)</h2>
+<p class="muted">
+  Content rulebooks are embedded in other prompts at render time; they have
+  no front matter and no result rows — only a content hash.
+</p>
+<table class="data">
+  <thead>
+    <tr>
+      <th>File</th>
+      <th>Hash (SHA256)</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rulebooks %}
+    <tr>
+      <td><code>{{ r.name }}</code></td>
+      <td><code title="{{ r.hash }}">{{ r.hash[:12] }}…</code></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

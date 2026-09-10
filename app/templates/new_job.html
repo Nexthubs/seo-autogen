@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}New Article · SEO Auto-Gen{% endblock %}
+{% block content %}
+{% set nav = 'new' %}
+<h1 class="page-title">New Article</h1>
+
+<form class="card form" method="post" action="/generate">
+  <div class="form-grid">
+    <label class="span2">
+      <span class="field-label">Target Keyword <em class="req">*</em></span>
+      <input type="text" name="keyword" required minlength="1" maxlength="500"
+             placeholder="e.g. how to improve home wifi coverage" autocomplete="off">
+    </label>
+
+    <label>
+      <span class="field-label">Language</span>
+      <input type="text" name="language" value="{{ default_language }}" required>
+    </label>
+
+    <label>
+      <span class="field-label">Market</span>
+      <input type="text" name="market" value="{{ default_market }}" required>
+    </label>
+
+    <label class="span2">
+      <span class="field-label">Target Function</span>
+      <input type="text" name="target_function" value=""
+             placeholder="optional — e.g. /tools/wifi-coverage">
+    </label>
+
+    <label>
+      <span class="field-label">Strategy</span>
+      <select name="strategy">
+        {% for value, label in strategies %}
+        <option value="{{ value }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <label>
+      <span class="field-label">Image Mode</span>
+      <select name="image_mode">
+        {% for value, label in image_modes %}
+        <option value="{{ value }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <label>
+      <span class="field-label">Author {% if not strapi_configured %}<span class="muted">(Strapi not configured)</span>{% endif %}</span>
+      <select name="author_document_id">
+        <option value="">— default author —</option>
+        {% for a in authors %}
+        <option value="{{ a.document_id }}">{{ a.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <label>
+      <span class="field-label">Category {% if not strapi_configured %}<span class="muted">(Strapi not configured)</span>{% endif %}</span>
+      <select name="category_document_id">
+        <option value="">— default category —</option>
+        {% for c in categories %}
+        <option value="{{ c.document_id }}">{{ c.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+
+  <div class="actions">
+    <button type="submit" class="btn btn-primary">Generate</button>
+  </div>
+  <p class="muted form-hint">
+    The job is enqueued and keeps running even if you close the browser.
+    Track it on the <a href="/jobs">Jobs</a> page.
+  </p>
+</form>
+{% endblock %}

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Jobs · SEO Auto-Gen{% endblock %}
+{% block content %}
+{% set nav = 'jobs' %}
+<div class="page-head">
+  <h1 class="page-title">Jobs</h1>
+  <a class="btn btn-primary" href="/">New Article</a>
+</div>
+
+<table class="data jobs-table">
+  <thead>
+    <tr>
+      <th>Keyword</th>
+      <th>Status</th>
+      <th>Progress</th>
+      <th>Model</th>
+      <th>Created At</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td><a href="/jobs/{{ row.job.id }}">{{ row.job.keyword }}</a></td>
+      <td><span class="badge badge-{{ 'terminal' if row.job.status in ('ready','failed','cancelled') else 'running' }}">{{ row.job.status.replace('_', ' ') }}</span></td>
+      <td>
+        <div class="mini-progress">
+          <div class="mini-fill" style="width: {{ row.progress.pct }}%"></div>
+        </div>
+        <span class="muted">{{ row.progress.stage }}/{{ row.progress.total }} · {{ row.progress.label }}</span>
+      </td>
+      <td class="muted">{{ row.model }}</td>
+      <td class="muted">{{ row.created_at }}</td>
+      <td>
+        <a href="/jobs/{{ row.job.id }}" class="btn btn-small">Open</a>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6" class="muted">No jobs yet. <a href="/">Create one</a>.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}{{ article.title if article else job.keyword }} · Preview · SEO Auto-Gen{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1 class="page-title">Article Preview</h1>
+  <div class="actions">
+    <a class="btn btn-link" href="/jobs/{{ job.id }}">Job Detail</a>
+    <a class="btn btn-link" href="/jobs">Jobs</a>
+  </div>
+</div>
+
+{% if not article %}
+  <div class="card">
+    <p class="muted">No article has been generated for this job yet
+      (status: <code>{{ job.status }}</code>).</p>
+  </div>
+{% else %}
+  <article class="card article-preview">
+    {% if hero %}
+    <img class="hero" src="{{ hero }}" alt="">
+    {% endif %}
+
+    <h1 class="article-title">{{ article.title }}</h1>
+    <p class="muted article-meta">
+      slug: <code>{{ article.slug or '—' }}</code>
+      &middot; seo title: {{ article.seo_title or '—' }}
+    </p>
+
+    <div class="md">{{ article.rendered }}</div>
+
+    <footer class="card-sub">
+      <h2>SEO metadata</h2>
+      <table class="kv">
+        <tr><th>SEO title</th><td>{{ article.seo_title or '—' }}</td></tr>
+        <tr><th>Meta description</th><td>{{ article.meta_description or '—' }}</td></tr>
+        <tr><th>Slug</th><td>{{ article.slug or '—' }}</td></tr>
+      </table>
+    </footer>
+
+    {% if links %}
+    <footer class="card-sub">
+      <h2>Internal links</h2>
+      <table class="data">
+        <thead><tr><th>Marker</th><th>Anchor</th><th>Target</th></tr></thead>
+        <tbody>
+          {% for l in links %}
+          <tr>
+            <td><code>{{ l.marker }}</code></td>
+            <td>{{ l.anchor_text }}</td>
+            <td><a href="{{ l.target_url }}">{{ l.target_url }}</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </footer>
+    {% else %}
+    <footer class="card-sub"><h2>Internal links</h2><p class="muted">None.</p></footer>
+    {% endif %}
+  </article>
+{% endif %}
+{% endblock %}
