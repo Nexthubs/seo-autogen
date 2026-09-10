@@ -48,7 +48,8 @@
 
 | 项 | 值 |
 |---|---|
-| 本轮修复 commit | `<ROUND2_COMMIT>`（工作区状态见 `git show --stat`） |
+| 本轮修复 commit | `4de7ab4`（`git show --stat 4de7ab4`） |
+| 前轮基线 commit | `0636e2e`（第二轮审计所基于的 HEAD） |
 | 全量测试 | `587 passed, 1 skipped, 1 warning`（无失败；跳过项为 `RUN_EXTERNAL_INTEGRATION_TESTS` 门控的真实 Strapi §59.3 流程） |
 | 新增迁移 | `0012_evidence_support_check`、`0013_review_lineage`、`0014_provider_cost_ledger`（均已 upgrade 本地 PG 测试库；`alembic upgrade head --sql` 离线生成成功；单 head） |
 | 新增依赖 | 无（复用已有 `markdown-it-py`） |

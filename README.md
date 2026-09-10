@@ -27,7 +27,7 @@ P0 → P1 → … → P9.
   证伪**:其中 9 项实际只是"部分修复",详见下表的诚实更正。
 - **第二轮**(同一 `CODEX-AUDIT-REPORT.md` 复验版,commit `0636e2e`,新编号
   `R-H01`…`R-L01`,共 0 Critical / **7 High** / **3 Medium** / **1 Low**)——
-  B8–B14 逐批修复,本轮 commit `<见下方 ROUND2_COMMIT>`,逐项进度与测试证据见
+  B8–B14 逐批修复,本轮 commit `4de7ab4`,逐项进度与测试证据见
   `docs/AUDIT-R2-FIX-PROGRESS.md`,每阶段详档见 `docs/audit-r2/`。
 
 | 批次 | 阶段 | 修复项 | 阶段文档 |
