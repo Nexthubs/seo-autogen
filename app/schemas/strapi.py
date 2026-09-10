@@ -29,7 +29,16 @@ class MediaUploadResult(BaseModel):
 
 
 class StrapiBlogEntry(BaseModel):
-    """One Blog entry as returned by ``GET /api/blogs`` (section 42)."""
+    """One Blog entry as returned by ``GET /api/blogs`` (section 42).
+
+    H03: Strapi 5 returns entries FLAT (``id``/``documentId``/``title``/…
+    directly under ``data`` — no ``attributes`` wrapper). Relations can
+    come back as a short documentId string, a numeric id, or a POPULATED
+    object (``{"id": …, "documentId": …, "name": …}``) when the request
+    used a ``populate`` query; the provider parses all of these, and
+    :func:`relation_document_id` / :func:`media_url` normalize them for
+    verification (section 64).
+    """
 
     id: int
     document_id: str
@@ -40,9 +49,61 @@ class StrapiBlogEntry(BaseModel):
     meta_title: str | None = None
     meta_description: str | None = None
     seo_keywords: str | None = None
-    author: str | int | None = None
-    category: str | int | None = None
-    main_image: str | None = None
+    author: str | int | dict | None = None
+    category: str | int | dict | None = None
+    main_image: str | dict | None = None
+
+
+def relation_document_id(value: str | int | dict | None) -> str | None:
+    """Canonical documentId for an author/category relation value.
+
+    Accepts the short documentId (string), a numeric Strapi id, or a
+    populated relation object. Returns ``None`` for ``None``/blank —
+    that is *not* a mismatch: when a relation was not written (e.g.
+    author optional + no default), the GET must not fail on it.
+    """
+    if value is None or isinstance(value, (int, str)):
+        return str(value) if value not in (None, "") else None
+    if isinstance(value, dict):
+        doc_id = value.get("documentId") or value.get("document_id")
+        if doc_id:
+            return str(doc_id)
+        item_id = value.get("id")
+        return str(item_id) if item_id is not None else None
+    return None
+
+
+def media_url(value: str | dict | None) -> str | None:
+    """Canonical public URL for a media field value (H03/M02).
+
+    Strapi returns media either as a plain URL string or, when the
+    response is populated, as an object with ``url``/``id``/``documentId``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, dict):
+        return value.get("url") or None
+    return None
+
+
+def media_id(value: str | dict | None) -> int | None:
+    """Canonical media item id for a media field value (H03/M02)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, str)):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, dict):
+        item_id = value.get("id")
+        try:
+            return int(item_id) if item_id is not None else None
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 # ======================================================================

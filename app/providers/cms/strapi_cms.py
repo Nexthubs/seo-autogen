@@ -160,10 +160,21 @@ class StrapiCMSProvider(CMSProvider):
 
     async def get_draft(self, document_id: str) -> StrapiBlogEntry:
         """``GET /api/{pluralApiId}/{documentId}?status=draft``
-        (STEP F verification, section 36)."""
+        (STEP F verification, section 36).
+
+        H03/M02: relations are POPULATED (``populate[author]`` etc.) so
+        the STEP F verification can compare the stored author/category
+        against the expected documentIds even when Strapi returns them
+        as populated objects instead of bare documentId strings.
+        """
         data = await self._get(
             f"/api/{self._settings.strapi_blog_plural_api_id}/{document_id}",
-            {"status": "draft"},
+            {
+                "status": "draft",
+                "populate[author]": "*",
+                "populate[category]": "*",
+                "populate[mainImage]": "*",
+            },
             code=ErrorCode.STRAPI_AUTH_FAILED,
         )
         return self._entry_from_item(data.get("data") or {})
@@ -239,7 +250,20 @@ class StrapiCMSProvider(CMSProvider):
     # internals
     # ------------------------------------------------------------
     def _entry_from_item(self, item: dict) -> StrapiBlogEntry:
-        attributes = item.get("attributes") or {}
+        """Parse one Blog entry from a Strapi response item (H03).
+
+        Strapi 5 (the V1 target) returns entries FLAT:
+        ``{"id": 7, "documentId": "…", "title": …, "body": …, ...}`` —
+        there is NO ``attributes`` wrapper. Legacy Strapi 4 wrapped the
+        same fields under ``attributes``; per spec section 35 (a real
+        Strapi 4 server is repaired here only), that shape is still
+        tolerated so one deployment difference never breaks parsing.
+        """
+        data = item.get("data")
+        if isinstance(data, dict):  # some list responses wrap each item
+            item = data
+        attributes = item.get("attributes")
+        flat = attributes if isinstance(attributes, dict) else item
         if "id" not in item or "documentId" not in item:
             raise PipelineError(
                 ErrorCode.STRAPI_SCHEMA_MISMATCH,
@@ -249,16 +273,16 @@ class StrapiCMSProvider(CMSProvider):
         return StrapiBlogEntry(
             id=item["id"],
             document_id=item["documentId"],
-            slug=attributes.get("slug"),
-            title=attributes.get("title"),
-            status=attributes.get("status"),
-            body=attributes.get("body"),
-            meta_title=attributes.get("metaTitle"),
-            meta_description=attributes.get("metaDescription"),
-            seo_keywords=attributes.get("seoKeywords"),
-            author=attributes.get("author"),
-            category=attributes.get("category"),
-            main_image=attributes.get("mainImage"),
+            slug=flat.get("slug"),
+            title=flat.get("title"),
+            status=flat.get("status"),
+            body=flat.get("body"),
+            meta_title=flat.get("metaTitle"),
+            meta_description=flat.get("metaDescription"),
+            seo_keywords=flat.get("seoKeywords"),
+            author=flat.get("author"),
+            category=flat.get("category"),
+            main_image=flat.get("mainImage"),
         )
 
     async def _upload(
@@ -342,7 +366,19 @@ class StrapiCMSProvider(CMSProvider):
 
     @staticmethod
     def _upload_result(data: dict) -> MediaUploadResult:
-        item = (data.get("data") or {}).get("data") or {}
+        """Parse ``POST /api/upload`` (H03).
+
+        Strapi 5 returns ``{"data": [ {file}, ... ]}`` — an ARRAY of
+        uploaded files (one per ``files`` part); Strapi 4 returned a
+        single object. Both are accepted: for the array the first item
+        is the one we uploaded (single-file uploads in this codebase).
+        """
+        payload = data.get("data")
+        if isinstance(payload, list):
+            item = payload[0] if payload else {}
+        else:
+            # legacy v4 shape: a single object
+            item = payload or {}
         if not item.get("id") or not item.get("url"):
             raise PipelineError(
                 ErrorCode.STRAPI_SCHEMA_MISMATCH,

@@ -24,11 +24,21 @@ class JobStatus(str, Enum):
     READY = "ready"
     STRAPI_SYNCING = "strapi_syncing"
     STRAPI_DRAFT_CREATED = "strapi_draft_created"
+    STRAPI_SYNC_FAILED = "strapi_sync_failed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
     @property
     def is_terminal(self) -> bool:
+        # M01 / spec section 64: a failed Strapi push lands in
+        # ``strapi_sync_failed`` — the article pipeline SUCCEEDED (ready),
+        # so the state is deliberately NOT a pipeline-terminal state:
+        #   * the full/step/resume retry endpoints (spec 44) must not
+        #     re-run the article pipeline for it;
+        #     the sync is retried through the dedicated
+        #     ``POST /jobs/{id}/sync-strapi`` path instead;
+        #   * ops cleanup must never auto-delete it (it holds the
+        #     documentId anchor, sections 41/64).
         return self in (JobStatus.READY, JobStatus.FAILED, JobStatus.CANCELLED)
 
 

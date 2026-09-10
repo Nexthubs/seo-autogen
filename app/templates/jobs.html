@@ -22,7 +22,7 @@
     {% for row in rows %}
     <tr>
       <td><a href="/jobs/{{ row.job.id }}">{{ row.job.keyword }}</a></td>
-      <td><span class="badge badge-{{ 'terminal' if row.job.status in ('ready','failed','cancelled') else 'running' }}">{{ row.job.status.replace('_', ' ') }}</span></td>
+      <td><span class="badge badge-{{ 'error' if row.job.status == 'strapi_sync_failed' else 'terminal' if row.job.status in ('ready','failed','cancelled') else 'running' }}">{{ row.job.status.replace('_', ' ') }}</span></td>
       <td>
         <div class="mini-progress">
           <div class="mini-fill" style="width: {{ row.progress.pct }}%"></div>

@@ -231,7 +231,9 @@ async def test_failure_keeps_document_id_on_postgres(db, tmp_path):
     assert row.sync_status == StrapiSyncStatus.FAILED.value
     assert row.strapi_document_id == "doc-42"  # section 64: retry-safe
     db.refresh(job)
-    assert job.status == JobStatus.STRAPI_SYNCING.value
+    # M01: the unified persisted state — the job is strapi_sync_failed
+    # (NOT still strapi_syncing), so the UI can show + retry it.
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
     assert job.error_code == "STRAPI_UPLOAD_FAILED"
 
 
@@ -339,7 +341,14 @@ async def test_external_strapi_59_3_flow():
                 },
             )
             assert resp.status_code in (200, 201), resp.text[:300]
-            media = resp.json()["data"]["data"]
+            # H03: Strapi 5 returns ``data`` as an ARRAY of uploaded
+            # files; legacy Strapi 4 returns a single object with a
+            # ``data`` key. Accept both.
+            upload_data = resp.json()["data"]
+            if isinstance(upload_data, list):
+                media = upload_data[0]
+            else:
+                media = upload_data.get("data", upload_data)
             main_image = media["url"]
 
             # 3+4. Attach mainImage and update the body
@@ -363,7 +372,11 @@ async def test_external_strapi_59_3_flow():
                 headers=headers,
             )
             assert resp.status_code == 200, resp.text[:300]
-            draft = resp.json()["data"]["attributes"]
+            # H03: Strapi 5 returns the entry FLAT (no ``attributes``
+            # wrapper); legacy Strapi 4 wraps the fields under
+            # ``attributes``. Accept both.
+            raw = resp.json()["data"]
+            draft = raw.get("attributes", raw) if isinstance(raw, dict) else raw
             # 6. Verify status + fields
             assert draft["status"] == "draft"
             assert draft["slug"] == slug

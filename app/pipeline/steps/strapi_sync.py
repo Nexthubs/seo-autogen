@@ -41,7 +41,11 @@ from app.schemas.article import ArticleDocument
 from app.schemas.strapi import (
     build_draft_payload,
     build_final_body_payload,
+    build_seo_keywords,
+    media_id,
+    media_url,
     payload_hash,
+    relation_document_id,
     resolve_media_url,
 )
 from app.services.final_body import render_final_body
@@ -80,12 +84,33 @@ def _fail_pre_sync(
     row: StrapiSyncRow | None,
     error: PipelineError,
 ) -> None:
-    """Persist failure state before/around the HTTP phase (section 9)."""
-    if row is not None:
-        row.sync_status = StrapiSyncStatus.FAILED.value
-        row.error_message = str(error)
+    """Persist the unified failed state (M01, section 64).
+
+    Even a pre-HTTP failure (slug conflict, required author/category
+    missing) must land in a UNIFIED persisted state:
+
+    * a ``strapi_syncs`` row exists with ``sync_status=failed`` and
+      the error — so the UI/API can always show and retry it, and a
+      later mid-sync retry knows exactly where to resume;
+    * the job moves to ``strapi_sync_failed`` (section 64: the
+      article pipeline already succeeded — only the sync failed, so
+      ``failed`` is NOT the right status).
+    """
+    if row is None:
+        row = StrapiSyncRow(
+            job_id=job.id,
+            strapi_id=None,
+            strapi_document_id=None,
+            sync_status=StrapiSyncStatus.FAILED.value,
+        )
+        session.add(row)
+    row.sync_status = StrapiSyncStatus.FAILED.value
+    row.error_message = str(error)
+    job.status = JobStatus.STRAPI_SYNC_FAILED.value
+    job.current_step = "strapi_sync"
     job.error_code = error.error_code.value
     job.error_message = error.message
+    job.completed_at = job.completed_at or datetime.now(timezone.utc)
     session.commit()
     raise error
 
@@ -257,28 +282,118 @@ async def run_strapi_sync(
         row.last_payload_hash = payload_hash(final_payload)
         session.commit()
 
-        # ================= STEP F: GET verify (section 64) ============
+        # ================= STEP F: GET verify (section 64, M02) =====
+        # Verify the NORMALIZED values — not just non-empty:
+        #   * id / documentId anchor the retry;
+        #   * status must stay "draft" (we never publish, and a
+        #     "published" read-back means someone/something published
+        #     it — fail, don't report success);
+        #   * title/slug/body/metaTitle/metaDescription/seoKeywords
+        #     must equal what WE pushed;
+        #   * author/category resolve (short documentId string,
+        #     numeric id, or populated object) to the expected
+        #     documentIds;
+        #   * mainImage matches the uploaded hero media.
         fetched = await provider.get_draft(row.strapi_document_id)
-        missing = [
-            field
-            for field, value in (
-                ("title", fetched.title),
-                ("slug", fetched.slug),
-                ("author", fetched.author),
-                ("category", fetched.category),
-                ("mainImage", fetched.main_image),
-                ("body", fetched.body),
-                ("metaTitle", fetched.meta_title),
-                ("metaDescription", fetched.meta_description),
-                ("seoKeywords", fetched.seo_keywords),
+
+        problems: list[str] = []
+        if fetched.id != row.strapi_id:
+            problems.append(
+                f"id mismatch: got {fetched.id!r}, expected {row.strapi_id!r}"
             )
-            if value in (None, "")
-        ]
-        if missing:
+        if fetched.document_id != row.strapi_document_id:
+            problems.append(
+                f"documentId mismatch: got {fetched.document_id!r}, "
+                f"expected {row.strapi_document_id!r}"
+            )
+        if fetched.status != "draft":
+            problems.append(
+                f"status is {fetched.status!r} — expected 'draft' "
+                "(this tool never publishes)"
+            )
+        if (fetched.title or "") != doc.title:
+            problems.append(
+                f"title mismatch: got {fetched.title!r}, expected {doc.title!r}"
+            )
+        if (fetched.slug or "") != doc.slug:
+            problems.append(
+                f"slug mismatch: got {fetched.slug!r}, expected {doc.slug!r}"
+            )
+        if (fetched.body or "") != final_body:
+            problems.append(
+                "body mismatch: stored body does not equal the final "
+                "rendered body that was PUT"
+            )
+        if (fetched.meta_title or "") != doc.seo_title:
+            problems.append(
+                f"metaTitle mismatch: got {fetched.meta_title!r}, "
+                f"expected {doc.seo_title!r}"
+            )
+        if (fetched.meta_description or "") != doc.meta_description:
+            problems.append(
+                "metaDescription mismatch: got "
+                f"{fetched.meta_description!r}, expected "
+                f"{doc.meta_description!r}"
+            )
+        expected_keywords = build_seo_keywords(
+            doc.primary_keyword,
+            doc.secondary_keywords,
+            doc.long_tail_keywords,
+        )
+        if (fetched.seo_keywords or "") != expected_keywords:
+            problems.append(
+                "seoKeywords mismatch: got "
+                f"{fetched.seo_keywords!r}, expected {expected_keywords!r}"
+            )
+        expected_author = relation_document_id(
+            job.author_document_id or settings.strapi_default_author_document_id
+        )
+        if expected_author is not None:
+            actual_author = relation_document_id(fetched.author)
+            if actual_author != expected_author:
+                problems.append(
+                    f"author mismatch: got {actual_author!r}, "
+                    f"expected {expected_author!r}"
+                )
+        expected_category = relation_document_id(
+            job.category_document_id
+            or settings.strapi_default_category_document_id
+        )
+        if expected_category is not None:
+            actual_category = relation_document_id(fetched.category)
+            if actual_category != expected_category:
+                problems.append(
+                    f"category mismatch: got {actual_category!r}, "
+                    f"expected {expected_category!r}"
+                )
+        # Compare by URL PATH (section 39): we stored the absolute
+        # public URL, Strapi stores the raw one (possibly relative) —
+        # the path is what identifies the media file on disk.
+        expected_media_url = media_url(hero.strapi_url)
+        if expected_media_url:
+            actual_media_url = media_url(fetched.main_image)
+            if _url_path(expected_media_url) != _url_path(
+                actual_media_url or ""
+            ):
+                problems.append(
+                    f"mainImage mismatch: got {actual_media_url!r}, "
+                    f"expected {expected_media_url!r}"
+                )
+        # media id match when Strapi exposes it (populated object)
+        if hero.strapi_media_id is not None:
+            actual_media_id = media_id(fetched.main_image)
+            if (
+                actual_media_id is not None
+                and actual_media_id != int(hero.strapi_media_id)
+            ):
+                problems.append(
+                    f"mainImage media id mismatch: got {actual_media_id}, "
+                    f"expected {hero.strapi_media_id}"
+                )
+        if problems:
             raise PipelineError(
                 ErrorCode.STRAPI_SCHEMA_MISMATCH,
-                f"GET verify failed after sync — missing fields: "
-                f"{', '.join(missing)}",
+                f"GET verify failed after sync: {'; '.join(problems)}",
             )
 
         # ---- success (section 64: all 9 fields + GET + documentId) ----
@@ -299,13 +414,39 @@ async def run_strapi_sync(
         )
         return row
     except PipelineError as error:
-        # Section 64: keep the documentId so the retry UPDATES the same
-        # draft. Only fields that are actually safe to touch are set.
-        if row is not None:
-            row.sync_status = StrapiSyncStatus.FAILED.value
-            row.error_message = str(error)
+        # Section 64 + M01: a mid-sync failure keeps the documentId so
+        # the retry UPDATES the same draft. The persisted state is
+        # UNIFIED regardless of where it failed:
+        #   * the sync row is always failed (+ error message);
+        #   * the job is always ``strapi_sync_failed`` (the pipeline
+        #     itself succeeded — retrying the full pipeline must stay
+        #     409, only the sync is retried).
+        # ``_fail_pre_sync`` may already have created + committed a row
+        # while the LOCAL ``row`` here is still None (the idempotency
+        # anchor select never ran) — re-query before inserting so we
+        # never double-create (UNIQUE on job_id).
+        if row is None:
+            row = session.scalars(
+                select(StrapiSyncRow).where(StrapiSyncRow.job_id == job.id)
+            ).first()
+            if row is None:
+                # First-precheck failure (author/category missing, no
+                # final article): no row existed yet — still persist
+                # one so the failure is visible AND retryable (M01).
+                row = StrapiSyncRow(
+                    job_id=job.id,
+                    strapi_id=None,
+                    strapi_document_id=None,
+                    sync_status=StrapiSyncStatus.FAILED.value,
+                )
+                session.add(row)
+        row.sync_status = StrapiSyncStatus.FAILED.value
+        row.error_message = str(error)
+        job.status = JobStatus.STRAPI_SYNC_FAILED.value
+        job.current_step = "strapi_sync"
         job.error_code = error.error_code.value
         job.error_message = error.message
+        job.completed_at = job.completed_at or datetime.now(timezone.utc)
         session.commit()
         logger.warning(
             "strapi_sync_failed",
@@ -321,14 +462,38 @@ async def run_strapi_sync(
         raise
 
 
+def _url_path(url: str) -> str:
+    """Path component of a media URL for comparison (M02).
+
+    Strapi returns relative ``/uploads/...`` URLs; we persist the
+    absolute public URL (section 39). Comparing by path keeps the
+    verification correct either way.
+    """
+    if not url:
+        return ""
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    if "://" in path:
+        path = path.split("://", 1)[1]
+        path = path.split("/", 1)[1] if "/" in path else ""
+    if not path.startswith("/"):
+        path = "/" + path
+    return path or "/"
+
+
 def _read_image_bytes(row: ImageRow, label: str) -> bytes:
     if not row.local_path:
         raise PipelineError(
             ErrorCode.STRAPI_UPLOAD_FAILED,
             f"local image file missing for {label} — run image generation first",
         )
-    with open(row.local_path, "rb") as fh:
-        return fh.read()
+    try:
+        with open(row.local_path, "rb") as fh:
+            return fh.read()
+    except OSError as error:  # M01: path set but file vanished (cleanup, disk)
+        raise PipelineError(
+            ErrorCode.STRAPI_UPLOAD_FAILED,
+            f"local image file unreadable for {label}: {error}",
+        ) from error
 
 
 def _record_media(row: ImageRow, result, settings: Settings) -> None:

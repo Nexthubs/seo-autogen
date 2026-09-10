@@ -57,17 +57,51 @@ class _Entry:
 
 
 class FakeStrapiProvider:
-    """Records every call; the full A-F flow is scriptable per test."""
+    """Records every call; the full A-F flow is scriptable per test.
 
-    def __init__(self, *, slug_entries=None, fail_inline: str | None = None):
+    M02: the fake keeps the draft's DOCUMENT STATE — create/updates
+    merge their ``data`` fields into it, and ``get_draft`` ECHOES that
+    state (plus the uploaded hero mainImage). The STEP F verification
+    therefore passes only when the step pushes values that actually
+    survive on the "server"; ``get_override`` can corrupt any field to
+    prove a mismatch is rejected.
+    """
+
+    def __init__(
+        self,
+        *,
+        slug_entries=None,
+        fail_inline: str | None = None,
+        main_image: str | None = None,
+        get_override: dict | None = None,
+    ):
         self.slug_entries = slug_entries or []
         self.fail_inline = fail_inline
+        self.main_image = main_image  # set after the hero upload
+        self.get_override = get_override or {}
         self.created: list[dict] = []
         self.updates: list[tuple[str, dict]] = []
         self.hero_uploads: list[dict] = []
         self.inline_uploads: list[dict] = []
         self.get_calls: list[str] = []
         self.slug_searches: list[str] = []
+        self._doc_state: dict = {}
+
+    def _doc_view(self) -> dict:
+        view = {
+            "slug": self._doc_state.get("slug"),
+            "title": self._doc_state.get("title"),
+            "status": "draft",
+            "body": self._doc_state.get("body"),
+            "metaTitle": self._doc_state.get("metaTitle"),
+            "metaDescription": self._doc_state.get("metaDescription"),
+            "seoKeywords": self._doc_state.get("seoKeywords"),
+            "author": self._doc_state.get("author"),
+            "category": self._doc_state.get("category"),
+            "mainImage": self.main_image,
+        }
+        view.update(self.get_override)
+        return view
 
     async def find_blogs_by_slug(self, slug):
         self.slug_searches.append(slug)
@@ -75,63 +109,24 @@ class FakeStrapiProvider:
 
     async def create_draft_entry(self, payload):
         self.created.append(payload)
-        data = payload["data"]
-        return _Entry(
-            42,
-            "doc-42",
-            slug=data.get("slug"),
-            title=data.get("title"),
-            status="draft",
-            body=data.get("body"),
-            metaTitle=data.get("metaTitle"),
-            metaDescription=data.get("metaDescription"),
-            seoKeywords=data.get("seoKeywords"),
-            author=data.get("author"),
-            category=data.get("category"),
-            mainImage=None,
-        )
+        self._doc_state = dict(payload["data"])
+        return _Entry(42, "doc-42", **self._doc_view())
 
     async def update_draft_entry(self, document_id, payload):
         self.updates.append((document_id, payload))
-        data = payload.get("data") or {}
-        return _Entry(
-            42,
-            document_id,
-            slug="p7test-slug",
-            title="T",
-            status="draft",
-            body=data.get("body", "previous"),
-            metaTitle="mt",
-            metaDescription="md",
-            seoKeywords="kw",
-            author="doc-author-1",
-            category="doc-cat-1",
-            mainImage=BASE + "/uploads/hero.webp",
-        )
+        self._doc_state.update(payload.get("data") or {})
+        return _Entry(42, document_id, **self._doc_view())
 
     async def get_draft(self, document_id):
         self.get_calls.append(document_id)
-        last_body = self.updates[-1][1]["data"]["body"] if self.updates else BODY
-        return _Entry(
-            42,
-            document_id,
-            slug="p7test-slug",
-            title="Anxious Attachment No Contact: P7 Test Guide",
-            status="draft",
-            body=last_body,
-            metaTitle="mt",
-            metaDescription="md",
-            seoKeywords="anxious attachment no contact",
-            author="doc-author-1",
-            category="doc-cat-1",
-            mainImage=BASE + "/uploads/hero.webp",
-        )
+        return _Entry(42, document_id, **self._doc_view())
 
     async def upload_hero(self, file_bytes, filename, *, blog_numeric_id,
                           alt_text="", caption=""):
         self.hero_uploads.append(
             {"bytes": file_bytes, "filename": filename, "blog_numeric_id": blog_numeric_id, "alt": alt_text}
         )
+        self.main_image = BASE + "/uploads/hero.webp"
         return MediaUploadResult(
             media_id=101, url="/uploads/hero.webp",
             document_id="doc-media-101", alternative_text=alt_text or None,
@@ -372,8 +367,9 @@ async def test_h07_sync_unknown_internal_link_marker_fails(db, tmp_path):
     assert excinfo.value.error_code == ErrorCode.ARTICLE_VALIDATION_FAILED
     # the final body PUT never happened (failure at STEP D)
     assert provider.updates == []
-    # the draft + media were already checkpointed — documentId is kept
-    assert job.status == JobStatus.STRAPI_SYNCING.value
+    # M01: the draft + media were already checkpointed — the documentId
+    # is kept and the job lands in the UNIFIED strapi_sync_failed state
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
     row = db.scalars(select(StrapiSyncRow)).first()
     assert row.sync_status == StrapiSyncStatus.FAILED.value
     assert row.strapi_document_id == "doc-42"
@@ -393,10 +389,16 @@ async def test_slug_conflict_other_entry_blocks_sync(db, tmp_path):
     # no draft was created, no uploads
     assert provider.created == []
     assert provider.hero_uploads == []
-    # failure persisted with the job's error fields
+    # M01: the pre-HTTP failure is persisted in the UNIFIED state — a
+    # sync row with sync_status=failed + the job in strapi_sync_failed,
+    # so the UI shows it and the sync retry endpoint can pick it up.
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
     assert job.error_code == "STRAPI_SLUG_CONFLICT"
     assert "doc-other" in job.error_message
-    assert db.scalars(select(StrapiSyncRow)).first() is None
+    row = db.scalars(select(StrapiSyncRow)).first()
+    assert row is not None
+    assert row.sync_status == StrapiSyncStatus.FAILED.value
+    assert row.strapi_document_id is None  # nothing was created yet
 
 
 # ----------------------------------------------------------- mid-sync failure
@@ -409,7 +411,8 @@ async def test_mid_upload_failure_keeps_document_id(db, tmp_path):
         await run_strapi_sync(db, job, provider, settings=settings)
 
     assert excinfo.value.error_code == ErrorCode.STRAPI_UPLOAD_FAILED
-    assert job.status == JobStatus.STRAPI_SYNCING.value  # not created
+    # M01: unified persisted state — the job is strapi_sync_failed
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
     assert job.error_code == "STRAPI_UPLOAD_FAILED"
     row = db.scalars(select(StrapiSyncRow)).first()
     assert row.sync_status == StrapiSyncStatus.FAILED.value
@@ -442,7 +445,11 @@ async def test_retry_updates_existing_draft_without_new_create(db, tmp_path):
     db.commit()
 
     own_entry = _Entry(42, "doc-42", slug="p7test-slug", status="draft")
-    provider = FakeStrapiProvider(slug_entries=[own_entry])
+    # the hero was already uploaded on the previous attempt — the
+    # "server" already has it as the entry's mainImage
+    provider = FakeStrapiProvider(
+        slug_entries=[own_entry], main_image=BASE + "/uploads/hero.webp"
+    )
     settings = _settings(tmp_path)
 
     row = await run_strapi_sync(db, job, provider, settings=settings)
@@ -494,7 +501,12 @@ async def test_missing_author_fails_before_any_http(db, tmp_path):
     assert "author" in excinfo.value.message.lower()
     assert provider.call_count == 0  # ZERO Strapi HTTP calls
     assert job.error_code == "STRAPI_SCHEMA_MISMATCH"
-    assert job.status == JobStatus.STRAPI_SYNCING.value  # not created
+    # M01: the first-precheck failure is persisted in the UNIFIED state
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
+    row = db.scalars(select(StrapiSyncRow)).first()
+    assert row is not None
+    assert row.sync_status == StrapiSyncStatus.FAILED.value
+    assert row.strapi_document_id is None
 
 
 async def test_job_override_beats_default(db, tmp_path):
@@ -504,3 +516,154 @@ async def test_job_override_beats_default(db, tmp_path):
     await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
     assert provider.created[0]["data"]["author"] == "doc-job-author"
     assert provider.created[0]["data"]["category"] == "doc-cat-1"
+
+
+# ------------------------------------------------------------- M01: unified failed state
+def test_sync_failed_state_is_not_terminal():
+    """Section 64: strapi_sync_failed is PERSISTED but not pipeline-terminal
+    — a full/step retry must stay 409; only the sync retry path applies."""
+    from app.core.enums import JobStatus as JS
+
+    assert JS.STRAPI_SYNC_FAILED is not None
+    assert not JS.STRAPI_SYNC_FAILED.is_terminal
+    # while ready/failed/cancelled are terminal
+    assert JS.READY.is_terminal
+    assert JS.FAILED.is_terminal
+    assert JS.CANCELLED.is_terminal
+
+
+async def test_missing_local_file_fails_with_upload_error(db, tmp_path):
+    """M01: a local image path that no longer resolves (file vanished) is a
+    STRAPI_UPLOAD_FAILED — not an unhandled OSError — and lands in the
+    unified strapi_sync_failed state, keeping any documentId."""
+    job = _job(db)
+    # Point the hero at a path that does not exist on disk.
+    rows = _image_rows(db)
+    hero = next(r for r in rows if r.role == "hero")
+    hero.local_path = str(tmp_path / "does-not-exist-hero.webp")
+    db.commit()
+
+    provider = FakeStrapiProvider()
+    with pytest.raises(PipelineError) as excinfo:
+        await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+
+    assert excinfo.value.error_code == ErrorCode.STRAPI_UPLOAD_FAILED
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
+    assert job.error_code == "STRAPI_UPLOAD_FAILED"
+    row = db.scalars(select(StrapiSyncRow)).first()
+    assert row is not None
+    assert row.sync_status == StrapiSyncStatus.FAILED.value
+
+
+async def test_mid_failure_then_retry_updates_same_draft(db, tmp_path):
+    """M01: a mid-sync failure persists strapi_sync_failed + documentId;
+    the subsequent sync retry UPDATES the same draft (no second create)."""
+    job = _job(db)
+    # First attempt: fail on inline-2 upload.
+    provider1 = FakeStrapiProvider(fail_inline="inline-2.webp")
+    with pytest.raises(PipelineError):
+        await run_strapi_sync(db, job, provider1, settings=_settings(tmp_path))
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
+
+    # Second attempt (retry): everything succeeds. It must NOT create a
+    # second draft, and must reuse the stored documentId. The hero was
+    # uploaded on attempt 1, so the "server" already has its mainImage.
+    own_entry = _Entry(42, "doc-42", slug="p7test-slug", status="draft")
+    provider2 = FakeStrapiProvider(
+        slug_entries=[own_entry], main_image=BASE + "/uploads/hero.webp"
+    )
+    row = await run_strapi_sync(db, job, provider2, settings=_settings(tmp_path))
+
+    assert provider2.created == []  # NO second draft
+    assert row.strapi_document_id == "doc-42"
+    assert row.sync_status == StrapiSyncStatus.DRAFT_CREATED.value
+    assert job.status == JobStatus.STRAPI_DRAFT_CREATED.value
+
+
+# ------------------------------------------------------------- M02: normalized verify
+async def test_verify_rejects_wrong_title(db, tmp_path):
+    """M02: a GET verify that reads back a DIFFERENT title is a schema
+    mismatch (WRONG TITLE must be rejected), keeping the documentId."""
+    job = _job(db)
+    provider = FakeStrapiProvider(get_override={"title": "WRONG TITLE"})
+    with pytest.raises(PipelineError) as excinfo:
+        await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+    assert excinfo.value.error_code == ErrorCode.STRAPI_SCHEMA_MISMATCH
+    assert "title mismatch" in excinfo.value.message
+    row = db.scalars(select(StrapiSyncRow)).first()
+    assert row.sync_status == StrapiSyncStatus.FAILED.value
+    assert row.strapi_document_id == "doc-42"
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
+
+
+async def test_verify_rejects_published_status(db, tmp_path):
+    """M02: a GET verify that reads back status='published' is rejected —
+    this tool never publishes, so a published read-back is a mismatch."""
+    job = _job(db)
+    provider = FakeStrapiProvider(get_override={"status": "published"})
+    with pytest.raises(PipelineError) as excinfo:
+        await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+    assert excinfo.value.error_code == ErrorCode.STRAPI_SCHEMA_MISMATCH
+    assert "status" in excinfo.value.message
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
+
+
+async def test_verify_accepts_populated_relation_objects(db, tmp_path):
+    """M02/H03: relations come back as POPULATED objects (author/category)
+    and the media as an object — the normalized comparison still passes
+    when the documentId matches the expected relation."""
+    job = _job(db)
+    provider = FakeStrapiProvider(
+        get_override={
+            "author": {"id": 5, "documentId": "doc-author-1", "name": "Alice"},
+            "category": {"id": 9, "documentId": "doc-cat-1", "name": "Health"},
+            "mainImage": {
+                "id": 101,
+                "documentId": "doc-media-101",
+                "url": "/uploads/hero.webp",
+            },
+        }
+    )
+    row = await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+    assert row.sync_status == StrapiSyncStatus.DRAFT_CREATED.value
+    assert job.status == JobStatus.STRAPI_DRAFT_CREATED.value
+
+
+async def test_verify_rejects_wrong_relation_document_id(db, tmp_path):
+    """M02: a GET verify that resolves author to a DIFFERENT documentId is a
+    mismatch (relation values must match what we pushed)."""
+    job = _job(db)
+    provider = FakeStrapiProvider(
+        get_override={"author": "doc-someone-else"}
+    )
+    with pytest.raises(PipelineError) as excinfo:
+        await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+    assert excinfo.value.error_code == ErrorCode.STRAPI_SCHEMA_MISMATCH
+    assert "author mismatch" in excinfo.value.message
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
+
+
+async def test_verify_rejects_wrong_media(db, tmp_path):
+    """M02: a GET verify that reads back a DIFFERENT mainImage is a mismatch
+    (media id/url must match the uploaded hero)."""
+    job = _job(db)
+    provider = FakeStrapiProvider(
+        get_override={"mainImage": BASE + "/uploads/other-hero.webp"}
+    )
+    with pytest.raises(PipelineError) as excinfo:
+        await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+    assert excinfo.value.error_code == ErrorCode.STRAPI_SCHEMA_MISMATCH
+    assert "mainImage mismatch" in excinfo.value.message
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
+
+
+async def test_verify_accepts_absolute_url_main_image(db, tmp_path):
+    """M02/H03: mainImage comparison is PATH-based — a fully-absolute URL
+    with the same path still matches the stored relative upload path."""
+    job = _job(db)
+    provider = FakeStrapiProvider(
+        get_override={"mainImage": "https://cms.test/uploads/hero.webp"}
+    )
+    row = await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+    assert row.sync_status == StrapiSyncStatus.DRAFT_CREATED.value
+    assert job.status == JobStatus.STRAPI_DRAFT_CREATED.value

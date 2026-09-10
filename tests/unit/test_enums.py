@@ -21,15 +21,21 @@ SPEC_STATUS_VALUES = [
     "ready",
     "strapi_syncing",
     "strapi_draft_created",
+    # M01 (section 64; the canonical enum in section 8 predates it —
+    # documented in docs/AUDIT-FIX-PROGRESS.md B6): persisted Strapi
+    # sync failure. The pipeline itself succeeded (ready), so the
+    # state is NOT pipeline-terminal: full/step/resume retries stay
+    # 409, only the dedicated sync retry path applies.
+    "strapi_sync_failed",
     "failed",
     "cancelled",
 ]
 
 
-def test_job_status_has_exactly_20_spec_values():
+def test_job_status_has_exactly_21_spec_values():
     values = [s.value for s in JobStatus]
     assert values == SPEC_STATUS_VALUES
-    assert len(values) == 20
+    assert len(values) == 21
 
 
 def test_job_status_is_str_enum():
@@ -43,6 +49,10 @@ def test_terminal_states():
     assert JobStatus.CANCELLED.is_terminal
     assert not JobStatus.QUEUED.is_terminal
     assert not JobStatus.STRAPI_SYNCING.is_terminal
+    # M01: strapi_sync_failed is a PERSISTED sync failure — the
+    # pipeline already reached ready, so it is not terminal for the
+    # pipeline retry/cancel paths (they stay 409).
+    assert not JobStatus.STRAPI_SYNC_FAILED.is_terminal
 
 
 def test_image_roles():

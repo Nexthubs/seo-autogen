@@ -22,14 +22,24 @@ router = APIRouter(prefix="/api/strapi", tags=["strapi"])
 
 
 def _items(data: list[dict]) -> list[dict]:
+    """Flatten author/category list items to ``{document_id, label}``.
+
+    H03: Strapi 5 returns items FLAT (``id``/``documentId``/``name`` at
+    the top level) — no ``attributes`` wrapper. A legacy Strapi 4 wraps
+    the same fields under ``attributes``; tolerate both.
+    """
     out = []
     for entry in data:
-        attrs = entry.get("attributes") or {}
-        document_id = entry.get("documentId") or str(entry.get("id", ""))
+        flat = entry.get("attributes") if isinstance(entry.get("attributes"), dict) else entry
+        document_id = (
+            entry.get("documentId")
+            or flat.get("documentId")
+            or str(entry.get("id", ""))
+        )
         label = (
-            attrs.get("name")
-            or attrs.get("title")
-            or attrs.get("slug")
+            flat.get("name")
+            or flat.get("title")
+            or flat.get("slug")
             or document_id
         )
         out.append({"document_id": document_id, "label": label})

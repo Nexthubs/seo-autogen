@@ -246,6 +246,30 @@ def test_api_sync_strapi_draft_created_repush(client):
     assert client.enqueued_syncs == [job_id]
 
 
+def test_api_sync_strapi_sync_failed_retry_200(client):
+    """M01: a persisted strapi sync failure (section 64) is syncable —
+    the dedicated retry path enqueues an UPDATE of the same draft."""
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    _set_status(client, job_id, "strapi_sync_failed")
+    response = client.post(f"/api/jobs/{job_id}/sync-strapi")
+    assert response.status_code == 200
+    assert response.json()["enqueued"] is True
+    assert client.enqueued_syncs == [job_id]
+
+
+def test_api_retry_refuses_sync_failed(client):
+    """M01: strapi_sync_failed is NOT pipeline-terminal — the full/step
+    retry endpoint stays 409 (the article pipeline already succeeded;
+    only the dedicated sync retry applies). Cancel is still allowed:
+    the user may abandon a sync-failed job."""
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    _set_status(client, job_id, "strapi_sync_failed")
+    assert client.post(f"/api/jobs/{job_id}/retry").status_code == 409
+    response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+
+
 # ----------------------------------------------------------------------
 # REST: datasets / strapi / providers
 # ----------------------------------------------------------------------

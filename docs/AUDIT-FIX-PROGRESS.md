@@ -26,7 +26,7 @@
 | B3 | P3 | H04, M05 | ✅ 完成（见下） |
 | B4 | P4 / P5 | H09, H06, H07, H11, M08 | ✅ 完成（见下） |
 | B5 | P6 | H05, H10, M06, M07, L01 | ✅ 完成（见下） |
-| B6 | P7 | H03, M01, M02 | ⏳ 待办 |
+| B6 | P7 | H03, M01, M02 | ✅ 完成（见下） |
 | B7 | P8 / P9 + 文档 | M13, M14, M12, M10, M03, H12, L03 | ⏳ 待办 |
 
 > 决策记录：H11（不可变文章历史，属 P5/P9）原可放 B1 的 P1 范围，
@@ -98,13 +98,17 @@
 
 **B5 测试结果**：`486 passed, 1 skipped`（B4 后 478 + 净增 8：H05 路由门禁 ×4、H10 ×2、M06/M07 ×2；另有若干既有断言按新语义改写）。**新增依赖 `pillow>=10.0`**（WebP 转码/解码校验）；**无新迁移**。
 
-### B6 — P7（⏳）
+### B6 — P7 ✅
 
-| ID | 级别 | 问题摘要 | 计划 | 状态 |
-|---|---|---|---|---|
-| H03 | High | Strapi 5 扁平 data / 数组上传 / relation populate 契约不兼容 | 按 Strapi 5 REST 契约重写解析；schema 修正 relation/media；官方形状 mock | ⏳ |
-| M01 | Med | sync 失败后 job 停 `strapi_syncing`，UI 无错误区/重试入口 | 统一持久化失败状态（FAILED + sync_status，保留 documentId）；UI/API 可重试 | ⏳ |
-| M02 | Med | GET 验证只查非空，不核对字段值与 Draft 状态 | 逐字段规范化比对 + documentId/媒体/relations + Draft 语义 | ⏳ |
+| ID | 级别 | 问题摘要 | 修复内容 | 关键文件 | 测试证据 | 状态 |
+|---|---|---|---|---|---|---|
+| H03 | High | Strapi 5 扁平 data / 数组上传 / relation populate 契约不兼容 | **Strapi 5 REST 契约解析**（§35 兼容 v4 兜底）：① `_entry_from_item()` 扁平优先——`data` 直接取 `id/documentId/title/...`，无 `id/documentId` 报 `STRAPI_SCHEMA_MISMATCH`；嵌套 `data` dict 与 `attributes` 包裹（v4）均可兜底解析；② `_upload_result()` 接受 Strapi 5 的 `data` **数组**（取 `[0]`）与 v4 单对象（含 `data.data` 包裹）；③ `get_draft` 增加 `populate[author]=*&populate[category]=*&populate[mainImage]=*` 验证读取；④ schema 修正：`author/category` 放宽为 `str|int|dict|None`（documentId 短串 / 数字 id / populated 对象）、`main_image` 放宽 `str|dict|None`；新增 `relation_document_id()`（三种形态统一提取 documentId，`None` 保持 `None`=不比对）、`media_url()` / `media_id()` helper；⑤ `routes/strapi.py::_items` 扁平优先标签/键查找（v4 容忍） | `app/providers/cms/strapi_cms.py`、`app/schemas/strapi.py`、`app/routes/strapi.py` | `tests/unit/test_strapi_cms_provider.py` 整改：`_blog_item` 改扁平形状（populated relation 默认值），新增 `_blog_item_v4` 与 `_upload_response(v4=)`（默认数组）；新用例 ×4：v4 形状容忍（含 `populate%5Bauthor%5D` query 断言）、populated relation 解析、v4 单对象上传、数组缺 id → schema mismatch。`test_strapi_sync_step.py` 全 fake 改 Strapi 5 形状（`_doc_view` 扁平 + `get_override`），新用例 `test_verify_accepts_populated_relation_objects`（populated author/category dict 通过） | ✅ |
+| M01 | Med | sync 失败后 job 停 `strapi_syncing`，UI 无错误区/重试入口 | **统一持久化 `strapi_sync_failed` 状态**（§64）：① `JobStatus` 新增 `strapi_sync_failed`（**非** terminal——`is_terminal` 仍仅 ready/failed/cancelled，pipeline 级 retry/cancel 对同步失败 job 维持 409；§8 枚举无此值，以 §64 失败语义为准，决策已记录）；② `run_strapi_sync` 三条失败路径全部落统一状态——**pre-sync 前置检查失败**（`_fail_pre_sync`：无 row 时也创建 FAILED sync row，保留 `error_code/message`）、**中途失败**（`except PipelineError`：row 为 None 时先按 job_id 重查再创建，绝不双插——`UNIQUE(job_id)` 锚点）、**缺本地图片文件**（`_read_image_bytes` OSError → `STRAPI_UPLOAD_FAILED`）；失败时 job 置 `strapi_sync_failed` + `current_step` + error 字段 + `completed_at`，sync row 置 FAILED 并**保留 `strapi_document_id`**（§41 幂等重试锚）；③ 重试走 sync 专用通道：`_SYNCABLE_STATUSES` / `can_update` 纳入 `strapi_sync_failed`（UI Push/Update 按钮 + `POST /jobs/{id}/sync-strapi`），`ready` 进度列表 15/15 含该状态；④ 清理永不扫：`strapi_sync_failed` 不在 `AUTO_DELETABLE_STATUSES`/`TERMINAL_STATUSES`；⑤ UI：`job_fragment.html`/`jobs.html` 徽章 `badge-error`（`.badge-error` CSS 新增），Strapi 卡片 "Sync failed" 告警区展示 error 字段 | `app/core/enums.py`、`app/pipeline/steps/strapi_sync.py`、`app/routes/jobs.py`、`app/templates/job_fragment.html`、`app/templates/jobs.html`、`app/static/style.css` | `tests/unit/test_strapi_sync_step.py`：4 个既有失败断言改 `strapi_sync_failed`（slug-conflict 现断言 row 存在且 FAILED、`strapi_document_id is None`）；新用例 ×5：`test_sync_failed_state_is_not_terminal`、`test_missing_local_file_fails_with_upload_error`、`test_mid_failure_then_retry_updates_same_draft`（中途失败后重试更新同一 draft、零 create）、`test_verify_accepts_absolute_url_main_image`、重试测试 server 状态显式携带已有 mainImage。`test_p8_routes.py` 新 ×2：`strapi_sync_failed` 同步重试 200+enqueue、retry 409 但 cancel 200（用户可放弃）。`test_p9c_ops.py`：清理用例改用 `strapi_sync_failed` + 陈旧 `completed_at`（断言永不自动清扫）。`test_strapi_pipeline.py`（PG 集成）：中途失败断言改 `job.status == strapi_sync_failed` | ✅ |
+| M02 | Med | GET 验证只查非空，不核对字段值与 Draft 状态 | **STEP F 逐字段值校验**：GET verify 从"非空检查"升级为规范化值比对——`id`/`documentId` 与 row 持久化值一致、`status == "draft"`（`published` 等一律 fail 并明示实际状态）、`title == doc.title`、`slug == doc.slug`、`body == final_body`（渲染后终稿）、`metaTitle/metaDescription` 与 doc 字段一致、`seoKeywords == build_seo_keywords(...)`（与创建/更新写入同一规范化函数，12 个 / 500 字符上限）、author/category 经 `relation_document_id()` 与期望 documentId 比对（**仅当期望值非 None**）、mainImage 走 `_url_path()` **URL 路径**比对（本地持久化绝对 public URL vs Strapi 存储相对/绝对原始值），`hero.strapi_media_id` 存在时再核 `media_id()`。所有问题合并为单条 `PipelineError(STRAPI_SCHEMA_MISMATCH, "GET verify failed after sync: …")` | `app/pipeline/steps/strapi_sync.py` | `tests/unit/test_strapi_sync_step.py` 新用例 ×5：`test_verify_rejects_wrong_title`（错误 title → fail 且保留 docId）、`test_verify_rejects_published_status`、`test_verify_rejects_wrong_relation_document_id`（author 换成他人 documentId → fail）、`test_verify_rejects_wrong_media`（mainImage 指向别的图 → fail）、`test_verify_accepts_populated_relation_objects`（populated dict 形态不误报） | ✅ |
+
+**B6 测试结果**：`501 passed, 1 skipped`（B5 后 486 + 净增 15：provider ×4、sync step ×9、p8 routes ×2；另有多条既有断言按 Strapi 5 扁平/数组形状与 `strapi_sync_failed` 新语义改写）。**无新迁移**（无 schema 变更；`strapi_sync_failed` 是 status 枚举值，落 `generation_jobs.status` varchar）。
+
+> **决策记录（§8 vs §64）**：§8 规范状态枚举未列 `strapi_sync_failed`，§64 明确"Strapi 同步失败"为独立失败语义。取 **21 值枚举**（含 `strapi_sync_failed`），且该值**不是** terminal——文章 pipeline 已成功（§41 锚点 `strapi_document_id` 必须保留以供幂等重试），只有 sync 专用通道可重试；pipeline 级 retry/cancel 与自动清理均不触碰它。`test_enums.py` 断言 21 值 + 非 terminal，防止后续漂移。
 
 ### B7 — P8 / P9 + 文档（⏳）
 
@@ -120,6 +124,10 @@
 
 ## 变更日志
 
+- **2026-09-17 — B6 完成**：H03 / M01 / M02 全部修复并测试（`501 passed, 1 skipped`，净增 15 用例）。**无新迁移**。
+  - **H03**：`StrapiCMSProvider` 解析改 Strapi 5 REST 契约——entry 扁平 `data`（无 `attributes` 包裹，`id/documentId` 必填否则 `STRAPI_SCHEMA_MISMATCH`）、`/api/upload` 的 `data` **数组**取 `[0]`、`get_draft` 带 `populate[author]/* [category]/* [mainImage]/*`；v4 嵌套/单对象形状全部保留为兜底（§35）。schema 放宽 relation/media 为 `str|int|dict|None`，新增 `relation_document_id()/media_url()/media_id()` 统一 helper；`routes/strapi.py::_items` 扁平优先。
+  - **M01**：新增非 terminal 状态 `strapi_sync_failed`（§64）——pre-sync 前置检查 / 中途失败 / 缺本地图片文件三条路径全部落统一持久化状态（job + sync row FAILED，**保留 `strapi_document_id`** 幂等锚）；同步重试走 sync 专用通道（`_SYNCABLE_STATUSES`/UI Push-Update/`can_update`），pipeline retry/cancel 维持 409，自动清理永不扫；UI 红色 `badge-error` 徽章 + Strapi 卡片 "Sync failed" 告警区。§8 枚举缺此值 → 以 §64 为准取 21 值（决策已记录，`test_enums.py` 防漂移）。
+  - **M02**：STEP F GET verify 从非空检查升级为**逐字段值比对**——id/documentId/draft 状态/title/slug/终稿 body/metaTitle/metaDescription/`build_seo_keywords` 规范化 keywords/relations（`relation_document_id`，仅期望非 None 时比对）/mainImage（URL 路径比对 + `strapi_media_id` 存在时再核 media id），问题合并为单条 `STRAPI_SCHEMA_MISMATCH`。
 - **2026-09-17 — B5 完成**：H05 / H10 / M06 / M07 / L01 全部修复并测试（`486 passed, 1 skipped`，净增 8 用例）。**新增依赖 `pillow>=10.0`**；**无新迁移**。
   - **H05**：`ready` 状态归属改到 orchestrator——image step 不再提前 commit `ready`；`validate_article_done` 通过后**同事务**置 `ready` + `completed_at`（覆盖 fresh/retry/resume/no-rework backfill 全部路径）。`POST /jobs/{id}/sync-strapi` 加服务端状态门禁（非 syncable 状态 409），UI `can_push` 镜像同一门禁（failed 不再可推）。
   - **H10**：`OpenAIImageProvider._download()` 去掉 `Authorization` 头，Images API key 不再随响应 URL（第三方 CDN / 预签名）外泄。

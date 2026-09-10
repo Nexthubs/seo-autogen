@@ -12,7 +12,7 @@
         &middot; created {{ d.created_at }}
       </div>
     </div>
-    <span class="badge badge-{{ 'terminal' if st in ('ready','failed','cancelled') else 'running' if st not in ('queued','strapi_draft_created') else ('done' if st in ('ready','strapi_draft_created') else 'queued') }}">{{ st.replace('_', ' ') }}</span>
+    <span class="badge badge-{{ 'error' if st == 'strapi_sync_failed' else 'terminal' if st in ('ready','failed','cancelled') else 'running' if st not in ('queued','strapi_draft_created') else ('done' if st in ('ready','strapi_draft_created') else 'queued') }}">{{ st.replace('_', ' ') }}</span>
   </div>
 
   {% if d.error %}

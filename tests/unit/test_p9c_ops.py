@@ -166,9 +166,12 @@ def test_cleanup_skips_success_fresh_and_non_terminal(db, tmp_path):
         _job(session, keyword="ready-old", status="ready",
              completed_at=NOW - 40 * DAY)
         _job(session, keyword="failed-fresh", status="failed", completed_at=NOW)
-        # A Strapi-sync-failed job stays in non-terminal `strapi_syncing`
-        # with no completed_at (state machine untouched by P9-C).
-        _job(session, keyword="strapi-syncing", status="strapi_syncing")
+        # M01: a Strapi-sync-failed job (section 64) is in the unified
+        # persisted state — non-terminal, WITH a completed_at, and
+        # deliberately NOT in AUTO_DELETABLE_STATUSES: it holds the
+        # documentId anchor and must never be auto-swept.
+        _job(session, keyword="strapi-sync-failed",
+             status="strapi_sync_failed", completed_at=NOW - 40 * DAY)
         _job(session, keyword="no-completed-at", status="failed")
         session.commit()
 
@@ -178,8 +181,8 @@ def test_cleanup_skips_success_fresh_and_non_terminal(db, tmp_path):
             retention_days=30, apply=False,
         )
     # ready = success (never auto-deleted); fresh = not expired;
-    # strapi_sync_failed is NOT in AUTO_DELETABLE_STATUSES;
-    # no completed_at = retention window cannot be evaluated.
+    # strapi_sync_failed is NOT in AUTO_DELETABLE_STATUSES (even with a
+    # stale completed_at); no completed_at = window cannot be evaluated.
     assert summary.jobs == []
 
 

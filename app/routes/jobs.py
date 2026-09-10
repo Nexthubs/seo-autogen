@@ -80,7 +80,12 @@ def job_progress(job: GenerationJob) -> dict:
     status = job.status
     if status == "queued":
         return {"stage": 0, "total": _TOTAL_STAGES, "pct": 0, "label": "Queued"}
-    if status in ("ready", "strapi_syncing", "strapi_draft_created"):
+    if status in (
+        "ready",
+        "strapi_syncing",
+        "strapi_draft_created",
+        "strapi_sync_failed",  # M01: the pipeline succeeded — 15/15
+    ):
         return {"stage": _TOTAL_STAGES, "total": _TOTAL_STAGES, "pct": 100, "label": "Ready"}
     if status in ("failed", "cancelled"):
         return {
@@ -493,12 +498,14 @@ def api_job_reviews(job_id: str, session: Session = Depends(get_db)) -> dict:
 
 #: Job statuses the Strapi push gate admits (H05, spec section 63: only a
 #: DoD-gated article may be pushed to the CMS). ``strapi_syncing`` stays
-#: allowed as the mid-sync retry path (M01 will make a failed sync persist a
-#: terminal status instead).
+#: allowed as the mid-sync retry path; ``strapi_sync_failed`` (M01,
+#: section 64) is the PERSISTED failure state — its retry updates the
+#: same draft and must NOT go through the full pipeline retry.
 _SYNCABLE_STATUSES = {
     JobStatus.READY.value,
     JobStatus.STRAPI_DRAFT_CREATED.value,
     JobStatus.STRAPI_SYNCING.value,
+    JobStatus.STRAPI_SYNC_FAILED.value,
 }
 
 
@@ -673,8 +680,13 @@ def _strapi_payload(session: Session, job: GenerationJob, sync) -> dict:
         # H05: mirror the server-side push gate (a failed/cancelled job's
         # body failed the DoD gate and must not be offered for push).
         "can_push": job.status in _SYNCABLE_STATUSES,
+        # M01: a FAILED sync that kept its documentId is retried by
+        # UPDATING the same draft (section 41) — "Update" is offered
+        # then too, not only from a successful draft_created state.
         "can_update": bool(
-            sync and sync.sync_status == "draft_created" and sync.strapi_document_id
+            sync
+            and sync.sync_status in ("draft_created", "failed")
+            and sync.strapi_document_id
         ),
         "admin_url": (
             settings.strapi_admin_panel_url

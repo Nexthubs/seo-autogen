@@ -81,7 +81,32 @@ def provider(fake):
     )
 
 
-def _blog_item(item_id=7, doc_id="doc-abc", **attributes):
+def _blog_item(item_id=7, doc_id="doc-abc", **fields):
+    """A Strapi 5 (V1 target) Blog item — FLAT (H03).
+
+    Strapi 5 returns ``{"id", "documentId", "title", ...}`` directly:
+    there is NO ``attributes`` wrapper (that was Strapi 4).
+    """
+    data = {
+        "id": item_id,
+        "documentId": doc_id,
+        "title": "T",
+        "slug": "slug",
+        "status": "draft",
+        "body": "b",
+        "metaTitle": "mt",
+        "metaDescription": "md",
+        "seoKeywords": "kw",
+        "author": "doc-author-1",
+        "category": "doc-cat-1",
+        "mainImage": "https://cms/uploads/hero.webp",
+    }
+    data.update(fields)
+    return data
+
+
+def _blog_item_v4(item_id=7, doc_id="doc-abc", **attributes):
+    """A legacy Strapi 4 Blog item — wrapped in ``attributes``."""
     attrs = {
         "title": "T",
         "slug": "slug",
@@ -204,20 +229,20 @@ async def test_create_draft_failure_raises_code(fake, provider):
 
 
 # -------------------------------------------------------------------- uploads
-def _upload_response(url="/uploads/hero.webp"):
-    return httpx.Response(
-        201,
-        json={
-            "data": {
-                "data": {
-                    "id": 11,
-                    "documentId": "doc-media-11",
-                    "url": url,
-                    "alternativeText": "alt",
-                }
-            }
-        },
-    )
+def _upload_response(url="/uploads/hero.webp", v4=False):
+    """``POST /api/upload`` response (H03).
+
+    Strapi 5 returns ``data`` as an ARRAY of uploaded files; the
+    legacy Strapi 4 shape returns a single object — both are accepted.
+    """
+    file_item = {
+        "id": 11,
+        "documentId": "doc-media-11",
+        "url": url,
+        "alternativeText": "alt",
+    }
+    data = file_item if v4 else [file_item]
+    return httpx.Response(201, json={"data": data})
 
 
 def _multipart_fields(request: httpx.Request) -> dict:
@@ -329,9 +354,74 @@ async def test_404_is_not_retryable(fake, provider):
 
 
 async def test_schema_mismatch_on_bad_blog_response(fake, provider):
+    # H03: flat item without id/documentId is a schema mismatch.
     fake.routes[("POST", "/api/blogs")] = httpx.Response(
-        201, json={"data": {"attributes": {"title": "no ids"}}}
+        201, json={"data": {"title": "no ids"}}
     )
     with pytest.raises(PipelineError) as excinfo:
         await provider.create_draft_entry({"data": {}})
+    assert excinfo.value.error_code == ErrorCode.STRAPI_SCHEMA_MISMATCH
+
+
+# ------------------------------------------------------------------ H03 shape
+async def test_get_draft_tolerates_legacy_v4_shape(fake, provider):
+    """A Strapi 4 server (spec 35: repaired here only) still parses."""
+    fake.routes[("GET", "/api/blogs/doc-7")] = httpx.Response(
+        200, json={"data": _blog_item_v4(doc_id="doc-7", title="Legacy")}
+    )
+    entry = await provider.get_draft("doc-7")
+    assert entry.title == "Legacy"
+    assert entry.main_image == "https://cms/uploads/hero.webp"
+    # and the request still populated the relation fields (M02)
+    assert "populate%5Bauthor%5D" in q(
+        fake.calls("GET", "/api/blogs/doc-7")[0]
+    )
+
+
+async def test_get_draft_parses_populated_relations(fake, provider):
+    """H03/M02: relations come back as populated objects when the
+    request used a ``populate`` query — the schema accepts them."""
+    fake.routes[("GET", "/api/blogs/doc-7")] = httpx.Response(
+        200,
+        json={
+            "data": _blog_item(
+                doc_id="doc-7",
+                author={
+                    "id": 5,
+                    "documentId": "doc-author-1",
+                    "name": "Alice",
+                },
+                category={"id": 9, "documentId": "doc-cat-1", "name": "Health"},
+                mainImage={
+                    "id": 11,
+                    "documentId": "doc-media-11",
+                    "url": "/uploads/hero.webp",
+                },
+            )
+        },
+    )
+    entry = await provider.get_draft("doc-7")
+    assert entry.author == {
+        "id": 5,
+        "documentId": "doc-author-1",
+        "name": "Alice",
+    }
+    assert entry.category["documentId"] == "doc-cat-1"
+    assert entry.main_image["url"] == "/uploads/hero.webp"
+
+
+async def test_upload_accepts_v4_single_object_response(fake, provider):
+    """H03: the legacy v4 single-object upload response still works."""
+    fake.routes[("POST", "/api/upload")] = _upload_response(v4=True)
+    result = await provider.upload_inline(b"img", "inline-1.webp")
+    assert result.media_id == 11
+    assert result.url == "/uploads/hero.webp"
+
+
+async def test_upload_array_missing_ids_is_schema_mismatch(fake, provider):
+    fake.routes[("POST", "/api/upload")] = httpx.Response(
+        201, json={"data": [{"url": "/uploads/x.webp"}]}
+    )
+    with pytest.raises(PipelineError) as excinfo:
+        await provider.upload_inline(b"img", "inline-1.webp")
     assert excinfo.value.error_code == ErrorCode.STRAPI_SCHEMA_MISMATCH
