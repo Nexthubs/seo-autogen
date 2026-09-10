@@ -26,6 +26,7 @@ from app.db.models.serp import SerpResult, SerpRun
 from app.db.models.source import JobSource, SourcePage
 from app.providers.extractor.base import ContentExtractor
 from app.schemas.sources import ExtractedPage
+from app.services.cost_ledger import record_cache_hit, record_provider_cost
 from app.services.source_cache import SourceCache, page_from_row
 from app.services.url_normalizer import content_hash, normalize_url
 
@@ -122,6 +123,9 @@ async def run_source_extract(
     seen_urls: set[str] = set()
     seen_content: set[str] = set()
     pages: list[ExtractedPage] = []
+    # R-H04: keep the last extractor failure so ``SOURCE_EMPTY`` can carry a
+    # redacted diagnostic raw instead of dropping the provider detail.
+    last_extract_error: PipelineError | None = None
 
     for result in organic:
         if len(pages) == max_sources:
@@ -140,6 +144,15 @@ async def run_source_extract(
         row = None if force_refresh else cache.find_fresh(session, url)
         if row is not None:
             page = page_from_row(row)
+            # R-M02: a cache hit is a real (zero-cost) event — record it so
+            # the ledger shows that no new paid call was made for this URL.
+            record_cache_hit(
+                session,
+                job_id=job.id,
+                provider=page.extractor or "extractor",
+                step="source_extract",
+                detail=norm,
+            )
             logger.info(
                 "source_cache_hit",
                 extra={
@@ -153,7 +166,10 @@ async def run_source_extract(
                 results = await extractor.extract([url])
             except PipelineError as exc:
                 # Per-URL failure: skip and let the next organic result
-                # backfill the slot (section 14.1).
+                # backfill the slot (section 14.1). Retain the last failure
+                # so an all-sources-failed SOURCE_EMPTY can still expose the
+                # provider's (redacted) raw payload for debugging (R-H04).
+                last_extract_error = exc
                 logger.warning(
                     "source_extract_failed",
                     extra={
@@ -180,6 +196,18 @@ async def run_source_extract(
                 )
                 continue
             row = cache.upsert(session, page, url)
+            # R-M02: every FRESH extraction is a paid call — append it to the
+            # cost ledger, which survives a checkpoint reset (unlike the
+            # shared ``source_pages`` row, whose provider_cost is overwritten
+            # by the next fresh extraction).
+            record_provider_cost(
+                session,
+                job_id=job.id,
+                provider=page.extractor or "extractor",
+                step="source_extract",
+                amount=page.provider_cost,
+                detail=norm,
+            )
             # Record the fresh extraction's cost on the cache row (spec
             # section 54). M12: ``source_pages`` is a TTL cache SHARED across
             # jobs, so ``provider_cost`` is the cost of the LAST *fresh*
@@ -213,6 +241,7 @@ async def run_source_extract(
         raise PipelineError(
             ErrorCode.SOURCE_EMPTY,
             "no competitor sources could be extracted",
+            raw=last_extract_error.raw if last_extract_error is not None else None,
         )
 
     job.status = JobStatus.SERP_ANALYZING.value

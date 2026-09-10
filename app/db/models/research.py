@@ -106,6 +106,14 @@ class EvidenceNoteRow(Base):
     usage: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # R-H06: outcome of the support check against the fetched source body
+    # (supported / unsupported / contradicted / unverified) plus the
+    # corroborating or contradicting excerpt that justified it.
+    verification_status: Mapped[str | None] = mapped_column(
+        VARCHAR(16), nullable=True
+    )
+    supporting_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = created_at_column()
 
     def __repr__(self) -> str:  # pragma: no cover

@@ -39,6 +39,7 @@ from app.pipeline.steps._article_common import latest_article_version
 from app.providers.image.base import ImageProvider
 from app.schemas.images import ImageGenerationRequest
 from app.services.article_renderer import export_article
+from app.services.cost_ledger import record_provider_cost, record_reuse
 from app.services.final_body import render_final_body
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,15 @@ async def run_image_generation(
         if existing is not None:
             row.local_path, row.mime_type = existing
             reused.append(row.filename)
+            # R-M02: reuse is a real (zero-cost) event — the paid generation
+            # is NOT repeated, and the ledger records that explicitly.
+            record_reuse(
+                session,
+                job_id=job.id,
+                provider=row.provider or "image",
+                step="image_generate",
+                detail=row.filename,
+            )
             session.commit()
             continue
         request = ImageGenerationRequest(
@@ -144,6 +154,17 @@ async def run_image_generation(
         # A cost the provider did not report (None) stays None (absent), not
         # a fabricated 0.
         row.provider_cost = image.provider_cost
+        # R-M02: append the paid generation to the cost ledger. The row's
+        # ``provider_cost`` is the CURRENT cost and is overwritten by a
+        # regeneration; the ledger keeps every generation's cost.
+        record_provider_cost(
+            session,
+            job_id=job.id,
+            provider=image.provider or "image",
+            step="image_generate",
+            amount=image.provider_cost,
+            detail=row.filename,
+        )
         session.commit()
 
     if reused:

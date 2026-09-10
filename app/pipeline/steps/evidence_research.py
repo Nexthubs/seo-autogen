@@ -24,6 +24,7 @@ from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.providers.extractor.base import ContentExtractor
 from app.providers.llm.base import LLMProvider
 from app.schemas.research import EvidenceNote
+from app.services.cost_ledger import record_provider_cost
 from app.services.evidence_verification import verify_evidence_sources
 from app.services.prompt_service import PromptSpec, load_prompt
 from pydantic import BaseModel
@@ -95,11 +96,30 @@ async def run_evidence_research(
             "evidence research returned no notes",
         )
 
-    # H09: an LLM self-report is not proof a source exists. Verify each note's
-    # source URL through the independent extractor; unverifiable notes are
-    # downgraded to ``avoid``/``low`` so the writer cannot lean on them.
-    notes = await verify_evidence_sources(output.notes, verifier)
-    downgraded = sum(1 for n in notes if n.usage == "avoid")
+    # H09/R-H06: an LLM self-report is not proof a source exists. Verify each
+    # note's source URL through the independent extractor AND compare the
+    # fetched body against the proposed title/claim/numbers; notes the source
+    # does not support are downgraded (soften/avoid) so the writer cannot lean
+    # on them, and the corroborating/contradicting excerpt is saved.
+    #
+    # R-M02: that fetch is itself a paid extractor call the per-artifact cost
+    # columns never saw — append it to the independent cost ledger.
+    def _record_extraction(page) -> None:
+        record_provider_cost(
+            session,
+            job_id=job.id,
+            provider=page.extractor or "extractor",
+            step="evidence_research",
+            amount=page.provider_cost,
+            detail=page.normalized_url or page.url,
+        )
+
+    notes = await verify_evidence_sources(
+        output.notes, verifier, on_extraction=_record_extraction
+    )
+    downgraded = sum(
+        1 for n in notes if (n.verification_status or "supported") != "supported"
+    )
 
     # One set per job: re-runs replace the previous notes.
     for row in session.scalars(
@@ -118,6 +138,8 @@ async def run_evidence_research(
                 confidence=note.confidence,
                 usage=note.usage,
                 note=note.note,
+                verification_status=note.verification_status,
+                supporting_excerpt=note.supporting_excerpt,
             )
         )
 

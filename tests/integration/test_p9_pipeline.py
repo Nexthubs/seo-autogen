@@ -37,7 +37,7 @@ from sqlalchemy import delete as sa_delete, func, select
 
 from app.core.config import Settings
 from app.core.enums import JobStatus
-from app.core.exceptions import PipelineError
+from app.core.exceptions import ErrorCode, PipelineError
 from app.db.models.article import ArticleReviewRow, ArticleVersionRow
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
@@ -951,6 +951,24 @@ async def test_known_keyword_full_run_reaches_ready(job, tmp_path):
         assert src["sources"], "sources.json should list job sources"
         brief = _json.loads((job_dir / "content-brief.json").read_text())
         assert brief, "content-brief.json should not be empty"
+
+        # R-M03: the revision records the exact review attempts it consumed,
+        # so it stays traceable after a later review retry appends attempts.
+        with SessionLocal() as session:
+            revision = session.scalars(
+                select(ArticleVersionRow)
+                .where(
+                    ArticleVersionRow.job_id == job,
+                    ArticleVersionRow.stage == "revision",
+                )
+                .order_by(ArticleVersionRow.version.desc())
+            ).first()
+            assert revision is not None
+            lineage = revision.based_on_reviews or {}
+            assert {"seo", "fact", "style"} <= set(lineage)
+            for entry in lineage.values():
+                assert entry["review_id"]
+                assert entry["attempt"] >= 1
     finally:
         with SessionLocal() as session:
             session.execute(
@@ -960,3 +978,212 @@ async def test_known_keyword_full_run_reaches_ready(job, tmp_path):
                 sa_delete(KeywordCluster).where(KeywordCluster.id == cluster_id)
             )
             session.commit()
+
+
+# ---------------------------------------------------------------------------
+# R-H04 regression: a provider business failure carrying a STRUCTURED raw
+# payload must land as a FAILED job with the original error code and a
+# redacted string raw — not crash the orchestrator's except branch (which
+# used to call the string-only redact() with a dict -> TypeError before the
+# commit, leaving the job in its previous status with empty error fields).
+# ---------------------------------------------------------------------------
+class _RaisingSERP(SERPProvider):
+    """Raises one prepared (real-parser) error instead of searching."""
+
+    def __init__(self, error: PipelineError):
+        self._error = error
+
+    async def search(self, request: SERPRequest) -> SERPResponse:  # pragma: no cover
+        raise self._error
+
+    async def health_check(self) -> bool:
+        return True
+
+
+class _RaisingExtractor(ContentExtractor):
+    def __init__(self, error: PipelineError):
+        self._error = error
+
+    async def extract(self, urls: list[str]) -> list[ExtractedPage]:  # pragma: no cover
+        raise self._error
+
+    async def health_check(self) -> bool:
+        return True
+
+
+def _dataforseo_settings() -> Settings:
+    return Settings(
+        dataforseo_base_url="https://api.dataforseo.test",
+        dataforseo_login="user",
+        dataforseo_password="pw",
+        _env_file=None,
+    )
+
+
+async def _assert_failed_with_raw(job, tmp_path, providers, expected_code):
+    with SessionLocal() as session:
+        job_row = session.get(GenerationJob, job)
+        with pytest.raises(PipelineError):
+            await _full_run(session, job_row, providers, _settings(tmp_path))
+        session.rollback()
+
+    with SessionLocal() as session:
+        fresh = session.get(GenerationJob, job)
+        assert fresh.status == JobStatus.FAILED.value
+        assert fresh.error_code == expected_code
+        assert fresh.error_raw is not None
+        assert isinstance(fresh.error_raw, str)
+        # a structured raw payload must be persisted as valid JSON text
+        json.loads(fresh.error_raw)
+        return fresh
+
+
+async def test_r_h04_dataforseo_business_auth_failure_persists_raw(job, tmp_path):
+    """Real DataForSEO parser error (dict raw) through the failure branch."""
+    from app.providers.serp.dataforseo import DataForSEOSERPProvider
+
+    provider = DataForSEOSERPProvider(settings=_dataforseo_settings())
+    envelope = {
+        "status_code": 40101,
+        "status_message": "authorization failed",
+        "api_key": "sk-live-leak",
+        "tasks": [
+            {
+                "status_code": 40101,
+                "status_message": "Invalid credentials",
+                "result": None,
+            }
+        ],
+    }
+    with pytest.raises(PipelineError) as captured:
+        provider.parse(envelope)
+    real_error = captured.value
+
+    providers, _, _, _, _, _ = _providers(tmp_path, _payloads())
+    providers.serp = _RaisingSERP(real_error)
+
+    fresh = await _assert_failed_with_raw(
+        job, tmp_path, providers, "DATAFORSEO_REQUEST_FAILED"
+    )
+    assert "sk-live-leak" not in fresh.error_raw
+    assert "40101" in fresh.error_raw
+
+
+async def test_r_h04_dataforseo_empty_serp_persists_raw(job, tmp_path):
+    """Real DataForSEO ``search`` raising ``DATAFORSEO_EMPTY_SERP`` (dict raw).
+
+    ``parse()`` returns an empty organic list without raising; ``search()``
+    is the layer that raises ``DATAFORSEO_EMPTY_SERP`` and attaches the full
+    (dict) response envelope as ``raw``. Drive the real provider through
+    httpx.MockTransport so the regression exercises the production code path.
+    """
+    import httpx as _httpx
+
+    from app.providers.serp.dataforseo import DataForSEOSERPProvider
+    from app.schemas.serp import SERPRequest
+
+    envelope = {
+        "status_code": 20000,
+        "tasks": [
+            {
+                "status_code": 20000,
+                "status_message": "Ok.",
+                "result": [{"items": []}],
+            }
+        ],
+    }
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        return _httpx.Response(200, json=envelope)
+
+    dfs_settings = _dataforseo_settings()
+    provider = DataForSEOSERPProvider(
+        settings=dfs_settings,
+        client=_httpx.AsyncClient(
+            base_url=dfs_settings.dataforseo_base_url,
+            transport=_httpx.MockTransport(handler),
+            auth=(dfs_settings.dataforseo_login, dfs_settings.dataforseo_password),
+        ),
+        backoff_seconds=FAST_BACKOFF,
+    )
+    with pytest.raises(PipelineError) as captured:
+        await provider.search(
+            SERPRequest(
+                keyword=KEYWORD,
+                location_code=2840,
+                language_code="en",
+                device="desktop",
+                depth=10,
+            )
+        )
+    assert captured.value.error_code.value == "DATAFORSEO_EMPTY_SERP"
+    await provider.aclose()
+
+    providers, _, _, _, _, _ = _providers(tmp_path, _payloads())
+    providers.serp = _RaisingSERP(captured.value)
+
+    fresh = await _assert_failed_with_raw(
+        job, tmp_path, providers, "DATAFORSEO_EMPTY_SERP"
+    )
+    assert "20000" in fresh.error_raw
+
+
+async def test_r_h04_exa_empty_content_persists_raw(job, tmp_path):
+    """Real Exa extractor ``SOURCE_EMPTY`` (dict raw) through the branch."""
+    import httpx as _httpx
+
+    from app.providers.extractor.exa import ExaContentExtractor
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        return _httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"url": ORGANIC_URLS[0], "title": "t", "text": ""},
+                ]
+            },
+        )
+
+    exa_settings = Settings(
+        exa_base_url="https://api.exa.test",
+        exa_api_key="test-key",
+        source_max_chars=50000,
+        _env_file=None,
+    )
+    extractor = ExaContentExtractor(
+        settings=exa_settings,
+        client=_httpx.AsyncClient(
+            base_url=exa_settings.exa_base_url,
+            transport=_httpx.MockTransport(handler),
+            headers={"x-api-key": exa_settings.exa_api_key},
+        ),
+        backoff_seconds=FAST_BACKOFF,
+    )
+    with pytest.raises(PipelineError) as captured:
+        await extractor.extract([ORGANIC_URLS[0]])
+    assert captured.value.error_code.value == "SOURCE_EMPTY"
+    await extractor.aclose()
+
+    providers, _, _, _, _, _ = _providers(tmp_path, _payloads())
+    providers.extractor = _RaisingExtractor(captured.value)
+
+    fresh = await _assert_failed_with_raw(job, tmp_path, providers, "SOURCE_EMPTY")
+    json.loads(fresh.error_raw)
+
+
+async def test_r_h04_legacy_dict_raw_never_crashes_failure_branch(job, tmp_path):
+    """Defense in depth: even a raw dict forced onto the exception (simulating
+    a provider that bypasses the constructor contract) is handled."""
+    error = PipelineError(ErrorCode.EXTRACTOR_FAILED, "legacy provider bug")
+    # Bypass __post_init__ the way the old code effectively did.
+    error.raw = {"api_token": "sk-legacy", "detail": {"password": "pw"}}  # type: ignore[assignment]
+
+    providers, _, _, _, _, _ = _providers(tmp_path, _payloads())
+    providers.serp = _RaisingSERP(error)
+
+    fresh = await _assert_failed_with_raw(
+        job, tmp_path, providers, "EXTRACTOR_FAILED"
+    )
+    assert "sk-legacy" not in fresh.error_raw
+    assert "pw" not in fresh.error_raw
+

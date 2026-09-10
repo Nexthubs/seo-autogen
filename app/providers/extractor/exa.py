@@ -228,6 +228,8 @@ class ExaContentExtractor(ContentExtractor):
             raise PipelineError(
                 ErrorCode.SOURCE_EMPTY,
                 "Exa returned no usable content for any url",
+                # R-H04: structured payload allowed here; PipelineError
+                # normalizes it into one redacted JSON string.
                 raw=data,
             )
         return pages

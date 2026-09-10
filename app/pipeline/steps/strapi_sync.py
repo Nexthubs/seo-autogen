@@ -21,15 +21,17 @@ KEEPING ``strapi_document_id`` so the retry updates the same draft.
 """
 
 import logging
+import traceback
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.enums import JobStatus, StrapiSyncStatus
 from app.core.exceptions import ErrorCode, PipelineError
-from app.core.redaction import redact
+from app.core.redaction import redact, redact_raw
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
 from app.db.models.strapi_syncs import StrapiSyncRow
@@ -214,15 +216,45 @@ async def run_strapi_sync(
             ),
         )
         if row is None or existing_doc_id is None:
+            # R-H03: distinguish "no row at all" from "row exists but the
+            # documentId is still empty" (e.g. a previous attempt failed the
+            # author/category pre-check or an HTTP create). The old code
+            # inserted a SECOND row for the same job_id in the second case,
+            # violating UNIQUE(strapi_syncs.job_id) after the remote draft had
+            # already been created. The new draft id is written back onto the
+            # EXISTING row so the idempotency anchor (section 41) is preserved.
             entry = await provider.create_draft_entry(payload)
-            row = StrapiSyncRow(
-                job_id=job.id,
-                strapi_id=entry.id,
-                strapi_document_id=entry.document_id,
-                sync_status=StrapiSyncStatus.IN_PROGRESS.value,
-            )
-            session.add(row)
-            session.flush()
+            if row is None:
+                row = StrapiSyncRow(
+                    job_id=job.id,
+                    strapi_id=entry.id,
+                    strapi_document_id=entry.document_id,
+                    sync_status=StrapiSyncStatus.IN_PROGRESS.value,
+                )
+                session.add(row)
+                try:
+                    session.flush()
+                except IntegrityError:
+                    # A row for this job appeared underneath us. Never keep
+                    # using a failed transaction (R-H03): roll back the
+                    # INSERT, re-read the anchor and reuse it.
+                    session.rollback()
+                    job.status = JobStatus.STRAPI_SYNCING.value
+                    job.current_step = "strapi_sync"
+                    row = session.scalars(
+                        select(StrapiSyncRow).where(
+                            StrapiSyncRow.job_id == job.id
+                        )
+                    ).first()
+                    if row is None:  # pragma: no cover - defensive
+                        raise
+                    row.strapi_id = entry.id
+                    row.strapi_document_id = entry.document_id
+                    row.sync_status = StrapiSyncStatus.IN_PROGRESS.value
+            else:
+                row.strapi_id = entry.id
+                row.strapi_document_id = entry.document_id
+                row.sync_status = StrapiSyncStatus.IN_PROGRESS.value
         else:
             entry = await provider.update_draft_entry(
                 existing_doc_id, payload
@@ -419,52 +451,104 @@ async def run_strapi_sync(
     except PipelineError as error:
         # Section 64 + M01: a mid-sync failure keeps the documentId so
         # the retry UPDATES the same draft. The persisted state is
-        # UNIFIED regardless of where it failed:
-        #   * the sync row is always failed (+ error message);
-        #   * the job is always ``strapi_sync_failed`` (the pipeline
-        #     itself succeeded — retrying the full pipeline must stay
-        #     409, only the sync is retried).
-        # ``_fail_pre_sync`` may already have created + committed a row
-        # while the LOCAL ``row`` here is still None (the idempotency
-        # anchor select never ran) — re-query before inserting so we
-        # never double-create (UNIQUE on job_id).
-        if row is None:
-            row = session.scalars(
-                select(StrapiSyncRow).where(StrapiSyncRow.job_id == job.id)
-            ).first()
-            if row is None:
-                # First-precheck failure (author/category missing, no
-                # final article): no row existed yet — still persist
-                # one so the failure is visible AND retryable (M01).
-                row = StrapiSyncRow(
-                    job_id=job.id,
-                    strapi_id=None,
-                    strapi_document_id=None,
-                    sync_status=StrapiSyncStatus.FAILED.value,
-                )
-                session.add(row)
-        row.sync_status = StrapiSyncStatus.FAILED.value
-        # M10: sanitize before persisting (spec 60) — see the
-        # first-precheck failure path above.
-        row.error_message = redact(str(error))
-        job.status = JobStatus.STRAPI_SYNC_FAILED.value
-        job.current_step = "strapi_sync"
-        job.error_code = error.error_code.value
-        job.error_message = redact(error.message)
-        job.completed_at = job.completed_at or datetime.now(timezone.utc)
-        session.commit()
-        logger.warning(
-            "strapi_sync_failed",
-            extra={
-                "event": "strapi_sync_failed",
-                "job_id": str(job.id),
-                "error_code": error.error_code.value,
-                "strapi_document_id": (
-                    row.strapi_document_id if row is not None else None
-                ),
-            },
+        # UNIFIED regardless of where it failed.
+        _persist_sync_failure(
+            session,
+            job,
+            row,
+            error_code=error.error_code.value,
+            message=error.message,
+            raw=error.raw,
+            log_event="strapi_sync_failed",
         )
         raise
+    except Exception as error:  # noqa: BLE001 — R-H02 unified failure branch
+        # R-H02: a NON-PipelineError (e.g. an unexpected provider payload
+        # shape) used to escape this step entirely. The worker only logged a
+        # crash, the sync row stayed ``in_progress`` and the job stayed
+        # ``strapi_syncing`` — a stranded state the UI could neither explain
+        # nor retry. Persist the same unified failure state as a stable code.
+        logger.exception(
+            "strapi_sync_crash",
+            extra={"event": "strapi_sync_crash", "job_id": str(job.id)},
+        )
+        # Never keep using a transaction that may have failed (R-H03): a DB
+        # error inside the step would otherwise make the failure write itself
+        # fail. Every earlier checkpoint was committed, so dropping the
+        # uncommitted tail is safe.
+        try:
+            session.rollback()
+        except Exception:  # pragma: no cover - rollback must not mask cause
+            logger.warning(
+                "strapi_sync_rollback_failed",
+                extra={"event": "strapi_sync_rollback_failed"},
+            )
+        _persist_sync_failure(
+            session,
+            job,
+            row,
+            error_code="UNEXPECTED",
+            message=f"{error.__class__.__name__}: {error}",
+            raw="".join(
+                traceback.format_exception(
+                    type(error), error, error.__traceback__
+                )
+            ),
+            log_event="strapi_sync_failed",
+        )
+        raise
+
+
+def _persist_sync_failure(
+    session: Session,
+    job: GenerationJob,
+    row: StrapiSyncRow | None,
+    *,
+    error_code: str,
+    message: str,
+    raw: str | None = None,
+    log_event: str,
+) -> None:
+    """Persist the unified Strapi-sync failure state (M01, R-H02).
+
+    * the ``strapi_syncs`` row is FAILED and KEEPS ``strapi_document_id``
+      (the section-41 retry anchor); a row is created when none exists yet;
+    * the job moves to ``strapi_sync_failed`` with the stable error code;
+    * secrets are redacted before persisting (spec 60).
+    """
+    if row is None:
+        row = session.scalars(
+            select(StrapiSyncRow).where(StrapiSyncRow.job_id == job.id)
+        ).first()
+    if row is None:
+        # First-precheck failure (author/category missing, no final article):
+        # no row existed yet — still persist one so the failure is visible AND
+        # retryable (M01).
+        row = StrapiSyncRow(
+            job_id=job.id,
+            strapi_id=None,
+            strapi_document_id=None,
+            sync_status=StrapiSyncStatus.FAILED.value,
+        )
+        session.add(row)
+    row.sync_status = StrapiSyncStatus.FAILED.value
+    row.error_message = redact(message)
+    job.status = JobStatus.STRAPI_SYNC_FAILED.value
+    job.current_step = "strapi_sync"
+    job.error_code = error_code
+    job.error_message = redact(message)
+    job.error_raw = redact_raw(raw)
+    job.completed_at = job.completed_at or datetime.now(timezone.utc)
+    session.commit()
+    logger.warning(
+        log_event,
+        extra={
+            "event": log_event,
+            "job_id": str(job.id),
+            "error_code": error_code,
+            "strapi_document_id": row.strapi_document_id,
+        },
+    )
 
 
 def _url_path(url: str) -> str:

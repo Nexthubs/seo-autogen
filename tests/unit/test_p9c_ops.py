@@ -34,6 +34,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import models  # noqa: F401 - register all models on Base
 from app.db.base import Base
+from app.db.models.cost import ProviderCostEventRow
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
 from app.db.models.llm_usage import LLMUsageRow
@@ -229,6 +230,16 @@ def test_cleanup_apply_deletes_full_chain_keeps_shared_pages(db, tmp_path):
         _full_job_chain(session, old)
         page = _shared_page(session, old)
         session.add(JobSource(job_id=keep.id, source_page_id=page.id))
+        # R-M02: the paid-cost ledger is job-owned and must be cleaned too.
+        session.add(
+            ProviderCostEventRow(
+                job_id=old.id,
+                provider="dataforseo",
+                step="serp_search",
+                kind="charged",
+                amount=1,
+            )
+        )
         session.commit()
         old_id = old.id
         keep_id = keep.id
@@ -250,6 +261,7 @@ def test_cleanup_apply_deletes_full_chain_keeps_shared_pages(db, tmp_path):
     assert summary.rows_deleted["evidence_notes"] == 1
     assert summary.rows_deleted["llm_usage"] == 1
     assert summary.rows_deleted["job_sources"] == 1
+    assert summary.rows_deleted["provider_cost_events"] == 1
     assert summary.dirs_removed == [str(art)]
     assert not art.exists()
     with session_factory() as session:
@@ -259,6 +271,10 @@ def test_cleanup_apply_deletes_full_chain_keeps_shared_pages(db, tmp_path):
         assert session.get(SourcePage, page.id) is not None
         assert session.scalar(select(func.count()).select_from(JobSource)) == 1
         assert session.scalar(select(func.count()).select_from(SerpRun)) == 0
+        assert (
+            session.scalar(select(func.count()).select_from(ProviderCostEventRow))
+            == 0
+        )
 
 
 def test_cleanup_explicit_job_id_bypasses_retention(db, tmp_path):
@@ -623,3 +639,193 @@ def test_backup_prune_keeps_newest_n(db, tmp_path):
 
     # Pruning again with nothing to prune removes nothing.
     assert backup.prune_backups(settings) == []
+
+
+# =====================================================================
+# R-H07: restore path normalization / containment
+# =====================================================================
+def _synthetic_archive(tmp_path: Path, inner_name: str) -> Path:
+    """A minimal backup archive whose inner artifacts.tar holds one member."""
+    inner_buf = io.BytesIO()
+    with tarfile.open(fileobj=inner_buf, mode="w") as inner:
+        payload = b"pwned"
+        info = tarfile.TarInfo(inner_name)
+        info.size = len(payload)
+        inner.addfile(info, io.BytesIO(payload))
+    inner_buf.seek(0)
+
+    manifest = {
+        "app": "seo-autogen",
+        "created_at": NOW.isoformat(),
+        "tables": {"generation_jobs": 0, "images": 0},
+    }
+    archive = tmp_path / "malicious.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        for name, data in {
+            "db/manifest.json": json.dumps(manifest).encode(),
+            "db/generation_jobs.jsonl": b"",
+            "db/images.jsonl": b"",
+            "artifacts.tar": inner_buf.read(),
+        }.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return archive
+
+
+@pytest.mark.parametrize(
+    "inner_name",
+    [
+        "articles/../escaped.txt",
+        "articles/a/../../escaped.txt",
+        "/etc/escaped.txt",
+        "other/escaped.txt",
+        "C:/windows/escaped.txt",
+        "articles\\..\\escaped.txt",
+    ],
+    ids=["dotdot", "nested-dotdot", "absolute", "outside-tree", "drive", "backslash"],
+)
+def test_r_h07_unsafe_archive_is_rejected_with_zero_writes(tmp_path, inner_name):
+    archive = _synthetic_archive(tmp_path, inner_name)
+    with pytest.raises(backup.BackupError):
+        backup.validate_archive(archive)
+
+    target, t_session = fresh_sqlite()
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    with pytest.raises(backup.BackupError):
+        backup.restore_archive(archive, target, data_dir=dst)
+
+    # Zero filesystem writes outside (or inside) the target tree...
+    assert not (tmp_path / "escaped.txt").exists()
+    assert not (dst / "escaped.txt").exists()
+    assert not (dst / "articles" / "escaped.txt").exists()
+    # ...and zero DB changes.
+    with t_session() as s:
+        assert s.scalar(select(func.count()).select_from(GenerationJob)) == 0
+        assert s.scalar(select(func.count()).select_from(ImageRow)) == 0
+
+
+def test_r_h07_symlink_member_is_rejected(tmp_path):
+    inner_buf = io.BytesIO()
+    with tarfile.open(fileobj=inner_buf, mode="w") as inner:
+        link = tarfile.TarInfo("articles/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        inner.addfile(link)
+    inner_buf.seek(0)
+    manifest = {"app": "seo-autogen", "created_at": NOW.isoformat(), "tables": {}}
+    archive = tmp_path / "symlink.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        for name, data in {
+            "db/manifest.json": json.dumps(manifest).encode(),
+            "artifacts.tar": inner_buf.read(),
+        }.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    with pytest.raises(backup.BackupError):
+        backup.validate_archive(archive)
+
+
+# =====================================================================
+# R-M01: restore must not overwrite live files when the DB import fails
+# =====================================================================
+def _rewrite_db_member(archive: Path, member: str, mutate) -> Path:
+    """Rewrite one ``db/*.jsonl`` member into a new archive."""
+    out = archive.with_name("tampered_" + archive.name)
+    with tarfile.open(archive, "r:gz") as src, tarfile.open(out, "w:gz") as dst:
+        for m in src.getmembers():
+            data = b""
+            if m.isfile():
+                fh = src.extractfile(m)
+                data = fh.read() if fh is not None else b""
+            if m.name == member:
+                rows = [
+                    json.loads(line)
+                    for line in data.decode("utf-8").splitlines()
+                    if line.strip()
+                ]
+                rows = [mutate(r) for r in rows]
+                data = "\n".join(json.dumps(r) for r in rows).encode("utf-8")
+            info = tarfile.TarInfo(m.name)
+            info.size = len(data)
+            info.mtime = m.mtime
+            dst.addfile(info, io.BytesIO(data))
+    return out
+
+
+def test_r_m01_db_failure_restores_original_live_files(db, tmp_path):
+    """Audit reproduction: the archived DB row is invalid, so the import fails
+    AFTER the files would have been published. The live file must still hold
+    its ORIGINAL content and the target DB must stay empty."""
+    session_factory, engine = db
+    src_data = Path(tmp_path) / "src"
+    with session_factory() as session:
+        job = _job(session, keyword="rm01", status="ready", completed_at=NOW)
+        session.commit()
+        job_id = job.id
+    img_dir = src_data / "articles" / str(job_id) / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "a.webp").write_bytes(b"REPLACED")
+    with session_factory() as session:
+        _image(
+            session,
+            session.get(GenerationJob, job_id),
+            local_path=str(img_dir / "a.webp"),
+        )
+        session.commit()
+
+    arch = backup.create_backup(fake_settings(src_data), engine=engine)
+    # Make the image row invalid (filename is NOT NULL) so the DB commit fails.
+    tampered = _rewrite_db_member(
+        arch, "db/images.jsonl", lambda r: {**r, "filename": None}
+    )
+
+    # The target data dir already holds a DIFFERENT file at the same rel path.
+    dst = Path(tmp_path) / "dst"
+    live_file = dst / "articles" / str(job_id) / "images" / "a.webp"
+    live_file.parent.mkdir(parents=True)
+    live_file.write_bytes(b"ORIGINAL")
+
+    target, t_session = fresh_sqlite()
+    with pytest.raises(backup.BackupError):
+        backup.restore_archive(tampered, target, data_dir=dst)
+
+    # R-M01: the live file was rolled back to its original content...
+    assert live_file.read_bytes() == b"ORIGINAL"
+    # ...and the DB was not changed.
+    with t_session() as s:
+        assert s.scalar(select(func.count()).select_from(GenerationJob)) == 0
+        assert s.scalar(select(func.count()).select_from(ImageRow)) == 0
+
+
+def test_r_m01_successful_restore_still_overwrites_live_file(db, tmp_path):
+    """The compensation machinery must not break the happy path: a valid
+    archive DOES replace the live file."""
+    session_factory, engine = db
+    src_data = Path(tmp_path) / "src"
+    with session_factory() as session:
+        job = _job(session, keyword="rm01ok", status="ready", completed_at=NOW)
+        session.commit()
+        job_id = job.id
+    img_dir = src_data / "articles" / str(job_id) / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "a.webp").write_bytes(b"NEW")
+    with session_factory() as session:
+        _image(
+            session,
+            session.get(GenerationJob, job_id),
+            local_path=str(img_dir / "a.webp"),
+        )
+        session.commit()
+    arch = backup.create_backup(fake_settings(src_data), engine=engine)
+
+    dst = Path(tmp_path) / "dst"
+    live_file = dst / "articles" / str(job_id) / "images" / "a.webp"
+    live_file.parent.mkdir(parents=True)
+    live_file.write_bytes(b"OLD")
+
+    target, t_session = fresh_sqlite()
+    backup.restore_archive(arch, target, data_dir=dst)
+    assert live_file.read_bytes() == b"NEW"

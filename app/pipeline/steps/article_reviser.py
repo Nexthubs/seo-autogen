@@ -25,6 +25,7 @@ from app.pipeline.steps._article_common import (
     latest_writer_version,
     load_research_context,
     persist_article_version,
+    review_lineage,
 )
 from app.pipeline.steps._common import llm_model_name, set_llm_prompt
 from app.pipeline.steps.anti_copy_step import (
@@ -95,6 +96,10 @@ async def run_article_reviser(
         )
 
     # Reviews for this version (empty when a review step was skipped).
+    # R-M03: ``latest_review`` returns the CURRENT attempt; ``review_lineage``
+    # records the exact review rows this revision consumes, so the revision
+    # stays traceable after a later review retry appends new attempts.
+    lineage = review_lineage(session, job, draft)
     seo = latest_review(session, job, draft, "seo") or {}
     fact = latest_review(session, job, draft, "fact") or {}
     style = latest_review(session, job, draft, "style") or {}
@@ -133,6 +138,7 @@ async def run_article_reviser(
         prompt_name=prompt.name,
         prompt_version=prompt.version,
         prompt_hash=prompt.prompt_hash,
+        based_on_reviews=lineage,
     )
 
     # Final anti-copy check on the revision (section 29 / DoD).

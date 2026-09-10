@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings, get_settings
 from app.core.enums import JobStatus
 from app.core.exceptions import ErrorCode, PipelineError
-from app.core.redaction import redact
+from app.core.redaction import redact, redact_raw
 from app.db.models.job import GenerationJob
 from app.pipeline import checkpoints
 from app.pipeline.steps.article_reviser import run_article_reviser
@@ -462,8 +462,11 @@ async def run_job_pipeline(
         job.error_message = redact(error.message)
         # Raw failure detail kept for debugging (spec section 49): the
         # provider's verbatim output / exception text, when the raising
-        # step attached one (redacted, section 60).
-        job.error_raw = redact(error.raw) if error.raw is not None else None
+        # step attached one (redacted, section 60). R-H04: ``redact_raw``
+        # accepts any shape and always returns a redacted string, so a
+        # provider that still hands over a structured payload can no longer
+        # crash the failure branch (and the persisted value stays a string).
+        job.error_raw = redact_raw(error.raw)
         job.completed_at = datetime.now(timezone.utc)
         session.commit()
         logger.error(

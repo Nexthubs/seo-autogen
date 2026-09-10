@@ -367,5 +367,11 @@ def reset_from_step(
     # old behaviour here deleted every re-run step's rows, which erased the
     # cost history section 54 asks us to keep for later analysis.) So there
     # is deliberately no LLMUsageRow deletion in this reset.
+    #
+    # R-M02: ``provider_cost_events`` is the same kind of append-only ledger
+    # for PAID providers (DataForSEO / Exa / image generation). It is
+    # independent of every checkpoint row, so this reset never touches it —
+    # deleting ``serp_runs`` / ``images`` above cannot erase the spend
+    # history of a retry or a regeneration.
 
     return len(STEP_NAMES) - step_index + 1

@@ -8,6 +8,32 @@
 > 内容规则以 `SEO-AUTO-DEV-SPEC.md` 为最高优先级；不调用真实付费 API / 不写真实 Strapi，
 > 全部使用 mock / fixture 验证。
 
+> ## ⚠️ 诚实性更正（第二轮审计，R-L01）
+>
+> 本文件记录的 B1–B7 是**第一轮**修复。第一轮收尾时"30 项全部修复"的表述
+> **超出实际证据**：第二轮 `CODEX-AUDIT-REPORT.md`（基于 commit `0636e2e`）
+> 逐项复验后确认其中 **9 项只是"部分修复"**，并给出新编号 `R-H01`…`R-L01`。
+>
+> 下表逐项标注**当前真实状态**（第二轮 B8–B14 已全部收口，详见
+> `docs/AUDIT-R2-FIX-PROGRESS.md` 与 `docs/audit-r2/` 各阶段详档）：
+>
+> | 第一轮项 | 第一轮记录 | 第二轮复验实际 | 第二轮批次 |
+> |---|---|---|---|
+> | H03 | 部分修复 | 部分修复（Blog 扁平已修，Upload 顶层数组仍崩）→ **R-H02** | B12 |
+> | H06 | 关闭 | 实际未关闭（FAQ 空答案 / 有效 H1 / 旧 writer 审核）→ **R-H05** | B11 |
+> | H08 | 关闭 | 实际回归（RQ 参数名错误）→ **R-H01** | B8 |
+> | H09 | 部分修复 | 部分修复（只证明有正文）→ **R-H06** | B10 |
+> | H11 | 部分修复 | 部分修复（审核历史仍被删除）→ **R-M03** | B11 |
+> | H12 | 部分修复 | 部分修复（路径越界 + 失败覆盖 live 文件）→ **R-H07 / R-M01** | B13 |
+> | M01 | 部分修复 | 部分修复（标准上传异常未落失败态；有行无 ID 重试重复）→ **R-H02 / R-H03** | B12 |
+> | M11 | 部分修复 | 部分修复（dict raw 使失败处理再崩）→ **R-H04** | B9 |
+> | M12 | 部分修复 | 部分修复（SERP/图片/证据抓取成本仍丢失）→ **R-M02** | B13 |
+> | L03 | 关闭 | 实际未关闭（"全部修复"表述不准确）→ **R-L01** | B14 |
+>
+> 其余 21 项在第二轮复验中维持"已关闭"（报告 §6 逐项映射）。
+> 因此：**本文件的 B1–B7 明细是历史记录，其"状态 ✅"只代表第一轮的证据范围；
+> 最终状态以 `docs/AUDIT-R2-FIX-PROGRESS.md` 为准。**
+
 ## 基线
 
 | 项 | 值 |
@@ -127,6 +153,9 @@
 ## 变更日志
 
 - **2026-09-17 — B7 完成**：M13 / M14 / M12 / M10 / M03 / H12 / L03 全部修复并测试（`520 passed, 1 skipped`，净增 19 用例）。**无新迁移**。至此 CODEX 审计报告 30 项（0 Critical / 12 High / 15 Medium / 3 Low）全部在 B1–B7 收口。
+  - **⚠️ 更正（第二轮 R-L01）**：本行"30 项全部收口"的表述不成立。第二轮复验确认
+    其中 9 项只是"部分修复"（见文首诚实性更正表），并已在 B8–B14 逐项真正收口；
+    最终状态以 `docs/AUDIT-R2-FIX-PROGRESS.md` 为准。
   - **M13**：Job Detail 读时派生（无 schema 变更）研究正文 + Logs——`competitor_analyses`（逐条 + 源页 title/url/analysis/model）、`serp_synthesis`、`evidence_notes`、`logs`（current_step + job error + 全 15 步 checkpoint）；`job_fragment.html` 新增 4 卡片。
   - **M14**：enqueue 失败降级 + 安全重投——入队失败 job 保持 `queued` + `error_code="ENQUEUE_FAILED"`（非 terminal，§43.3 降级手动重试）；`CreateJobResponse` 增 `enqueued/error`；新增 `POST /jobs/{id}/enqueue`（仅 `status=="queued"` 可重投，其余 409，成功后清 error 标记）；fragment 红色告警 + "重新入队" `hx-post` 按钮。
   - **M12**：`llm_usage` 改**不可变 append-only 台账**（§54）——`reset_from_step` 不再删 usage 行（重试累加、保留历史）；`source_pages` 共享缓存 `provider_cost` = 最后一次 fresh 提取成本（cache hit 零新增）；`image_generate` 复用零新增；`_extract_cost` 读 `cost` 非 `credits`（B2 已改）；None 成本保持 None（不造 0）。

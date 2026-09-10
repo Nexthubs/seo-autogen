@@ -65,6 +65,11 @@ class EvidenceNote(BaseModel):
     SEO competitor claims are NOT evidence. The Writer may only use
     research findings / numbers that exist in the evidence notes for
     the job.
+
+    ``verification_status`` / ``supporting_excerpt`` (audit R-H06) record
+    the outcome of the programmatic support check against the *fetched*
+    source body: it is not enough that the source is reachable — the page
+    must actually corroborate the proposed title/claim/numbers.
     """
 
     claim: str
@@ -74,6 +79,11 @@ class EvidenceNote(BaseModel):
     confidence: Literal["high", "medium", "low"]
     usage: Literal["supported", "soften", "avoid"]
     note: str | None = None
+
+    verification_status: Literal[
+        "supported", "unsupported", "contradicted", "unverified"
+    ] | None = None
+    supporting_excerpt: str | None = None
 
 
 # ============================================================

@@ -253,6 +253,9 @@ class DataForSEOSERPProvider(SERPProvider):
                 ErrorCode.DATAFORSEO_REQUEST_FAILED,
                 f"DataForSEO status_code={raw.get('status_code')} "
                 f"status_message={raw.get('status_message')!r}",
+                # R-H04: structured payloads are allowed at the provider
+                # boundary; PipelineError normalizes them into one redacted
+                # JSON string (never a dict) for every consumer.
                 raw=raw,
             )
         tasks = raw.get("tasks") or []

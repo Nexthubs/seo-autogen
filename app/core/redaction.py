@@ -28,12 +28,20 @@ in the database and on disk.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 #: The replacement used for every redacted secret value.
 REDACTED = "<redacted>"
+
+#: Upper bound for a normalized raw error payload (audit R-H04). Providers
+#: may hand over a whole SERP/extractor envelope; the persisted
+#: ``generation_jobs.error_raw`` is a debugging aid, not the raw archive
+#: (the full provider payload lives in ``serp_runs.raw_response`` per spec
+#: section 12.2), so it is capped to keep the column and the Web UI sane.
+RAW_MAX_CHARS = 20000
 
 # ----------------------------------------------------------------------
 # field-name based redaction (structured payloads)
@@ -161,3 +169,46 @@ def redact_dict(value: dict) -> dict:
     """``redact_value`` specialized to dict input (always returns a dict)."""
     out = redact_value(value)
     return out if isinstance(out, dict) else {}
+
+
+# ----------------------------------------------------------------------
+# raw provider payload normalization (audit R-H04)
+# ----------------------------------------------------------------------
+def _truncate(value: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value
+    suffix = f"...[truncated {len(value) - max_chars} chars]"
+    return value[:max_chars] + suffix
+
+
+def redact_raw(value: Any, *, max_chars: int = RAW_MAX_CHARS) -> str | None:
+    """Normalize any provider ``raw`` payload into one redacted string.
+
+    ``PipelineError.raw`` used to be *annotated* ``str | None`` while several
+    providers passed structured dicts (DataForSEO response envelopes, Exa
+    payloads). The dataclass never enforced the annotation, so the
+    orchestrator's failure branch called the string-only :func:`redact` with
+    a dict and crashed with ``TypeError`` — the original business failure was
+    then lost instead of being persisted (audit R-H04).
+
+    This helper is the single, explicit conversion boundary:
+
+    * ``None`` -> ``None`` (no raw detail);
+    * ``str`` -> :func:`redact` applied;
+    * any JSON-shaped structure -> recursively secret-redacted via
+      :func:`redact_value` and then JSON-serialized;
+    * anything not JSON-serializable -> ``str(value)`` fallback, redacted.
+
+    The result is always a redacted string, so persisting it can never leak a
+    secret (spec section 60) and can never raise.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _truncate(redact(value), max_chars)
+    try:
+        redacted = redact_value(value)
+        serialized = json.dumps(redacted, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - defensive fallback
+        serialized = str(value)
+    return _truncate(redact(serialized), max_chars)

@@ -29,11 +29,12 @@ import argparse
 import io
 import json
 import logging
+import shutil
 import tarfile
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from sqlalchemy import create_engine, delete, select
@@ -309,15 +310,25 @@ def validate_archive(archive: Path) -> dict[str, Any]:
                 elif member.name == "artifacts.tar":
                     # The inner tar must itself be readable — a truncated
                     # outer archive with a broken inner tar must fail here,
-                    # not mid-restore.
+                    # not mid-restore. R-H07: EVERY member name is normalized
+                    # and containment-checked here, before any write, so a
+                    # traversal/absolute/symlink archive is rejected with zero
+                    # filesystem and zero DB changes.
                     fh = tar.extractfile(member)
                     if fh is None:
                         raise BackupError("artifacts.tar unreadable")
                     inner = io.BytesIO(fh.read())
                     with tarfile.open(fileobj=inner, mode="r") as inner_tar:
                         for im in inner_tar.getmembers():
-                            if im.isfile():
-                                artifact_files.append(im.name)
+                            if im.issym() or im.islnk():
+                                raise BackupError(
+                                    "artifact archive contains a link member "
+                                    f"{im.name!r} — refusing to restore"
+                                )
+                            if not im.isfile():
+                                continue
+                            _artifact_rel_parts(im.name)
+                            artifact_files.append(im.name)
             if manifest is None:
                 raise BackupError("archive is not a valid backup (missing db/manifest.json)")
             if manifest.get("app") != APP_MARKER:
@@ -347,8 +358,65 @@ def validate_archive(archive: Path) -> dict[str, Any]:
     return {"tables": {t: 0 for t in table_names}, "artifact_files": artifact_files}
 
 
+def _artifact_rel_parts(arcname: str) -> tuple[str, ...]:
+    """Normalize an inner-tar member name to a safe path under ``articles/``.
+
+    R-H07: restore must never write outside the target ``articles`` tree.
+    Rejects, before any write:
+
+    * absolute paths (``/etc/passwd``, ``C:/x``, ``\\\\host\\share``);
+    * traversal components (``articles/../escaped.txt``);
+    * NUL bytes;
+    * members not rooted at ``articles/``.
+
+    Returns the relative parts *below* ``articles`` (empty for the
+    ``articles`` root entry).
+    """
+    if not arcname or "\x00" in arcname:
+        raise BackupError(f"invalid artifact member name: {arcname!r}")
+    # tar uses POSIX separators; normalize backslashes too so a hand-made
+    # archive cannot smuggle a Windows path past the check.
+    normalized = arcname.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if path.is_absolute() or normalized.startswith("/"):
+        raise BackupError(f"absolute artifact path rejected: {arcname!r}")
+    parts = path.parts
+    if not parts or parts[0] != "articles":
+        raise BackupError(
+            f"artifact member outside the articles tree rejected: {arcname!r}"
+        )
+    for part in parts[1:]:
+        if part in ("", ".", ".."):
+            raise BackupError(
+                f"unsafe artifact path component {part!r} in {arcname!r}"
+            )
+        if ":" in part:
+            raise BackupError(
+                f"unsafe artifact path component {part!r} in {arcname!r}"
+            )
+    return tuple(parts[1:])
+
+
+def _assert_within(path: Path, root: Path) -> None:
+    """Containment check for a materialized path (R-H07, defense in depth)."""
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+    except OSError as error:  # pragma: no cover - very unusual FS state
+        raise BackupError(f"cannot resolve artifact path {path}: {error}") from error
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise BackupError(
+            f"artifact path escapes the target directory: {path}"
+        )
+
+
 def _iter_artifact_files(archive: Path) -> list[tuple[str, bytes]]:
-    """Read every file under the inner ``artifacts.tar`` as (arcname, bytes)."""
+    """Read every safe file under the inner ``artifacts.tar`` (R-H07).
+
+    Raises :class:`BackupError` on symlink/hardlink members, unsafe member
+    names, or an unreadable inner tar — so a malicious archive is rejected
+    before anything is written.
+    """
     with _open_archive(archive) as tar:
         member = tar.getmember("artifacts.tar")
         fh = tar.extractfile(member)
@@ -358,58 +426,113 @@ def _iter_artifact_files(archive: Path) -> list[tuple[str, bytes]]:
     out: list[tuple[str, bytes]] = []
     with tarfile.open(fileobj=io.BytesIO(buf), mode="r") as inner:
         for im in inner.getmembers():
+            if im.issym() or im.islnk():
+                raise BackupError(
+                    f"artifact archive contains a link member {im.name!r} — "
+                    "refusing to restore"
+                )
             if not im.isfile():
                 continue
-            fh = inner.extractfile(im)
-            if fh is None:
+            rel_parts = _artifact_rel_parts(im.name)
+            if not rel_parts:
+                raise BackupError(
+                    f"artifact member has no file name: {im.name!r}"
+                )
+            member_fh = inner.extractfile(im)
+            if member_fh is None:
                 continue
-            out.append((im.name, fh.read()))
+            out.append(("/".join(rel_parts), member_fh.read()))
     return out
 
 
-def _extract_artifacts(archive: Path, data_dir: Path) -> list[Path]:
-    """Write the archive's ``articles`` tree into ``data_dir`` (H12).
+def _stage_artifacts(
+    files: list[tuple[str, bytes]], staging: Path
+) -> dict[str, Path]:
+    """Write validated artifacts into ``staging`` (R-H07/R-M01).
 
-    Files are materialized into a temp directory first and then moved into
-    place, so a failure mid-copy never leaves a half-written tree in the
-    live data dir. Returns the written file paths.
+    Everything lands under the staging directory first; the live tree is
+    only touched after the DB rows and image list have been validated.
     """
-    import shutil
-
-    files = _iter_artifact_files(archive)
-    # Strip the leading ``articles/`` arcname prefix so the tree lands at
-    # {data_dir}/articles/... (matches how create_backup packed it).
-    prefix = "articles" + "/"
-    target_root = Path(data_dir)
-    staging = target_root / ".restore_staging"
-    written: list[Path] = []
     if staging.exists():
         shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+    for rel, data in files:
+        dest = staging.joinpath(*PurePosixPath(rel).parts)
+        _assert_within(dest, staging)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        written[rel] = dest
+    return written
+
+
+def _compensate_artifacts(
+    promoted: list[Path], backed_up: list[tuple[Path, Path]]
+) -> None:
+    """Undo a partial publish: delete new files, restore the originals."""
+    for target in promoted:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - best effort compensation
+            logger.warning(
+                "restore_compensation_unlink_failed",
+                extra={"event": "restore_compensation_unlink_failed",
+                       "path": str(target)},
+            )
+    for target, backup in backed_up:
+        try:
+            if backup.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(backup), str(target))
+        except OSError:  # pragma: no cover - best effort compensation
+            logger.error(
+                "restore_compensation_move_failed",
+                extra={"event": "restore_compensation_move_failed",
+                       "path": str(target), "backup": str(backup)},
+            )
+
+
+def _promote_artifacts(
+    staged: dict[str, Path], live_root: Path, rollback_dir: Path
+) -> tuple[list[Path], list[tuple[Path, Path]]]:
+    """Move staged files into the live tree, snapshotting overwritten files.
+
+    R-M01: every live file that is about to be replaced is first moved into
+    ``rollback_dir`` so a failure (here or later, e.g. the DB commit) can put
+    the ORIGINAL tree back. Returns ``(promoted, backed_up)``.
+    """
+    promoted: list[Path] = []
+    backed_up: list[tuple[Path, Path]] = []
+    if rollback_dir.exists():
+        shutil.rmtree(rollback_dir)
+    live_root.mkdir(parents=True, exist_ok=True)
     try:
-        for arcname, data in files:
-            if not (arcname == "articles" or arcname.startswith(prefix)):
-                # Never write anything outside the articles tree.
-                continue
-            rel = arcname[len(prefix):] if arcname != "articles" else ""
-            dest = (staging / rel) if rel else staging
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-        # Promote: move staging into the live articles dir (overwriting),
-        # recording the FINAL live path of every file.
-        live_root = target_root / "articles"
-        if staging.exists():
-            live_root.mkdir(parents=True, exist_ok=True)
-            for child in sorted(staging.rglob("*")):
-                if child.is_file():
-                    rel = child.relative_to(staging)
-                    target = live_root / rel
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(child), str(target))
-                    written.append(target)
-        return written
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+        for rel in sorted(staged):
+            staged_path = staged[rel]
+            target = live_root.joinpath(*PurePosixPath(rel).parts)
+            _assert_within(target, live_root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                backup = rollback_dir.joinpath(*PurePosixPath(rel).parts)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(target), str(backup))
+                backed_up.append((target, backup))
+            shutil.move(str(staged_path), str(target))
+            promoted.append(target)
+    except Exception as error:
+        _compensate_artifacts(promoted, backed_up)
+        raise BackupError(
+            f"failed to publish restored artifacts: {error}"
+        ) from error
+    return promoted, backed_up
+
+
+def _articles_rel(local_path: str) -> str | None:
+    """The path below ``articles/`` for an archived ``local_path``."""
+    parts = Path(local_path).parts
+    if "articles" not in parts:
+        return None
+    return "/".join(parts[parts.index("articles") + 1:])
 
 
 def _remap_local_path(local_path: str, rel_to_target: dict[str, str]) -> str:
@@ -460,87 +583,135 @@ def restore_archive(
     With ``clear`` every table is emptied first (children before parents).
     Returns ``{"tables": {name: row_count}, "artifacts": [paths],
     "image_files": {local_path: sha256}, "missing_images": [local_path]}``.
+
+    R-H07 / R-M01 ordering guarantees:
+
+    1. archive + member-path validation happens first (zero writes on a
+       malicious/invalid archive);
+    2. artifacts are staged into ``{data_dir}/.restore_staging`` and every
+       archived image row is checked against that staging tree — the LIVE
+       ``articles`` tree is untouched so far;
+    3. the live tree is then published with a rollback snapshot of every
+       overwritten file;
+    4. the DB transaction commits last; if it fails, the file publish is
+       compensated, so DB and files both end up in their ORIGINAL state.
     """
     import hashlib
 
-    # 1) Validate before touching the target at all.
+    # 1) Validate before touching the target at all (paths included).
     validate_archive(archive)
 
-    # 2) Extract the image tree (if a data dir is given) and build the
-    #    rel→target map used to remap every archived local_path.
-    written: list[Path] = []
+    data_path = Path(data_dir) if data_dir is not None else None
+    staging = (data_path / ".restore_staging") if data_path else None
+    rollback_dir = (data_path / ".restore_rollback") if data_path else None
+
+    # 2) Stage the image tree (no live writes yet) and remap every archived
+    #    local_path onto the FINAL live location.
+    staged: dict[str, Path] = {}
     rel_to_target: dict[str, str] = {}
-    if data_dir is not None:
-        written = _extract_artifacts(archive, Path(data_dir))
-        rel_to_target = {
-            str(p.relative_to(Path(data_dir) / "articles")): str(p)
-            for p in written
+    try:
+        if data_path is not None:
+            staged = _stage_artifacts(_iter_artifact_files(archive), staging)
+            live_root = data_path / "articles"
+            rel_to_target = {
+                rel: str(live_root.joinpath(*PurePosixPath(rel).parts))
+                for rel in staged
+            }
+
+        maker = sessionmaker(bind=target_engine, expire_on_commit=False)
+        by_table = {m.__tablename__: m for m in table_order()}
+        tables_in_archive = {
+            name: [_remap_row(name, r, rel_to_target) for r in rows]
+            for name, rows in iter_archive_db(archive)
         }
 
-    # 3) Pre-load + remap every image local_path, then validate that each
-    #    file exists BEFORE the DB commit (fail-fast, no half-restore).
-    maker = sessionmaker(bind=target_engine, expire_on_commit=False)
-    by_table = {m.__tablename__: m for m in table_order()}
-    tables_in_archive = {
-        name: [_remap_row(name, r, rel_to_target) for r in rows]
-        for name, rows in iter_archive_db(archive)
-    }
-    remapped_image_paths: list[str] = []
-    for r in tables_in_archive.get("images", []):
-        lp = r.get("local_path")
-        if lp:
-            remapped_image_paths.append(lp)
-
-    missing_images = [lp for lp in remapped_image_paths if not Path(lp).is_file()]
-    if missing_images:
-        raise BackupError(
-            "restore cannot satisfy image rows before touching the DB "
-            f"({len(missing_images)} missing, e.g. {missing_images[0]}) — "
-            "the archive and the target data dir are out of sync"
-        )
-
-    # 4) Stage the whole DB section in one transaction (atomic).
-    counts: dict[str, int] = {}
-    with maker() as session:
-        if clear:
-            for model in reversed(by_table.values()):
-                session.execute(delete(model))
-        for table_name, model in by_table.items():
-            rows = tables_in_archive.get(table_name)
-            if rows is None:
+        # 3) Validate every image row against the STAGING tree BEFORE any
+        #    live write and BEFORE the DB commit (fail-fast, no half-restore).
+        remapped_image_paths: list[str] = []
+        missing_images: list[str] = []
+        for r in tables_in_archive.get("images", []):
+            archived_lp = r.get("local_path")
+            if not archived_lp:
                 continue
-            id_column = model.__table__.primary_key.columns[0]
-            pk_attr = getattr(model, id_column.name)
-            pks = [_pk_value(model, r[id_column.name]) for r in rows]
-            if pks:
-                session.execute(delete(model).where(pk_attr.in_(pks)))
-            for payload in rows:
-                session.add(_restore_row(model, payload))
-            counts[table_name] = len(rows)
-        session.commit()  # single commit — all-or-nothing DB restore
+            remapped_image_paths.append(archived_lp)
+            if data_path is None:
+                if not Path(archived_lp).is_file():
+                    missing_images.append(archived_lp)
+                continue
+            rel = _articles_rel(archived_lp)
+            if rel is None or rel not in staged:
+                missing_images.append(archived_lp)
+        if missing_images:
+            raise BackupError(
+                "restore cannot satisfy image rows before touching the target "
+                f"({len(missing_images)} missing, e.g. {missing_images[0]}) — "
+                "the archive and the target data dir are out of sync"
+            )
 
-    # Report the digest of each restored file (path-mapping + file-summary
-    # check the audit demands).
-    image_files: dict[str, str] = {
-        lp: hashlib.sha256(Path(lp).read_bytes()).hexdigest()
-        for lp in remapped_image_paths
-    }
-    logger.info(
-        "backup_restored",
-        extra={
-            "event": "backup_restored",
-            "archive": str(archive),
+        # 4) Publish the staged tree with a rollback snapshot (R-M01).
+        promoted: list[Path] = []
+        backed_up: list[tuple[Path, Path]] = []
+        if data_path is not None and staged:
+            promoted, backed_up = _promote_artifacts(
+                staged, data_path / "articles", rollback_dir
+            )
+
+        # 5) Stage the whole DB section in one transaction (atomic). If it
+        #    fails, compensate the file publish so DB + files stay original.
+        counts: dict[str, int] = {}
+        try:
+            with maker() as session:
+                if clear:
+                    for model in reversed(by_table.values()):
+                        session.execute(delete(model))
+                for table_name, model in by_table.items():
+                    rows = tables_in_archive.get(table_name)
+                    if rows is None:
+                        continue
+                    id_column = model.__table__.primary_key.columns[0]
+                    pk_attr = getattr(model, id_column.name)
+                    pks = [_pk_value(model, r[id_column.name]) for r in rows]
+                    if pks:
+                        session.execute(delete(model).where(pk_attr.in_(pks)))
+                    for payload in rows:
+                        session.add(_restore_row(model, payload))
+                    counts[table_name] = len(rows)
+                session.commit()  # single commit — all-or-nothing DB restore
+        except Exception as error:
+            _compensate_artifacts(promoted, backed_up)
+            raise BackupError(
+                "database restore failed; the original artifacts were put "
+                f"back ({error.__class__.__name__}: {error})"
+            ) from error
+
+        # Report the digest of each restored file (path-mapping + file-summary
+        # check the audit demands).
+        image_files: dict[str, str] = {
+            lp: hashlib.sha256(Path(lp).read_bytes()).hexdigest()
+            for lp in remapped_image_paths
+        }
+        logger.info(
+            "backup_restored",
+            extra={
+                "event": "backup_restored",
+                "archive": str(archive),
+                "tables": counts,
+                "artifacts": len(promoted),
+                "images": len(image_files),
+            },
+        )
+        return {
             "tables": counts,
-            "artifacts": len(written),
-            "images": len(image_files),
-        },
-    )
-    return {
-        "tables": counts,
-        "artifacts": [str(p) for p in written],
-        "image_files": image_files,
-        "missing_images": missing_images,
-    }
+            "artifacts": [str(p) for p in promoted],
+            "image_files": image_files,
+            "missing_images": missing_images,
+        }
+    finally:
+        # R-M01: staging/rollback are scratch space; the live tree and the
+        # DB are consistent at this point either way.
+        for scratch in (staging, rollback_dir):
+            if scratch is not None and scratch.exists():
+                shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _remap_row(table_name: str, row: dict, rel_to_target: dict[str, str]) -> dict:

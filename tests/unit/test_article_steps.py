@@ -378,14 +378,30 @@ async def test_reviewers_reject_without_article(db, job):
     await llm.aclose()
 
 
-async def test_reviewer_rerun_replaces_same_version_type(db, job):
+async def test_reviewer_rerun_appends_attempt_and_keeps_history(db, job):
+    """R-M03: re-running a review appends an attempt; the previous verdict is
+    NOT deleted (an already-persisted revision must stay traceable)."""
+    from app.pipeline.steps._article_common import latest_review
+
     await _run_writer(db, job)
+    writer = db.scalars(
+        select(ArticleVersionRow)
+        .where(ArticleVersionRow.job_id == job.id)
+        .order_by(ArticleVersionRow.version.desc())
+    ).first()
     for _ in range(2):
         llm = FakeLLM([json.dumps(SEO_REVIEW)])
         await run_seo_review(db, job, llm, guideline_excerpt="G")
         await llm.aclose()
-    count = db.query(ArticleReviewRow).count()
-    assert count == 1
+    rows = (
+        db.query(ArticleReviewRow)
+        .filter(ArticleReviewRow.review_type == "seo")
+        .order_by(ArticleReviewRow.attempt)
+        .all()
+    )
+    assert [r.attempt for r in rows] == [1, 2]
+    # current valid verdict is the newest attempt
+    assert latest_review(db, job, writer, "seo") is not None
     # status walked back to fact_reviewing on each run
     db.refresh(job)
     assert job.status == JobStatus.FACT_REVIEWING.value

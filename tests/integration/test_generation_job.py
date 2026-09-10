@@ -66,3 +66,40 @@ def test_create_job_roundtrip():
         assert loaded.status == "queued"
         session.delete(loaded)
         session.commit()
+
+
+def test_evidence_notes_table_has_r_h06_support_columns():
+    """Audit R-H06 / migration 0012: support verdict + excerpt columns."""
+    with engine.connect() as conn:
+        info = set(
+            conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'evidence_notes'"
+                )
+            ).scalars()
+        )
+    assert {"verification_status", "supporting_excerpt"} <= info
+
+
+def test_provider_cost_ledger_table_exists():
+    """Audit R-M02 / migration 0014: the append-only paid-cost ledger."""
+    with engine.connect() as conn:
+        info = set(
+            conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'provider_cost_events'"
+                )
+            ).scalars()
+        )
+    assert {
+        "id",
+        "job_id",
+        "provider",
+        "step",
+        "kind",
+        "amount",
+        "detail",
+        "created_at",
+    } <= info

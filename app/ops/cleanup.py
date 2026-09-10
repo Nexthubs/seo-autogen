@@ -36,6 +36,7 @@ from app.core.config import Settings, get_settings
 from app.db.base import Base  # noqa: F401
 from app.db import models  # noqa: F401 - register all models on Base
 from app.db.models.article import ArticleReviewRow, ArticleVersionRow
+from app.db.models.cost import ProviderCostEventRow
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
 from app.db.models.llm_usage import LLMUsageRow
@@ -61,6 +62,7 @@ _JOB_CHILD_TABLES: tuple[type, ...] = (
     SerpRun,            # -> generation_jobs
     JobSource,          # -> generation_jobs, source_pages (pages kept)
     LLMUsageRow,        # -> generation_jobs
+    ProviderCostEventRow,  # -> generation_jobs (R-M02 ledger)
     StrapiSyncRow,      # -> generation_jobs
     ImageRow,           # -> generation_jobs
     CompetitorAnalysisRow,

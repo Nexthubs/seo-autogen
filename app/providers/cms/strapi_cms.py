@@ -44,6 +44,19 @@ RETRY_BACKOFF_SECONDS = (2.0, 5.0, 15.0)
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
+def _safe_json(value, *, limit: int = 300) -> str:
+    """Best-effort truncated JSON/text for an error ``raw`` payload.
+
+    Accepts any shape (list/dict/scalar) so the upload parser can never
+    crash while building its own error (R-H02); ``PipelineError`` then
+    normalizes/redacts the string (R-H04).
+    """
+    try:
+        return json.dumps(value, ensure_ascii=False)[:limit]
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return str(value)[:limit]
+
+
 class StrapiCMSProvider(CMSProvider):
     """CMSProvider backed by a Strapi 5 REST API (V1, Draft-only)."""
 
@@ -365,25 +378,46 @@ class StrapiCMSProvider(CMSProvider):
         )
 
     @staticmethod
-    def _upload_result(data: dict) -> MediaUploadResult:
-        """Parse ``POST /api/upload`` (H03).
+    def _upload_result(data) -> MediaUploadResult:
+        """Parse ``POST /api/upload`` (H03, R-H02).
 
-        Strapi 5 returns ``{"data": [ {file}, ... ]}`` — an ARRAY of
-        uploaded files (one per ``files`` part); Strapi 4 returned a
-        single object. Both are accepted: for the array the first item
-        is the one we uploaded (single-file uploads in this codebase).
+        The **standard Strapi upload controller response is a TOP-LEVEL
+        ARRAY** of file objects (``uploadFiles`` puts the sanitized file
+        list straight on ``ctx.body`` with HTTP 201), e.g.::
+
+            [{"id": 101, "url": "/uploads/hero.webp", ...}]
+
+        The previous parser started from ``data.get("data")`` and therefore
+        crashed with ``AttributeError: 'list' object has no attribute
+        'get'`` on the real response. Accepted shapes:
+
+        * top-level list (standard Strapi 5 upload);
+        * ``{"data": [...]}`` (proxy/wrapper compatibility);
+        * ``{"data": {...}}`` / bare object (Strapi 4 single-object shape).
+
+        Anything that does not yield an object with ``id`` + ``url`` is a
+        stable ``STRAPI_SCHEMA_MISMATCH`` PipelineError (never a raw
+        AttributeError).
         """
-        payload = data.get("data")
-        if isinstance(payload, list):
-            item = payload[0] if payload else {}
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            payload = data.get("data", data)
+            if isinstance(payload, list):
+                items = payload
+            elif isinstance(payload, dict):
+                items = [payload]
+            else:
+                items = []
         else:
-            # legacy v4 shape: a single object
-            item = payload or {}
+            items = []
+
+        item = items[0] if items and isinstance(items[0], dict) else {}
         if not item.get("id") or not item.get("url"):
             raise PipelineError(
                 ErrorCode.STRAPI_SCHEMA_MISMATCH,
                 "Strapi upload response lacks id/url",
-                raw=json.dumps(data, ensure_ascii=False)[:300],
+                raw=_safe_json(data),
             )
         return MediaUploadResult(
             media_id=item["id"],

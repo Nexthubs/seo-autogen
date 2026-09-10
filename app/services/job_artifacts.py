@@ -177,6 +177,8 @@ def _sources(session: Session, job: GenerationJob) -> dict:
                 "confidence": e.confidence,
                 "usage": e.usage,
                 "note": e.note,
+                "verification_status": e.verification_status,
+                "supporting_excerpt": e.supporting_excerpt,
             }
             for e in evidence
         ],

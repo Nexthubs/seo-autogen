@@ -95,7 +95,12 @@ def enqueue_job(
         options or {},
         # RQ's default job timeout (180s) is shorter than a full pipeline
         # run, so it must be set explicitly per job (audit H08).
-        timeout=settings.rq_job_timeout_seconds,
+        #
+        # RQ's control parameter is ``job_timeout`` (see
+        # ``rq.queue.Queue.parse_args``); a plain ``timeout=...`` is *not*
+        # consumed by RQ and would instead be delivered to the task as a
+        # keyword argument, breaking the call before it starts (audit R-H01).
+        job_timeout=settings.rq_job_timeout_seconds,
     )
 
 
@@ -109,7 +114,8 @@ def enqueue_strapi_sync(job_id: str | uuid.UUID) -> None:
     queue.enqueue(
         "app.workers.article_tasks.sync_strapi_draft",
         str(job_id),
-        timeout=settings.rq_job_timeout_seconds,
+        # Same RQ control-parameter rule as :func:`enqueue_job` (R-H01).
+        job_timeout=settings.rq_job_timeout_seconds,
     )
 
 

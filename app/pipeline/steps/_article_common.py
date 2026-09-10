@@ -82,8 +82,14 @@ def persist_article_version(
     prompt_name: str | None,
     prompt_version: str | None,
     prompt_hash: str | None = None,
+    based_on_reviews: dict | None = None,
 ) -> ArticleVersionRow:
-    """Append a NEW version row (section 28: never overwrite)."""
+    """Append a NEW version row (section 28: never overwrite).
+
+    ``based_on_reviews`` (R-M03) records, per review type, the exact
+    ``article_reviews`` row + attempt a ``revision`` version was produced
+    from, so the revision stays traceable after later review retries.
+    """
     row = ArticleVersionRow(
         job_id=job.id,
         version=next_article_version(session, job),
@@ -97,10 +103,34 @@ def persist_article_version(
         prompt_name=prompt_name,
         prompt_version=prompt_version,
         prompt_hash=prompt_hash,
+        based_on_reviews=based_on_reviews,
     )
     session.add(row)
     session.flush()
     return row
+
+
+def latest_review_row(
+    session: Session,
+    job: GenerationJob,
+    version_row: ArticleVersionRow,
+    review_type: str,
+) -> ArticleReviewRow | None:
+    """The CURRENT VALID review row: highest ``attempt`` for that
+    (version, type).
+
+    R-M03: reviews are append-only history, so "which verdict is current"
+    is derived (max attempt), never expressed by deleting older rows.
+    """
+    return session.scalars(
+        select(ArticleReviewRow)
+        .where(
+            ArticleReviewRow.job_id == job.id,
+            ArticleReviewRow.article_version_id == version_row.id,
+            ArticleReviewRow.review_type == review_type,
+        )
+        .order_by(ArticleReviewRow.attempt.desc())
+    ).first()
 
 
 def persist_review(
@@ -114,21 +144,23 @@ def persist_review(
     prompt_version: str | None = None,
     prompt_hash: str | None = None,
 ) -> ArticleReviewRow:
-    """Persist one review for one article version (section 46.14).
+    """Append one review run for one article version (section 46.14).
 
-    Re-running a step replaces the review row for that
-    (version, type) pair.
+    R-M03: re-running a step no longer deletes the previous verdict for the
+    (version, type) pair — it appends a new attempt. The current valid
+    verdict is the highest ``attempt`` (:func:`latest_review_row`). This
+    keeps every review run that an already-persisted revision was built
+    from traceable.
     """
-    existing = session.scalars(
-        select(ArticleReviewRow).where(
+    last_attempt = session.scalars(
+        select(ArticleReviewRow.attempt)
+        .where(
             ArticleReviewRow.job_id == job.id,
             ArticleReviewRow.article_version_id == version_row.id,
             ArticleReviewRow.review_type == review_type,
         )
+        .order_by(ArticleReviewRow.attempt.desc())
     ).first()
-    if existing is not None:
-        session.delete(existing)
-        session.flush()
     row = ArticleReviewRow(
         job_id=job.id,
         article_version_id=version_row.id,
@@ -137,10 +169,40 @@ def persist_review(
         model=model,
         prompt_version=prompt_version,
         prompt_hash=prompt_hash,
+        attempt=(last_attempt or 0) + 1,
     )
     session.add(row)
     session.flush()
     return row
+
+
+def review_lineage(
+    session: Session,
+    job: GenerationJob,
+    version_row: ArticleVersionRow,
+) -> dict[str, dict]:
+    """The current review attempt set for a version, keyed by review type.
+
+    Shape: ``{"seo": {"review_id": "<uuid>", "attempt": 1}, ...}`` — the
+    value persisted on a revision's ``based_on_reviews`` (R-M03).
+    """
+    rows = session.scalars(
+        select(ArticleReviewRow)
+        .where(
+            ArticleReviewRow.job_id == job.id,
+            ArticleReviewRow.article_version_id == version_row.id,
+        )
+        .order_by(ArticleReviewRow.attempt.desc())
+    ).all()
+    lineage: dict[str, dict] = {}
+    for row in rows:
+        # Rows are ordered by attempt desc, so the first per type is current.
+        if row.review_type not in lineage:
+            lineage[row.review_type] = {
+                "review_id": str(row.id),
+                "attempt": row.attempt,
+            }
+    return lineage
 
 
 def latest_review(
@@ -149,13 +211,7 @@ def latest_review(
     version_row: ArticleVersionRow,
     review_type: str,
 ) -> dict | None:
-    row = session.scalars(
-        select(ArticleReviewRow).where(
-            ArticleReviewRow.job_id == job.id,
-            ArticleReviewRow.article_version_id == version_row.id,
-            ArticleReviewRow.review_type == review_type,
-        )
-    ).first()
+    row = latest_review_row(session, job, version_row, review_type)
     return row.review if row is not None else None
 
 
@@ -183,6 +239,11 @@ def load_research_context(session: Session, job: GenerationJob) -> dict:
             "confidence": n.confidence,
             "usage": n.usage,
             "note": n.note,
+            # R-H06: the source-support verdict + corroborating excerpt travel
+            # with the note so the writer / fact reviewer can see what the
+            # fetched source actually says.
+            "verification_status": n.verification_status,
+            "supporting_excerpt": n.supporting_excerpt,
         }
         for n in session.scalars(
             select(EvidenceNoteRow).where(EvidenceNoteRow.job_id == job.id)

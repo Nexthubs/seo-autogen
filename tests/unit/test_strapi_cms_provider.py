@@ -229,11 +229,13 @@ async def test_create_draft_failure_raises_code(fake, provider):
 
 
 # -------------------------------------------------------------------- uploads
-def _upload_response(url="/uploads/hero.webp", v4=False):
-    """``POST /api/upload`` response (H03).
+def _upload_response(url="/uploads/hero.webp", v4=False, wrapped=False):
+    """``POST /api/upload`` response (H03, R-H02).
 
-    Strapi 5 returns ``data`` as an ARRAY of uploaded files; the
-    legacy Strapi 4 shape returns a single object — both are accepted.
+    The STANDARD Strapi upload controller response is a top-level ARRAY of
+    file objects (``uploadFiles`` puts the list straight on ``ctx.body`` with
+    HTTP 201). ``wrapped=True`` emulates a proxy/wrapper ``{"data": [...]}``
+    and ``v4=True`` the legacy Strapi 4 single object — all three must work.
     """
     file_item = {
         "id": 11,
@@ -241,8 +243,11 @@ def _upload_response(url="/uploads/hero.webp", v4=False):
         "url": url,
         "alternativeText": "alt",
     }
-    data = file_item if v4 else [file_item]
-    return httpx.Response(201, json={"data": data})
+    if v4:
+        return httpx.Response(201, json={"data": file_item})
+    if wrapped:
+        return httpx.Response(201, json={"data": [file_item]})
+    return httpx.Response(201, json=[file_item])
 
 
 def _multipart_fields(request: httpx.Request) -> dict:
@@ -425,3 +430,46 @@ async def test_upload_array_missing_ids_is_schema_mismatch(fake, provider):
     with pytest.raises(PipelineError) as excinfo:
         await provider.upload_inline(b"img", "inline-1.webp")
     assert excinfo.value.error_code == ErrorCode.STRAPI_SCHEMA_MISMATCH
+
+
+# --------------------------------------------------- R-H02: standard top-level array
+async def test_r_h02_upload_accepts_standard_top_level_array(fake, provider):
+    """R-H02 (audit reproduction): the real Strapi response is a TOP-LEVEL
+    array ``[{id,url,...}]`` — the old ``data.get('data')`` parser crashed with
+    ``AttributeError: 'list' object has no attribute 'get'``."""
+    fake.routes[("POST", "/api/upload")] = _upload_response("/uploads/hero.webp")
+    result = await provider.upload_inline(b"img", "inline-1.webp", alt_text="Alt")
+    assert result.media_id == 11
+    assert result.url == "/uploads/hero.webp"
+    assert result.document_id == "doc-media-11"
+
+
+async def test_r_h02_upload_accepts_wrapped_data_array(fake, provider):
+    """Proxy/wrapper compatibility: ``{"data": [...]}`` still parses."""
+    fake.routes[("POST", "/api/upload")] = _upload_response(
+        "/uploads/w.webp", wrapped=True
+    )
+    result = await provider.upload_inline(b"img", "inline-1.webp")
+    assert result.media_id == 11
+    assert result.url == "/uploads/w.webp"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], {}, {"data": []}, {"data": None}, "not-a-payload", None],
+    ids=["empty-list", "empty-dict", "empty-data-list", "null-data", "string", "null"],
+)
+async def test_r_h02_upload_empty_or_malformed_is_schema_mismatch(
+    fake, provider, payload
+):
+    """Empty/malformed upload bodies become a stable PipelineError — never a
+    raw AttributeError/TypeError."""
+    fake.routes[("POST", "/api/upload")] = httpx.Response(201, json=payload)
+    with pytest.raises(PipelineError) as excinfo:
+        await provider.upload_inline(b"img", "inline-1.webp")
+    # both are stable PipelineError codes: unparseable body -> UPLOAD_FAILED,
+    # parseable but empty/malformed structure -> SCHEMA_MISMATCH.
+    assert excinfo.value.error_code in (
+        ErrorCode.STRAPI_SCHEMA_MISMATCH,
+        ErrorCode.STRAPI_UPLOAD_FAILED,
+    )

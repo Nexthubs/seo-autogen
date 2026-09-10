@@ -23,10 +23,11 @@ import os
 import re
 from typing import TYPE_CHECKING
 
+from markdown_it import MarkdownIt
 from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.db.models.article import ArticleReviewRow, ArticleVersionRow
+from app.db.models.article import ArticleVersionRow
 from app.db.models.images import ImageRow
 from app.db.models.job import GenerationJob
 from app.db.models.research import (
@@ -38,7 +39,11 @@ from app.db.models.research import (
 )
 from app.db.models.serp import SerpResult, SerpRun
 from app.db.models.source import JobSource, SourcePage
-from app.pipeline.steps._article_common import latest_article_version
+from app.pipeline.steps._article_common import (
+    latest_article_version,
+    latest_review_row,
+    latest_writer_version,
+)
 from app.schemas.research import ArticleOutline, ContentBrief
 from app.schemas.internal_link import MARKER_SYNTAX
 from app.services.image_markers import _HEADING, _normalize_heading
@@ -47,18 +52,13 @@ from app.services.internal_link_service import validate_markers
 if TYPE_CHECKING:  # pragma: no cover
     from sqlalchemy.orm import Session
 
-#: ATX H1 line in the body (the writer contract forbids any H1 —
-#: identical to ``article_writer._H1_LINE``, kept local to avoid an
-#: import cycle through the provider stack).
-_H1_LINE = re.compile(r"(?m)^#\s(?!\s)(.*)$")
-#: Setext H1: a non-blank text line followed by a ``=`` underline. A
-#: ``-`` underline is a Setext *H2*, not an H1 — matching only ``=``
-#: keeps horizontal rules (``---``) and H2 underlines out of it.
-_SETEXT_H1 = re.compile(
-    r"(?m)^[^\n`#*\s][^\n]*[^\n`\s]\n[ \t]*={2,}[ \t]*\r?$"
-)
-#: "## FAQ" heading in the final body.
-_FAQ_HEADING = re.compile(r"(?m)^##\s+(?!#)FAQ\b")
+#: R-H05: heading structure is decided by the SAME Markdown parser the
+#: renderer uses, not by regexes. Regexes missed CommonMark's 1-3 space ATX
+#: indentation and single-``=`` Setext H1 (``X\n=\n``), both of which the
+#: project renderer turns into ``<h1>``. A token parse also ignores ``#``
+#: inside fenced code, which a line regex would wrongly flag.
+_MD = MarkdownIt("commonmark")
+
 #: Any internal-link marker attempt: the double-bracket + prefix is
 #: case-INSENSITIVE, so a malformed attempt (lowercase marker id
 #: ``[[INTERNAL_LINK:foo]]`` or a lowercase prefix ``[[internal_link:FOO]]``)
@@ -74,6 +74,65 @@ MAX_IMAGES = 3
 #: high-frequency Q&A pairs (each a ``###`` question with an answer).
 MIN_FAQ_QUESTIONS = 3
 REQUIRED_REVIEWS = ("seo", "fact", "style")
+
+
+def _headings(body: str) -> list[tuple[int, str, str]]:
+    """``(token_index, tag, text)`` for every heading, via Markdown tokens."""
+    tokens = _MD.parse(body or "")
+    out: list[tuple[int, str, str]] = []
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open":
+            continue
+        text = ""
+        if index + 1 < len(tokens) and tokens[index + 1].type == "inline":
+            text = tokens[index + 1].content or ""
+        out.append((index, token.tag, text))
+    return out
+
+
+def _find_h2(headings: list[tuple[int, str, str]], title: str) -> int | None:
+    """Index into ``headings`` of the first ``## title`` heading."""
+    normalized = _normalize_heading(title)
+    for index, (_, tag, text) in enumerate(headings):
+        if tag == "h2" and _normalize_heading(text) == normalized:
+            return index
+    return None
+
+
+def _faq_qa_counts(body: str, faq_heading_index: int) -> tuple[int, int]:
+    """``(questions, answered)`` for the FAQ section.
+
+    R-H05: the old gate counted ``###`` headings only, so three empty
+    question titles passed. A question counts as answered only when a
+    non-empty content block (paragraph, list item, quote) follows it before
+    the next heading.
+    """
+    tokens = _MD.parse(body or "")
+    headings = _headings(body)
+    start = headings[faq_heading_index][0]
+    end = len(tokens)
+    for index in range(faq_heading_index + 1, len(headings)):
+        if headings[index][1] == "h2":
+            end = headings[index][0]
+            break
+
+    questions = 0
+    answered = 0
+    for index in range(faq_heading_index + 1, len(headings)):
+        token_index, tag, _text = headings[index]
+        if token_index >= end:
+            break
+        if tag != "h3":
+            continue
+        questions += 1
+        next_heading = end
+        if index + 1 < len(headings):
+            next_heading = headings[index + 1][0]
+        for token in tokens[token_index + 2 : next_heading]:
+            if token.type == "inline" and (token.content or "").strip():
+                answered += 1
+                break
+    return questions, answered
 
 
 def validate_article_done(session: "Session", job: GenerationJob) -> list[str]:
@@ -224,11 +283,13 @@ def _check_article(
     body = version.body_markdown or ""
     if not (version.title or "").strip():
         errors.append("article: title is empty")
-    if _H1_LINE.search(body):
-        errors.append("article: body_markdown contains an H1 line")
-    if _SETEXT_H1.search(body):
+    # R-H05: token-based H1 detection (indented ATX + single-`=` Setext).
+    headings = _headings(body)
+    h1_texts = [text for _, tag, text in headings if tag == "h1"]
+    if h1_texts:
         errors.append(
-            "article: body_markdown contains a Setext H1 (= underline)"
+            "article: body_markdown contains an H1 heading "
+            f"({h1_texts[0]!r})"
         )
     if not (version.seo_title or "").strip():
         errors.append("article: seo_title is empty")
@@ -236,15 +297,23 @@ def _check_article(
         errors.append("article: meta_description is empty")
     if not (version.slug or "").strip():
         errors.append("article: slug is empty")
-    if not _FAQ_HEADING.search(body):
+    faq_heading_index = _find_h2(headings, "faq")
+    if faq_heading_index is None:
         errors.append("article: no FAQ section in body_markdown")
     else:
-        faq_questions = _faq_question_count(body)
+        faq_questions, faq_answered = _faq_qa_counts(body, faq_heading_index)
         if faq_questions < MIN_FAQ_QUESTIONS:
             errors.append(
                 "article: FAQ section has "
                 f"{faq_questions} question(s), at least {MIN_FAQ_QUESTIONS} "
                 "Q&A pairs are required (content guideline)"
+            )
+        # R-H05: a question title alone is not a Q&A pair — the content
+        # guideline (and section 63 "FAQ") requires an actual answer.
+        if faq_answered < faq_questions:
+            errors.append(
+                "article: FAQ has "
+                f"{faq_questions - faq_answered} question(s) without an answer"
             )
 
     errors.extend(_check_cta(session, job, version))
@@ -267,29 +336,36 @@ def _check_article(
         )
 
     #: Pipeline order: writer v(N) -> reviewers (reviews land on v(N))
-    #: -> reviser v(N+1) -> FINAL anti-copy on v(N+1). So seo/fact/style
-    #: must exist for SOME version of this job, while the anti-copy
-    #: verdict must belong to the latest (final) version — the body that
-    #: actually ships.
-    job_reviews = session.scalars(
-        select(ArticleReviewRow).where(ArticleReviewRow.job_id == job.id)
-    ).all()
-    final_reviews = session.scalars(
-        select(ArticleReviewRow).where(
-            ArticleReviewRow.article_version_id == version.id
-        )
-    ).all()
-    by_type = {r.review_type: r for r in job_reviews}
-    final_by_type = {r.review_type: r for r in final_reviews}
+    #: -> reviser v(N+1) -> FINAL anti-copy on v(N+1).
+    #:
+    #: R-H05: the three reviews must belong to the CURRENT writer draft —
+    #: the version the latest revision was actually built from. Aggregating
+    #: over "some version of this job" let a previous draft's reviews satisfy
+    #: a fresh draft (e.g. writer retry v3 + revision v4 whose own seo/fact/
+    #: style reviews never ran).
+    writer_version = latest_writer_version(session, job)
     for rtype in REQUIRED_REVIEWS:
-        if rtype not in by_type:
-            errors.append(f"article: missing {rtype} review")
-    if "anticopy" not in final_by_type:
+        row = (
+            latest_review_row(session, job, writer_version, rtype)
+            if writer_version is not None
+            else None
+        )
+        if row is None:
+            suffix = (
+                f" for the current writer draft v{writer_version.version}"
+                if writer_version is not None
+                else ""
+            )
+            errors.append(f"article: missing {rtype} review{suffix}")
+    #: The anti-copy verdict must belong to the final (latest-attempt) row
+    #: of the version that actually ships (R-M03: append-only attempts).
+    anticopy_row = latest_review_row(session, job, version, "anticopy")
+    if anticopy_row is None:
         errors.append(
             f"article: missing anticopy review for final version v{version.version}"
         )
     else:
-        report = final_by_type["anticopy"].review or {}
+        report = anticopy_row.review or {}
         if report.get("has_serious_overlap"):
             errors.append("article: anti-copy check reports serious overlap")
     return errors, version
@@ -353,25 +429,6 @@ def _section_has_content(body: str, heading: str) -> bool:
                     return True
             return False
     return False
-
-
-def _faq_question_count(body: str) -> int:
-    """Count ``###`` questions inside the FAQ section (each is one Q&A
-    pair; the content guideline requires at least three real questions)."""
-    lines = body.splitlines()
-    for idx, line in enumerate(lines):
-        m = _HEADING.match(line)
-        if not (m and m.group(1) == "##" and _normalize_heading(m.group(2)) == "faq"):
-            continue
-        count = 0
-        for rest in lines[idx + 1 :]:
-            rest_m = _HEADING.match(rest)
-            if rest_m and rest_m.group(1) == "##":
-                break  # next level-2 heading ends the FAQ section
-            if rest_m and rest_m.group(1) == "###":
-                count += 1
-        return count
-    return 0
 
 
 def _malformed_internal_link_markers(body: str) -> list[str]:

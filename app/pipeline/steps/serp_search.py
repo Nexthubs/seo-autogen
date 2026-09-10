@@ -16,6 +16,7 @@ from app.db.models.job import GenerationJob
 from app.db.models.serp import SerpResult, SerpRun
 from app.providers.serp.base import SERPProvider
 from app.schemas.serp import SERPRequest, SERPResponse
+from app.services.cost_ledger import record_provider_cost
 from app.services.url_normalizer import normalize_url
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,18 @@ async def run_serp_search(
         depth=settings.dataforseo_depth,
     )
     response: SERPResponse = await provider.search(request)
+
+    # R-M02: the paid SERP call is recorded in the append-only cost ledger
+    # BEFORE any checkpoint row can be deleted by a later reset — the ledger
+    # (spec section 54) is independent of ``serp_runs``.
+    record_provider_cost(
+        session,
+        job_id=job.id,
+        provider="dataforseo",
+        step="serp_search",
+        amount=response.provider_cost,
+        detail=job.keyword,
+    )
 
     # Persist the full raw payload (spec section 12.2) so re-parsing is
     # possible without another paid SERP call.

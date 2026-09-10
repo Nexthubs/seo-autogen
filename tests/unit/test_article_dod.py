@@ -239,7 +239,7 @@ def _build_compliant_job(sess: Session) -> GenerationJob:
     writer = ArticleVersionRow(
         job_id=job.id,
         version=1,
-        stage="draft",
+        stage="writer",
         title="Anxious Attachment: A Practical Dodtest Guide",
         body_markdown=BODY,
         seo_title="Anxious Attachment Dodtest Guide",
@@ -381,7 +381,7 @@ def test_gate_is_read_only(session):
         ),
         (
             lambda v: v.__setattr__("body_markdown", "# Top level H1\n\n" + BODY),
-            "article: body_markdown contains an H1 line",
+            "article: body_markdown contains an H1 heading",
         ),
         (
             lambda v: v.__setattr__(
@@ -654,7 +654,38 @@ def test_se_text_h1_fails(session):
     version.body_markdown = "My title\n=======\n\n## Body\n\ntext\n"
     session.flush()
     errors = validate_article_done(session, job)
-    assert _contains(errors, "Setext H1"), errors
+    assert _contains(errors, "contains an H1 heading"), errors
+
+
+def test_single_equals_setext_h1_fails(session):
+    """R-H05: CommonMark allows a SINGLE ``=`` underline for a Setext H1
+    (``X\\n=\\n``) — the old ``={2,}`` regex missed it."""
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = "My title\n=\n\n" + BODY
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert _contains(errors, "contains an H1 heading"), errors
+
+
+def test_indented_atx_h1_fails(session):
+    """R-H05: CommonMark allows 1-3 leading spaces on an ATX H1."""
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = "   # Extra H1\n\n" + BODY
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert _contains(errors, "contains an H1 heading"), errors
+
+
+def test_h1_inside_fenced_code_is_not_an_h1(session):
+    """A ``#`` line inside a fenced code block is not a heading token."""
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = BODY + "\n```\n# not a heading\n```\n"
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert not _contains(errors, "contains an H1 heading"), errors
 
 
 def test_h2_underline_is_not_an_h1(session):
@@ -666,8 +697,7 @@ def test_h2_underline_is_not_an_h1(session):
     version.body_markdown = body
     session.flush()
     errors = validate_article_done(session, job)
-    assert not _contains(errors, "Setext H1"), errors
-    assert not _contains(errors, "contains an H1 line"), errors
+    assert not _contains(errors, "contains an H1 heading"), errors
 
 
 def test_faq_with_too_few_questions_fails(session):
@@ -686,8 +716,8 @@ def test_faq_with_too_few_questions_fails(session):
     ), errors
 
 
-def test_faq_empty_answers_do_not_lower_count(session):
-    """Question count is by ### heading, but a missing FAQ heading fails."""
+def test_faq_missing_section_fails(session):
+    """Question count is by token heading, but a missing FAQ heading fails."""
     job = _job(session)
     version = _final_version(session, job)
     # Drop the FAQ heading entirely.
@@ -698,6 +728,51 @@ def test_faq_empty_answers_do_not_lower_count(session):
     session.flush()
     errors = validate_article_done(session, job)
     assert _contains(errors, "no FAQ section"), errors
+
+
+def test_faq_empty_answers_fail(session):
+    """R-H05: three question titles with no answers must NOT pass the gate."""
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = (
+        "## What is anxious attachment\n\ntext\n\n"
+        "## Practical steps for dodtest\n\ntext\n\n"
+        "## FAQ\n\n### First question?\n\n### Second question?\n\n"
+        "### Third question?\n"
+    )
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert _contains(errors, "3 question(s) without an answer"), errors
+
+
+def test_faq_partially_answered_fails(session):
+    """R-H05: at least one unanswered question is enough to fail."""
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = (
+        "## What is anxious attachment\n\ntext\n\n"
+        "## Practical steps for dodtest\n\ntext\n\n"
+        "## FAQ\n\n### First?\n\nanswer one\n\n### Second?\n\n### Third?\n\n"
+        "answer three\n"
+    )
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert _contains(errors, "1 question(s) without an answer"), errors
+
+
+def test_faq_list_answer_counts(session):
+    """A bulleted answer is still an answer (token-based content check)."""
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = (
+        "## What is anxious attachment\n\ntext\n\n"
+        "## Practical steps for dodtest\n\ntext\n\n"
+        "## FAQ\n\n### First?\n\n- point one\n- point two\n\n"
+        "### Second?\n\nanswer\n\n### Third?\n\nanswer\n"
+    )
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert not _contains(errors, "without an answer"), errors
 
 
 def test_cta_slot_section_without_content_fails(session):
@@ -765,3 +840,165 @@ def test_image_local_path_none_fails(session):
     session.flush()
     errors = validate_article_done(session, job)
     assert _contains(errors, "hero image local_path is missing"), errors
+
+
+# ----------------------------------------------------------------------
+# R-H05: reviews must belong to the CURRENT writer draft
+# ----------------------------------------------------------------------
+def _writer_version(session: Session, job: GenerationJob) -> ArticleVersionRow:
+    return session.scalars(
+        select(ArticleVersionRow).where(
+            ArticleVersionRow.job_id == job.id,
+            ArticleVersionRow.stage == "writer",
+        )
+    ).one()
+
+
+def _add_version(
+    session: Session,
+    job: GenerationJob,
+    version: int,
+    stage: str,
+) -> ArticleVersionRow:
+    row = ArticleVersionRow(
+        job_id=job.id,
+        version=version,
+        stage=stage,
+        title="Anxious Attachment: A Practical Dodtest Guide",
+        body_markdown=BODY,
+        seo_title="Anxious Attachment Dodtest Guide",
+        meta_description="Practical dodtest guide for anxious attachment.",
+        slug="dodtest-anxious-attachment",
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def test_r_h05_old_writer_reviews_do_not_satisfy_new_writer(session):
+    """Audit reproduction: writer v3 + revision v4, seo/fact/style only on the
+    old v1 writer, anticopy on v4 → the gate must FAIL (it used to return [])."""
+    job = _job(session)
+    writer_v3 = _add_version(session, job, 3, "writer")
+    revision_v4 = _add_version(session, job, 4, "revision")
+    session.add(
+        ArticleReviewRow(
+            job_id=job.id,
+            article_version_id=revision_v4.id,
+            review_type="anticopy",
+            review={"matches": [], "has_serious_overlap": False},
+        )
+    )
+    session.flush()
+
+    errors = validate_article_done(session, job)
+    for rtype in ("seo", "fact", "style"):
+        assert _contains(
+            errors, f"article: missing {rtype} review for the current writer draft v3"
+        ), errors
+    assert writer_v3.version == 3
+
+
+def test_r_h05_reviews_on_current_writer_satisfy_the_gate(session):
+    """The same layout passes once the three reviews exist on v3."""
+    job = _job(session)
+    writer_v3 = _add_version(session, job, 3, "writer")
+    revision_v4 = _add_version(session, job, 4, "revision")
+    for rtype in ("seo", "fact", "style"):
+        session.add(
+            ArticleReviewRow(
+                job_id=job.id,
+                article_version_id=writer_v3.id,
+                review_type=rtype,
+                review={"ok": True},
+            )
+        )
+    session.add(
+        ArticleReviewRow(
+            job_id=job.id,
+            article_version_id=revision_v4.id,
+            review_type="anticopy",
+            review={"matches": [], "has_serious_overlap": False},
+        )
+    )
+    session.flush()
+    assert validate_article_done(session, job) == []
+
+
+# ----------------------------------------------------------------------
+# R-M03: append-only review history + current-valid derivation
+# ----------------------------------------------------------------------
+def test_r_m03_review_retry_appends_and_keeps_history(session):
+    from app.pipeline.steps._article_common import (
+        latest_review,
+        persist_review,
+        review_lineage,
+    )
+
+    job = _job(session)
+    writer = _writer_version(session, job)
+    original = session.scalars(
+        select(ArticleReviewRow).where(
+            ArticleReviewRow.article_version_id == writer.id,
+            ArticleReviewRow.review_type == "fact",
+        )
+    ).one()
+    original_id = original.id
+    assert original.attempt == 1
+
+    persist_review(
+        session,
+        job,
+        writer,
+        review_type="fact",
+        review={"issues": [{"quote_or_claim": "REPLACEMENT"}]},
+    )
+    session.flush()
+
+    rows = session.scalars(
+        select(ArticleReviewRow)
+        .where(
+            ArticleReviewRow.article_version_id == writer.id,
+            ArticleReviewRow.review_type == "fact",
+        )
+        .order_by(ArticleReviewRow.attempt)
+    ).all()
+    # Both runs are preserved (the old row is NOT deleted).
+    assert [r.attempt for r in rows] == [1, 2]
+    assert original_id in {r.id for r in rows}
+
+    # The current valid verdict is the newest attempt.
+    current = latest_review(session, job, writer, "fact")
+    assert current["issues"][0]["quote_or_claim"] == "REPLACEMENT"
+
+    lineage = review_lineage(session, job, writer)
+    assert lineage["fact"]["attempt"] == 2
+    assert lineage["fact"]["review_id"] == str(rows[1].id)
+
+
+def test_r_m03_latest_anticopy_attempt_wins(session):
+    from app.pipeline.steps._article_common import persist_review
+
+    job = _job(session)
+    final = _final_version(session, job)
+    persist_review(
+        session,
+        job,
+        final,
+        review_type="anticopy",
+        review={"matches": [1], "has_serious_overlap": True},
+    )
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert _contains(errors, "anti-copy check reports serious overlap"), errors
+
+    # A newer clean attempt supersedes the flagged one.
+    persist_review(
+        session,
+        job,
+        final,
+        review_type="anticopy",
+        review={"matches": [], "has_serious_overlap": False},
+    )
+    session.flush()
+    assert validate_article_done(session, job) == []

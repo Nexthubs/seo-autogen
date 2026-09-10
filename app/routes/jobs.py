@@ -664,6 +664,8 @@ def job_detail_payload(session: Session, job: GenerationJob) -> dict:
             "confidence": en.confidence,
             "usage": en.usage,
             "note": en.note,
+            "verification_status": en.verification_status,
+            "supporting_excerpt": en.supporting_excerpt,
         }
         for en in session.scalars(
             select(EvidenceNoteRow)

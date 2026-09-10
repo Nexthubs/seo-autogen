@@ -11,6 +11,7 @@ from app.db.models.article import (
     ArticleReviewRow,
     ArticleVersionRow,
 )  # noqa: F401
+from app.db.models.cost import ProviderCostEventRow  # noqa: F401
 from app.db.models.images import ImageRow  # noqa: F401
 from app.db.models.internal_link import InternalLinkRule  # noqa: F401
 from app.db.models.job import GenerationJob  # noqa: F401
@@ -41,6 +42,7 @@ __all__ = [
     "Keyword",
     "KeywordCluster",
     "LLMUsageRow",
+    "ProviderCostEventRow",
     "SerpResult",
     "SerpRun",
     "SerpSynthesisRow",

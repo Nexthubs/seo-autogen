@@ -54,6 +54,14 @@ class ArticleVersionRow(Base):
     prompt_version: Mapped[str | None] = mapped_column(VARCHAR(32), nullable=True)
     prompt_hash: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True)
 
+    #: R-M03: which review rows (per type) this revision was produced from.
+    #: A retry of a review appends a new attempt instead of deleting the old
+    #: verdict, so a revision must record the exact attempt set it consumed —
+    #: otherwise an old revision cannot be traced to the reviews that shaped
+    #: it once newer attempts exist. Shape:
+    #: ``{"seo": {"review_id": "<uuid>", "attempt": 1}, ...}``.
+    based_on_reviews: Mapped[dict | None] = mapped_column(_JSONB, nullable=True)
+
     created_at: Mapped[datetime] = created_at_column()
 
     @property
@@ -101,6 +109,14 @@ class ArticleReviewRow(Base):
     model: Mapped[str | None] = mapped_column(VARCHAR(128), nullable=True)
     prompt_version: Mapped[str | None] = mapped_column(VARCHAR(32), nullable=True)
     prompt_hash: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True)
+
+    #: R-M03: append-only run history. Re-running a review for the same
+    #: (version, type) appends attempt N+1 instead of deleting attempt N, so
+    #: an older revision can still be traced to the review set it used. The
+    #: "current valid" verdict is the highest attempt.
+    attempt: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
 
     created_at: Mapped[datetime] = created_at_column()
 

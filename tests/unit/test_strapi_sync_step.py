@@ -667,3 +667,181 @@ async def test_verify_accepts_absolute_url_main_image(db, tmp_path):
     row = await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
     assert row.sync_status == StrapiSyncStatus.DRAFT_CREATED.value
     assert job.status == JobStatus.STRAPI_DRAFT_CREATED.value
+
+
+# ============================================================ R-H02: any exception
+class _CrashingProvider(FakeStrapiProvider):
+    """Raises a NON-PipelineError from the hero upload (e.g. an unexpected
+    provider payload shape)."""
+
+    async def upload_hero(self, *args, **kwargs):
+        raise RuntimeError("unexpected payload shape")
+
+
+async def test_r_h02_unexpected_error_lands_in_failed_state(db, tmp_path):
+    """R-H02: a non-PipelineError must still persist the unified failure state
+    (job strapi_sync_failed + sync row FAILED + documentId kept), not leave the
+    job stranded in ``strapi_syncing`` with the worker merely logging a crash."""
+    job = _job(db)
+    provider = _CrashingProvider()
+
+    with pytest.raises(RuntimeError):
+        await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+
+    assert job.status == JobStatus.STRAPI_SYNC_FAILED.value
+    assert job.error_code == "UNEXPECTED"
+    assert job.error_raw  # full traceback retained (redacted)
+    assert "RuntimeError" in job.error_message
+    row = db.scalars(select(StrapiSyncRow)).first()
+    assert row is not None
+    assert row.sync_status == StrapiSyncStatus.FAILED.value
+    # the draft was created before the crash: the retry anchor is preserved
+    assert row.strapi_document_id == "doc-42"
+
+
+# ============================================================ R-H03: failed row retry
+async def test_r_h03_precheck_failure_then_retry_reuses_row(db, tmp_path):
+    """R-H03 (audit reproduction): first attempt fails the author pre-check and
+    persists a FAILED row with ``documentId=None``. After fixing the config, the
+    retry creates the draft and writes the id back onto the SAME row — no
+    UNIQUE(job_id) violation, no second local row."""
+    job = _job(db)
+    job.author_document_id = None
+    failing = FakeStrapiProvider()
+    settings = _settings(tmp_path, strapi_default_author_document_id="")
+
+    with pytest.raises(PipelineError):
+        await run_strapi_sync(db, job, failing, settings=settings)
+    first = db.scalars(select(StrapiSyncRow)).all()
+    assert len(first) == 1
+    assert first[0].strapi_document_id is None
+    assert first[0].sync_status == StrapiSyncStatus.FAILED.value
+
+    # Fix the config and retry with a fresh provider.
+    job.author_document_id = "doc-author-1"
+    db.commit()
+    good = FakeStrapiProvider()
+    row = await run_strapi_sync(db, job, good, settings=_settings(tmp_path))
+
+    rows = db.scalars(select(StrapiSyncRow)).all()
+    assert len(rows) == 1, "retry must not create a duplicate strapi_syncs row"
+    assert rows[0].id == first[0].id
+    assert row.strapi_document_id == "doc-42"
+    assert len(good.created) == 1
+    assert job.status == JobStatus.STRAPI_DRAFT_CREATED.value
+
+
+async def test_r_h03_create_http_failure_then_retry_succeeds(db, tmp_path):
+    """R-H03: an HTTP create failure (no documentId stored) followed by a
+    successful retry reuses the same local row."""
+
+    class _CreateFailing(FakeStrapiProvider):
+        async def create_draft_entry(self, payload):
+            self.created.append(payload)
+            raise PipelineError(
+                ErrorCode.STRAPI_DRAFT_CREATE_FAILED, "create HTTP 500"
+            )
+
+    job = _job(db)
+    with pytest.raises(PipelineError):
+        await run_strapi_sync(
+            db, job, _CreateFailing(), settings=_settings(tmp_path)
+        )
+    rows = db.scalars(select(StrapiSyncRow)).all()
+    assert len(rows) == 1
+    assert rows[0].strapi_document_id is None
+    assert rows[0].sync_status == StrapiSyncStatus.FAILED.value
+
+    provider = FakeStrapiProvider()
+    row = await run_strapi_sync(db, job, provider, settings=_settings(tmp_path))
+    assert len(db.scalars(select(StrapiSyncRow)).all()) == 1
+    assert row.strapi_document_id == "doc-42"
+    assert job.status == JobStatus.STRAPI_DRAFT_CREATED.value
+
+
+async def test_r_h02_full_sync_with_real_provider_standard_201_array(db, tmp_path):
+    """R-H02: end-to-end A–F sync through the REAL ``StrapiCMSProvider`` whose
+    MockTransport answers with STANDARD Strapi 5 shapes — including the
+    top-level upload ARRAY with HTTP 201 that used to crash the parser."""
+    import httpx
+
+    from app.providers.cms.strapi_cms import StrapiCMSProvider
+
+    state: dict = {"seq": 0, "doc": None, "main_image": None}
+
+    def _flat() -> dict:
+        doc = state["doc"] or {}
+        return {
+            "id": 42,
+            "documentId": "doc-42",
+            "status": "draft",
+            "slug": doc.get("slug"),
+            "title": doc.get("title"),
+            "body": doc.get("body"),
+            "metaTitle": doc.get("metaTitle"),
+            "metaDescription": doc.get("metaDescription"),
+            "seoKeywords": doc.get("seoKeywords"),
+            "author": {"id": 1, "documentId": doc.get("author")},
+            "category": {"id": 2, "documentId": doc.get("category")},
+            "mainImage": state["main_image"],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if method == "GET" and path == "/api/blogs":
+            return httpx.Response(200, json={"data": [], "meta": {}})
+        if method == "POST" and path == "/api/blogs":
+            state["doc"] = dict(json.loads(request.content)["data"])
+            return httpx.Response(201, json={"data": _flat()})
+        if method == "POST" and path == "/api/upload":
+            state["seq"] += 1
+            n = state["seq"]
+            raw = request.content.decode("utf-8", "ignore")
+            url = f"/uploads/file-{n}.webp"
+            if 'name="field"' in raw and "mainImage" in raw:
+                state["main_image"] = {
+                    "id": 900 + n,
+                    "documentId": f"media-{n}",
+                    "url": url,
+                }
+            # STANDARD Strapi upload controller response: top-level array, 201.
+            return httpx.Response(
+                201,
+                json=[
+                    {
+                        "id": 900 + n,
+                        "documentId": f"media-{n}",
+                        "url": url,
+                        "alternativeText": "alt",
+                    }
+                ],
+            )
+        if method == "PUT" and path.startswith("/api/blogs/"):
+            state["doc"].update(json.loads(request.content)["data"])
+            return httpx.Response(200, json={"data": _flat()})
+        if method == "GET" and path.startswith("/api/blogs/"):
+            return httpx.Response(200, json={"data": _flat()})
+        return httpx.Response(404, json={"error": "not found"})
+
+    settings = _settings(tmp_path)
+    provider = StrapiCMSProvider(
+        settings=settings,
+        client=httpx.AsyncClient(
+            base_url=BASE, transport=httpx.MockTransport(handler)
+        ),
+        backoff_seconds=(0.001, 0.001, 0.001),
+    )
+    job = _job(db)
+    row = await run_strapi_sync(db, job, provider, settings=settings)
+    await provider.aclose()
+
+    assert row.sync_status == StrapiSyncStatus.DRAFT_CREATED.value
+    assert row.strapi_document_id == "doc-42"
+    assert job.status == JobStatus.STRAPI_DRAFT_CREATED.value
+    # hero + both inline uploads parsed from the top-level arrays
+    rows = {r.filename: r for r in _image_rows(db)}
+    assert rows["hero.webp"].strapi_url == BASE + "/uploads/file-1.webp"
+    assert rows["hero.webp"].strapi_media_id == 901
+    assert rows["inline-1.webp"].strapi_url == BASE + "/uploads/file-2.webp"
+    assert rows["inline-2.webp"].strapi_url == BASE + "/uploads/file-3.webp"

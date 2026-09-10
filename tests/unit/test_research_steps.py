@@ -545,10 +545,18 @@ async def test_evidence_research_no_verifier_keeps_notes(db, job):
 
 
 async def test_evidence_research_verified_source_kept(db, job):
-    # Reachable source with real content → note kept as reported.
+    # Reachable source whose body actually corroborates the title + claim →
+    # note kept as reported (R-H06: non-empty text alone is NOT enough).
     await _prep_research(db, job)
     url = EVIDENCE_NOTES[0]["source_url"]
-    verifier = _FakeVerifier({url: "Real study content found."})
+    verifier = _FakeVerifier(
+        {
+            url: (
+                "Hazan and Shaver (1987) found that attachment styles shape "
+                "adult romantic relationships across the lifespan."
+            )
+        }
+    )
     llm = FakeLLM([json.dumps({"notes": EVIDENCE_NOTES[:1]})])
     try:
         notes = await run_evidence_research(db, job, llm, verifier=verifier)
@@ -557,11 +565,15 @@ async def test_evidence_research_verified_source_kept(db, job):
     assert notes[0].confidence == "high"
     assert notes[0].usage == "supported"
     assert notes[0].note == "cite properly"  # unchanged
+    assert notes[0].verification_status == "supported"
+    assert "attachment styles" in (notes[0].supporting_excerpt or "")
     row = db.scalars(
         select(EvidenceNoteRow).where(EvidenceNoteRow.job_id == job.id)
     ).first()
     assert row.usage == "supported"
     assert row.confidence == "high"
+    assert row.verification_status == "supported"
+    assert row.supporting_excerpt
 
 
 async def test_evidence_research_unreachable_source_downgraded(db, job):
@@ -612,6 +624,51 @@ async def test_evidence_research_fetch_exception_downgraded(db, job):
     assert notes[0].usage == "avoid"
     assert notes[0].confidence == "low"
     assert "fetch failed" in (notes[0].note or "")
+
+
+# --- R-H06: reachable-but-unsupporting sources must be downgraded ----------
+async def test_r_h06_reachable_but_irrelevant_source_softened(db, job):
+    # A live page that does not corroborate the proposed paper/number must not
+    # ship as high/supported (the audit's "Welcome to our homepage" case).
+    await _prep_research(db, job)
+    url = EVIDENCE_NOTES[0]["source_url"]
+    verifier = _FakeVerifier({url: "Welcome to our homepage. Contact us."})
+    llm = FakeLLM([json.dumps({"notes": EVIDENCE_NOTES[:1]})])
+    try:
+        notes = await run_evidence_research(db, job, llm, verifier=verifier)
+    finally:
+        await llm.aclose()
+    assert notes[0].usage == "soften"
+    assert notes[0].confidence == "low"
+    assert notes[0].verification_status == "unsupported"
+    assert notes[0].supporting_excerpt
+    row = db.scalars(
+        select(EvidenceNoteRow).where(EvidenceNoteRow.job_id == job.id)
+    ).first()
+    assert row.usage == "soften"
+    assert row.verification_status == "unsupported"
+    assert row.supporting_excerpt
+
+
+async def test_r_h06_contradicting_source_avoided(db, job):
+    await _prep_research(db, job)
+    url = EVIDENCE_NOTES[0]["source_url"]
+    verifier = _FakeVerifier(
+        {
+            url: (
+                "There is no evidence that attachment styles affect adult "
+                "relationships in the general population."
+            )
+        }
+    )
+    llm = FakeLLM([json.dumps({"notes": EVIDENCE_NOTES[:1]})])
+    try:
+        notes = await run_evidence_research(db, job, llm, verifier=verifier)
+    finally:
+        await llm.aclose()
+    assert notes[0].usage == "avoid"
+    assert notes[0].verification_status == "contradicted"
+    assert "source_contradicted" in (notes[0].note or "")
 
 
 # ============================================================
