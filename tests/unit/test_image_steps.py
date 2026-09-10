@@ -155,9 +155,7 @@ class FakeLLM:
         await self._provider.aclose()
 
 
-PNG_1x1_BYTES = (
-    b"\x89PNG\r\n\x1a\n" + b"fake-png-body-for-tests" * 3
-)
+PNG_1x1_BYTES = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xe0\x12\x91\x03\x00\x00h\x00=T\x08\xa3\xf7\x00\x00\x00\x00IEND\xaeB`\x82'
 
 
 class FakeImageProvider:
@@ -175,7 +173,7 @@ class FakeImageProvider:
                 ErrorCode.IMAGE_PROVIDER_FAILED,
                 f"boom generating {request.filename}",
             )
-        path = save_image_bytes(
+        path, mime = save_image_bytes(
             request.job_id or "nojob",
             PNG_1x1_BYTES,
             request.filename,
@@ -184,7 +182,8 @@ class FakeImageProvider:
         return GeneratedImage(
             local_path=str(path),
             filename=request.filename,
-            mime_type="image/png",
+            # M07: .webp filenames are transcoded to real WebP by storage.
+            mime_type=mime,
             prompt=request.prompt,
             provider="fake-image-model",
             provider_request_id=f"fake-{request.filename}",
@@ -372,7 +371,9 @@ async def test_generation_hero_only_short_article(db, tmp_path):
     assert rows[0].local_path.endswith("hero.webp")
     assert rows[0].provider == "fake-image-model"
     assert rows[0].provider_request_id == "fake-hero.webp"
-    assert job.status == JobStatus.READY.value
+    # H05: the step no longer marks ready — the orchestrator sets READY in
+    # the same transaction as the DoD gate; the job stays image_generating.
+    assert job.status == JobStatus.IMAGE_GENERATING.value
 
     article_md = (tmp_path / "articles" / str(job.id) / "article.md").read_text()
     # Hero NOT in the body (default flag true) and no residual markers.
@@ -411,7 +412,9 @@ async def test_generation_markers_resolved_in_body(db, tmp_path):
     assert "[[IMAGE:" not in article_md
     # Hero stays out of the body (default flag true).
     assert "images/hero.webp" not in article_md
-    assert job.status == JobStatus.READY.value
+    # H05: the step no longer marks ready — the orchestrator sets READY in
+    # the same transaction as the DoD gate; the job stays image_generating.
+    assert job.status == JobStatus.IMAGE_GENERATING.value
 
 
 async def test_h07_export_resolves_internal_link_markers(db, tmp_path):
@@ -455,7 +458,9 @@ async def test_h07_export_resolves_internal_link_markers(db, tmp_path):
     assert "[[IMAGE:" not in article_md
     # images still resolved
     assert "![Inline one alt](images/inline-1.webp)" in article_md
-    assert job.status == JobStatus.READY.value
+    # H05: the step no longer marks ready — the orchestrator sets READY in
+    # the same transaction as the DoD gate; the job stays image_generating.
+    assert job.status == JobStatus.IMAGE_GENERATING.value
 
 
 async def test_h07_export_unknown_internal_link_marker_fails(db, tmp_path):
@@ -525,8 +530,16 @@ async def test_generation_failure_keeps_image_generating(db, tmp_path):
     # Re-run with a healthy provider succeeds from the image step.
     provider2 = FakeImageProvider(settings)
     rows = await run_image_generation(db, job, provider2, settings=settings)
-    assert job.status == JobStatus.READY.value
-    assert len(provider2.requests) == 3
+    # H05: the step no longer marks ready — the orchestrator sets READY in
+    # the same transaction as the DoD gate; the job stays image_generating.
+    assert job.status == JobStatus.IMAGE_GENERATING.value
+    # M06: the hero file survived the first attempt, so ONLY the two
+    # inline images are regenerated — no paid call for a good file.
+    assert len(provider2.requests) == 2
+    assert {r.filename for r in provider2.requests} == {
+        "inline-1.webp",
+        "inline-2.webp",
+    }
 
 
 async def test_generation_requires_plan(db, tmp_path):
@@ -594,3 +607,63 @@ def test_resolve_markers_and_drop_unknown():
     assert "![alt1](images/inline-1.webp)" in out
     assert "ghost" not in out
     assert "[[IMAGE:" not in out
+
+
+# ------------------------------------------------------------------- M06 / M07
+async def test_m07_webp_filename_gets_real_webp_bytes(db, tmp_path):
+    """M07: a ``.webp`` filename MUST hold real WebP bytes.
+
+    The fake provider writes a PNG payload; storage must transcode it to
+    genuine WebP so the extension, header and MIME all agree.
+    """
+    job = db.scalars(select(GenerationJob)).one()
+    body = (
+        "## What is anxious attachment\n\n"
+        + "A real paragraph that explains the concept here. " * 350
+    )
+    _add_version(db, job, body)
+    settings = _settings(tmp_path)
+    llm = FakeLLM([json.dumps(PLAN_THREE)], settings)
+    await run_image_planner(db, job, llm)
+    await llm.aclose()
+
+    rows = await run_image_generation(db, job, FakeImageProvider(settings), settings=settings)
+    for row in rows:
+        p = __import__("pathlib").Path(row.local_path)
+        data = p.read_bytes()
+        # Real WebP: RIFF....WEBP magic, decodable, MIME agrees with .webp.
+        assert data[:4] == b"RIFF" and data[8:12] == b"WEBP", row.filename
+        from app.services.image_storage import validate_local_image
+
+        assert validate_local_image(row.local_path) == "image/webp"
+        assert row.mime_type == "image/webp"
+
+
+async def test_m07_corrupt_or_mismatched_file_regenerates(db, tmp_path):
+    """M06 + M07: a row whose local file is corrupt or has the WRONG
+    format is NOT reused — it is regenerated (and re-transcoded)."""
+    job = db.scalars(select(GenerationJob)).one()
+    body = (
+        "## What is anxious attachment\n\n"
+        + "A real paragraph that explains the concept here. " * 350
+    )
+    _add_version(db, job, body)
+    settings = _settings(tmp_path)
+    llm = FakeLLM([json.dumps(PLAN_HERO_ONLY)], settings)
+    await run_image_planner(db, job, llm)
+    await llm.aclose()
+
+    # First run: hero.webp is a real (transcoded) WebP.
+    await run_image_generation(db, job, FakeImageProvider(settings), settings=settings)
+
+    # Corrupt the hero file in place (PNG bytes inside a .webp name) so the
+    # re-run must detect the mismatch and regenerate it.
+    hero = db.scalars(select(ImageRow).where(ImageRow.job_id == job.id)).one()
+    __import__("pathlib").Path(hero.local_path).write_bytes(PNG_1x1_BYTES)
+
+    provider2 = FakeImageProvider(settings)
+    rows = await run_image_generation(db, job, provider2, settings=settings)
+    # The mismatched hero was regenerated (not reused).
+    assert [r.filename for r in provider2.requests] == ["hero.webp"]
+    fixed = __import__("pathlib").Path(rows[0].local_path).read_bytes()
+    assert fixed[:4] == b"RIFF" and fixed[8:12] == b"WEBP"

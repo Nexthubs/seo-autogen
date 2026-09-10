@@ -24,6 +24,7 @@ dependencies = [
     "rapidfuzz>=3.6",
     "python-multipart>=0.0.9",
     "markdown-it-py>=3.0",
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]

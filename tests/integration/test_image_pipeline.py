@@ -161,7 +161,10 @@ async def test_image_pipeline_full_run(env, tmp_path):
         rows = await run_image_generation(session, job, provider,
                                           settings=settings)
 
-        assert job.status == JobStatus.READY.value
+        # H05: the step no longer marks READY (the orchestrator sets it in
+        # the same transaction as the DoD gate); the job stays
+        # image_generating when the step is driven directly.
+        assert job.status == JobStatus.IMAGE_GENERATING.value
         job_id = job.id
         filenames = [r.filename for r in rows]
 
@@ -169,6 +172,11 @@ async def test_image_pipeline_full_run(env, tmp_path):
     img_dir = tmp_path / "articles" / str(job_id) / "images"
     for name in ("hero.webp", "inline-1.webp", "inline-2.webp"):
         assert (img_dir / name).exists(), name
+    # L01: the research JSONs are exported next to the article too.
+    job_dir = tmp_path / "articles" / str(job_id)
+    for name in ("content-brief.json", "outline.json", "serp.json",
+                 "review.json", "sources.json"):
+        assert (job_dir / name).exists(), f"missing {name}"
     assert filenames == ["hero.webp", "inline-1.webp", "inline-2.webp"]
 
     article_md = (tmp_path / "articles" / str(job_id) / "article.md").read_text()
@@ -189,7 +197,8 @@ async def test_image_pipeline_full_run(env, tmp_path):
         assert len(rows) == 3
         for row in rows:
             assert row.local_path.endswith(row.filename)
-            assert row.mime_type == "image/png"
+            # M07: .webp filenames hold real WebP bytes (transcoded).
+            assert row.mime_type == "image/webp"
             assert row.provider == "fake-image-model"
             assert row.provider_request_id
             assert row.strapi_url is None

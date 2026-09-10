@@ -19,8 +19,7 @@ FAST_BACKOFF = (0.001, 0.001, 0.001)
 
 #: 1x1 transparent PNG.
 PNG_1x1 = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4"
-    "nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg=="
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPgEpEDAABoAD1UCKP3AAAAAElFTkSuQmCC"
 )
 
 
@@ -96,8 +95,12 @@ async def test_generate_stores_file_section34(tmp_path):
 
     # data/articles/{job}/images/hero.webp (section 34)
     assert image.local_path.endswith("articles/job-1/images/hero.webp")
-    assert (tmp_path / "articles/job-1/images/hero.webp").read_bytes() == PNG_1x1
-    assert image.mime_type == "image/png"
+    # M07: a .webp filename holds REAL WebP bytes even though the API
+    # returned a PNG payload — storage transcodes, mime reports the truth.
+    stored = (tmp_path / "articles/job-1/images/hero.webp").read_bytes()
+    assert stored != PNG_1x1
+    assert stored[:4] == b"RIFF" and stored[8:12] == b"WEBP"
+    assert image.mime_type == "image/webp"
     assert image.provider == "gpt-image-2"
     assert image.provider_request_id == "gen-123"
     # Auth header sent exactly once, key present (never logged — tested
@@ -131,6 +134,64 @@ async def test_generate_url_payload(tmp_path):
         await provider.aclose()
     assert seen == ["/v1/img.png"]
     assert (tmp_path / "articles/job-2/images/inline-1.webp").exists()
+
+
+async def test_download_never_sends_api_key_to_response_url(tmp_path):
+    """H10 / spec section 60: the Images API key authenticates only the
+    generation endpoint. A response URL (same-origin, cross-origin, or
+    presigned) must be downloaded WITHOUT the Bearer credential."""
+    downloads = []
+
+    for target in (
+        "http://image.test/v1/img.png",            # same-origin CDN
+        "http://cdn.other.example.com/img.webp",   # third-party CDN
+        "https://presigned.example.com/bucket/hero?sig=abc",  # presigned URL
+    ):
+        def make_handler(t=target):
+            def h(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/v1/images/generations":
+                    return httpx.Response(
+                        200,
+                        json={"id": "gen-x", "data": [{"url": t}]},
+                    )
+                downloads.append((str(request.url), request.headers.get("authorization")))
+                return httpx.Response(200, content=PNG_1x1)
+            return h
+
+        provider = _make(make_handler(), str(tmp_path))
+        try:
+            await provider.generate(
+                ImageGenerationRequest(
+                    prompt="p", filename="h.webp", job_id=f"job-{target[:20]}"
+                )
+            )
+        finally:
+            await provider.aclose()
+
+    assert len(downloads) == 3
+    for url, auth in downloads:
+        assert auth is None  # the credential must NEVER leave for a URL fetch
+
+
+async def test_download_404_is_provider_failed(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/images/generations":
+            return httpx.Response(
+                200,
+                json={"id": "gen-404", "data": [{"url": "http://image.test/v1/gone.png"}]},
+            )
+        return httpx.Response(404)
+
+    provider = _make(handler, str(tmp_path))
+    try:
+        with pytest.raises(PipelineError) as excinfo:
+            await provider.generate(
+                ImageGenerationRequest(prompt="p", filename="h.webp", job_id="job-3")
+            )
+    finally:
+        await provider.aclose()
+    assert excinfo.value.error_code == ErrorCode.IMAGE_PROVIDER_FAILED
+    assert "404" in excinfo.value.message
 
 
 async def test_generate_retries_on_429_then_succeeds(tmp_path):

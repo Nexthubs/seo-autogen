@@ -205,9 +205,44 @@ def test_api_job_serp_and_sources_empty(client):
 
 def test_api_sync_strapi_enqueues(client):
     job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    _set_status(client, job_id, "ready")
     response = client.post(f"/api/jobs/{job_id}/sync-strapi")
     assert response.status_code == 200
     assert response.json()["enqueued"] is True
+    assert client.enqueued_syncs == [job_id]
+
+
+def test_api_sync_strapi_failed_job_409(client):
+    """H05: a failed pipeline job's body failed the DoD gate — the push
+    endpoint must refuse it (409), not enqueue a CMS write."""
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    _set_status(client, job_id, "failed")
+    response = client.post(f"/api/jobs/{job_id}/sync-strapi")
+    assert response.status_code == 409
+    assert client.enqueued_syncs == []
+
+
+def test_api_sync_strapi_cancelled_job_409(client):
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    _set_status(client, job_id, "cancelled")
+    assert client.post(f"/api/jobs/{job_id}/sync-strapi").status_code == 409
+    assert client.enqueued_syncs == []
+
+
+def test_api_sync_strapi_non_terminal_status_409(client):
+    """H05: mid-pipeline (non-terminal) statuses are not syncable either."""
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    # created job is 'queued'
+    assert client.post(f"/api/jobs/{job_id}/sync-strapi").status_code == 409
+    assert client.enqueued_syncs == []
+
+
+def test_api_sync_strapi_draft_created_repush(client):
+    """H05: an already-synced draft may be re-pushed (the update path)."""
+    job_id = client.post("/api/jobs", json=_new_job_payload()).json()["job_id"]
+    _set_status(client, job_id, "strapi_draft_created")
+    response = client.post(f"/api/jobs/{job_id}/sync-strapi")
+    assert response.status_code == 200
     assert client.enqueued_syncs == [job_id]
 
 

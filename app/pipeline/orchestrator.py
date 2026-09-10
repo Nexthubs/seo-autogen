@@ -420,7 +420,8 @@ async def run_job_pipeline(
         session.refresh(job)
         # DoD gate (section 63) — the single point of admission to READY
         # for every pipeline run (fresh run, retry, resume, and the
-        # no-rework backfill where the image step already marked READY):
+        # no-rework backfill where every step was already checkpointed;
+        # H05: the READY commit happens below, in this same transaction):
         # every SERP / Research / Article / Images bullet must hold.
         # Failure -> FAILED with ARTICLE_VALIDATION_FAILED; checkpoints
         # stay intact, so retrying a step recovers (section 9).
@@ -430,12 +431,15 @@ async def run_job_pipeline(
                 ErrorCode.ARTICLE_VALIDATION_FAILED,
                 "Definition of Done not met: " + "; ".join(dod_errors),
             )
+        # H05: READY is set HERE — in the same transaction as the DoD
+        # gate above — for every run shape (fresh, retry, resume, and the
+        # no-rework backfill where every step was already checkpointed).
+        # The image step itself no longer commits READY, so a crash can
+        # never leave an ungated READY row.
         if job.status != JobStatus.READY.value:
-            # A resume that found every step already checkpointed (e.g. the
-            # run was cancelled after step 15) ends ready without rework.
             job.status = JobStatus.READY.value
             job.current_step = "image_generation"
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = job.completed_at or datetime.now(timezone.utc)
             session.commit()
         logger.info(
             "pipeline_done",

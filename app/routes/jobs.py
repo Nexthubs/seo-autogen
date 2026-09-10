@@ -491,12 +491,34 @@ def api_job_reviews(job_id: str, session: Session = Depends(get_db)) -> dict:
     }
 
 
+#: Job statuses the Strapi push gate admits (H05, spec section 63: only a
+#: DoD-gated article may be pushed to the CMS). ``strapi_syncing`` stays
+#: allowed as the mid-sync retry path (M01 will make a failed sync persist a
+#: terminal status instead).
+_SYNCABLE_STATUSES = {
+    JobStatus.READY.value,
+    JobStatus.STRAPI_DRAFT_CREATED.value,
+    JobStatus.STRAPI_SYNCING.value,
+}
+
+
 @router.post("/{job_id}/sync-strapi")
 def api_sync_strapi(job_id: str, session: Session = Depends(get_db)) -> dict:
-    """Enqueue the on-demand Strapi draft push (43.5). Never awaited here."""
+    """Enqueue the on-demand Strapi draft push (43.5). Never awaited here.
+
+    H05: the server-side gate — a push is only enqueued for a job in a
+    syncable state (ready / draft-created / mid-sync). A failed pipeline job
+    whose DoD gate rejected the article (or a cancelled one) gets 409, so a
+    QA-rejected body can never reach the CMS from this endpoint.
+    """
     from app.workers import article_tasks
 
     job = _get_job_or_404(session, _parse_uuid(job_id))
+    if job.status not in _SYNCABLE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job status '{job.status}' cannot be synced to Strapi",
+        )
     try:
         article_tasks.enqueue_strapi_sync(job.id)
         enqueued = True
@@ -648,7 +670,9 @@ def _strapi_payload(session: Session, job: GenerationJob, sync) -> dict:
         "state": state,
         "document_id": sync.strapi_document_id if sync else None,
         "error": sync.error_message if sync else None,
-        "can_push": job.status in ("ready", "strapi_draft_created", "failed"),
+        # H05: mirror the server-side push gate (a failed/cancelled job's
+        # body failed the DoD gate and must not be offered for push).
+        "can_push": job.status in _SYNCABLE_STATUSES,
         "can_update": bool(
             sync and sync.sync_status == "draft_created" and sync.strapi_document_id
         ),

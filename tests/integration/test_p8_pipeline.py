@@ -64,7 +64,7 @@ KEYWORD = "p8test anxious attachment no contact"
 MARKER = "[p8coach]"
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 FAST_BACKOFF = (0.001, 0.001, 0.001)
-PNG_1x1_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake-png-body" * 3
+PNG_1x1_BYTES = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xe0\x12\x91\x03\x00\x00h\x00=T\x08\xa3\xf7\x00\x00\x00\x00IEND\xaeB`\x82'
 TOP_N = 5
 ORGANIC_URLS = [f"https://p8test-site{i}.example.com/a{i}" for i in range(1, 9)]
 
@@ -329,7 +329,7 @@ class FakeImage(ImageProvider):
 
     async def generate(self, request: ImageGenerationRequest) -> GeneratedImage:
         self.requests.append(request)
-        path = save_image_bytes(
+        path, mime = save_image_bytes(
             request.job_id or "nojob",
             PNG_1x1_BYTES,
             request.filename,
@@ -338,7 +338,8 @@ class FakeImage(ImageProvider):
         return GeneratedImage(
             local_path=str(path),
             filename=request.filename,
-            mime_type="image/png",
+            # M07: .webp filenames are transcoded to real WebP by storage.
+            mime_type=mime,
             prompt=request.prompt,
             provider="fake-image-model",
             provider_request_id=f"fake-{request.filename}",
@@ -413,7 +414,15 @@ def _cleanup(job_id: uuid.UUID, tmp_path) -> None:
         session.commit()
     # Remove the local image/article exports written into the tmp data_dir.
     job_dir = Path(tmp_path) / "articles" / str(job_id)
-    for name in ("article.md", "article.json"):
+    for name in (
+        "article.md",
+        "article.json",
+        "content-brief.json",
+        "outline.json",
+        "serp.json",
+        "review.json",
+        "sources.json",
+    ):
         p = job_dir / name
         if p.exists():
             p.unlink(missing_ok=True)
@@ -508,10 +517,19 @@ async def test_full_pipeline_reaches_ready(job, tmp_path):
 
     # 15 LLM calls total (5 competitor + 10 structured).
     assert len(llm.calls) == 15
-    # Local article export written (section 34).
+    # Local article export written (section 34) — L01: the full research
+    # JSON set is on disk too, making the directory a complete offline export.
     job_dir = Path(tmp_path) / "articles" / str(job)
-    assert (job_dir / "article.md").exists()
-    assert (job_dir / "article.json").exists()
+    for name in (
+        "article.md",
+        "article.json",
+        "content-brief.json",
+        "outline.json",
+        "serp.json",
+        "review.json",
+        "sources.json",
+    ):
+        assert (job_dir / name).exists(), f"missing {name}"
 
 
 async def test_dod_gate_fails_ready_without_faq(job, tmp_path):

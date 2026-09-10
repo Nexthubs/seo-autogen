@@ -14,7 +14,10 @@ After all images succeed:
 - the local export ``article.md`` (section 5.1 / 34) is written with
   the hero OUT of the body (section 3.1/3.2, default
   ``STRAPI_FRONTEND_RENDERS_MAIN_IMAGE=true``);
-- the job moves to ``ready`` — P7 (Strapi sync) picks it up from there.
+- the job STAYS at ``image_generating``: H05 moved the ``ready``
+  transition to the orchestrator, which sets it in the same transaction
+  as the Definition-of-Done gate (spec section 63). P7 (Strapi sync)
+  picks the job up from ``ready``.
 
 A provider failure aborts the step with ``IMAGE_PROVIDER_FAILED`` and
 the job STAYS at ``image_generating`` (section 9 checkpoint: re-run
@@ -46,6 +49,22 @@ def _job_dir(job: GenerationJob, settings=None):
 
     settings = settings or get_settings()
     return Path(settings.data_dir) / "articles" / str(job.id)
+
+
+def _validated_local_image(local_path: str | None) -> tuple[str, str] | None:
+    """M06: return ``(local_path, real_mime)`` when the row's local file
+    still exists AND is a real image whose bytes match its extension
+    (M07 validation). None => regenerate this row.
+    """
+    if not local_path:
+        return None
+    try:
+        from app.services.image_storage import validate_local_image
+
+        mime = validate_local_image(local_path)
+    except PipelineError:
+        return None
+    return local_path, mime
 
 
 def load_planned_images(
@@ -91,8 +110,19 @@ async def run_image_generation(
 
     # Generate every planned image (section 51: per-image retries are
     # inside the provider; a hard failure aborts the step here).
-    results: dict[int, tuple[str, str, str]] = {}  # sort_order -> (path, mime, req_id)
+    #
+    # M06: a step re-run REUSES rows whose local file still exists and
+    # decodes as a real image — only the missing/corrupt rows are
+    # regenerated. Without this, a single failed image forced every
+    # (paid) generation to run again on retry.
+    reused: list[str] = []
     for row in planned:
+        existing = _validated_local_image(row.local_path)
+        if existing is not None:
+            row.local_path, row.mime_type = existing
+            reused.append(row.filename)
+            session.commit()
+            continue
         request = ImageGenerationRequest(
             prompt=row.prompt,
             filename=row.filename,
@@ -101,20 +131,25 @@ async def run_image_generation(
             job_id=str(job.id),
         )
         image = await provider.generate(request)
-        results[row.sort_order] = (
-            image.local_path,
-            image.mime_type,
-            image.provider_request_id or "",
-        )
         # Provenance on the row (section 9 checkpoint: partial results
-        # survive a failure; the step re-run regenerates the missing
-        # ones and overwrites the files in place).
+        # survive a failure; the step re-run regenerates only the
+        # missing ones and overwrites the files in place).
         row.local_path = image.local_path
         row.mime_type = image.mime_type
         row.provider = image.provider
         row.provider_request_id = image.provider_request_id or None
         row.provider_cost = image.provider_cost
         session.commit()
+
+    if reused:
+        logger.info(
+            "image_generation_reused_existing",
+            extra={
+                "event": "image_generation_reused_existing",
+                "job_id": str(job.id),
+                "reused": reused,
+            },
+        )
 
     # Marker body (sections 21 + 33, H07): the SHARED final renderer
     # resolves internal link markers FIRST, then image markers, then
@@ -178,7 +213,19 @@ async def run_image_generation(
         encoding="utf-8",
     )
 
-    job.status = JobStatus.READY.value
+    # L01: complete the section-34 directory with the research JSONs so the
+    # on-disk export is a self-contained offline audit (brief, outline,
+    # SERP, reviews, sources) — before this only article.md/article.json
+    # + images were written.
+    from app.services.job_artifacts import export_research_artifacts
+
+    export_research_artifacts(session, job, job_dir)
+
+    # H05: this step NO LONGER marks the job ``ready``. READY is set by the
+    # orchestrator in the SAME transaction as the Definition-of-Done gate
+    # (spec section 63) — a step commit before the gate let a crash in
+    # between leave an ungated READY row. The job stays
+    # ``image_generating`` until the orchestrator admits it.
     job.current_step = "image_generation"
     session.commit()
 

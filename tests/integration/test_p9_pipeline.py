@@ -75,7 +75,7 @@ KEYWORD = "p9test anxious attachment recovery"
 MARKER = "[p9coach]"
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 FAST_BACKOFF = (0.001, 0.001, 0.001)
-PNG_1x1_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake-png-body" * 3
+PNG_1x1_BYTES = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xe0\x12\x91\x03\x00\x00h\x00=T\x08\xa3\xf7\x00\x00\x00\x00IEND\xaeB`\x82'
 TOP_N = 5
 ORGANIC_URLS = [f"https://p9test-site{i}.example.com/a{i}" for i in range(1, 9)]
 # H09: evidence_research (step 6) verifies its single note's source URL via the
@@ -410,7 +410,7 @@ class FakeImage(ImageProvider):
 
     async def generate(self, request: ImageGenerationRequest) -> GeneratedImage:
         self.requests.append(request)
-        path = save_image_bytes(
+        path, mime = save_image_bytes(
             request.job_id or "nojob",
             PNG_1x1_BYTES,
             request.filename,
@@ -419,7 +419,8 @@ class FakeImage(ImageProvider):
         return GeneratedImage(
             local_path=str(path),
             filename=request.filename,
-            mime_type="image/png",
+            # M07: .webp filenames are transcoded to real WebP by storage.
+            mime_type=mime,
             prompt=request.prompt,
             provider="fake-image-model",
             provider_request_id=f"fake-{request.filename}",
@@ -481,7 +482,15 @@ def _cleanup(job_id: uuid.UUID, tmp_path) -> None:
         session.commit()
     # Remove the local image/article exports written into the tmp data_dir.
     job_dir = Path(tmp_path) / "articles" / str(job_id)
-    for name in ("article.md", "article.json"):
+    for name in (
+        "article.md",
+        "article.json",
+        "content-brief.json",
+        "outline.json",
+        "serp.json",
+        "review.json",
+        "sources.json",
+    ):
         p = job_dir / name
         if p.exists():
             p.unlink(missing_ok=True)
@@ -912,6 +921,36 @@ async def test_known_keyword_full_run_reaches_ready(job, tmp_path):
             fresh = session.get(GenerationJob, job)
             assert fresh.keyword_metrics_available is True
             assert fresh.status == JobStatus.READY.value
+
+        # L01: the section-34 directory is a COMPLETE offline export —
+        # the research JSONs (brief/outline/serp/review/sources) are on
+        # disk next to article.md/json, not only in the DB.
+        import json as _json
+
+        job_dir = Path(tmp_path) / "articles" / str(job)
+        for name in (
+            "article.md",
+            "article.json",
+            "content-brief.json",
+            "outline.json",
+            "serp.json",
+            "review.json",
+            "sources.json",
+        ):
+            art = job_dir / name
+            assert art.exists(), f"missing section-34 artifact {name}"
+            assert art.stat().st_size > 0, f"empty artifact {name}"
+
+        # Spot-check the exported research payloads are real, not empty.
+        serp = _json.loads((job_dir / "serp.json").read_text())
+        assert serp["runs"], "serp.json should have at least one run"
+        assert serp["runs"][0]["results"], "serp.json run should have results"
+        review = _json.loads((job_dir / "review.json").read_text())
+        assert review["reviews"], "review.json should have reviewer verdicts"
+        src = _json.loads((job_dir / "sources.json").read_text())
+        assert src["sources"], "sources.json should list job sources"
+        brief = _json.loads((job_dir / "content-brief.json").read_text())
+        assert brief, "content-brief.json should not be empty"
     finally:
         with SessionLocal() as session:
             session.execute(

@@ -26,7 +26,7 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import ErrorCode, PipelineError
 from app.providers.image.base import ImageProvider
 from app.schemas.images import GeneratedImage, ImageGenerationRequest
-from app.services.image_storage import save_image_bytes
+from app.services.image_storage import save_image_bytes, validate_image_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +63,6 @@ def _extract_cost(data: dict) -> float | None:
         return float(cost)
     return None
 
-
-#: Minimal PNG signature — sanity check for decoded bytes.
-_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-_JPEG_MAGIC = b"\xff\xd8"
-_WEBP_MAGIC = b"RIFF"
 
 
 class OpenAIImageProvider(ImageProvider):
@@ -125,18 +120,18 @@ class OpenAIImageProvider(ImageProvider):
                 "image response contained neither b64_json nor url",
             )
 
-        if not _looks_like_image(image_bytes):
-            raise PipelineError(
-                ErrorCode.IMAGE_PROVIDER_FAILED,
-                "decoded payload is not a recognizable image",
-            )
+        # M07: hard precheck (magic + decode) — the storage layer re-validates
+        # against the extension when writing.
+        validate_image_bytes(image_bytes)
 
         if not request.filename:
             raise PipelineError(
                 ErrorCode.IMAGE_PROVIDER_FAILED,
                 "request.filename is required for local storage",
             )
-        local_path = save_image_bytes(
+        # M07: the storage layer enforces the .webp contract (transcode +
+        # header/decode validation) and reports the REAL MIME.
+        local_path, real_mime = save_image_bytes(
             request.job_id or "nojob",
             image_bytes,
             request.filename,
@@ -145,7 +140,7 @@ class OpenAIImageProvider(ImageProvider):
         return GeneratedImage(
             local_path=str(local_path),
             filename=request.filename,
-            mime_type=_guess_mime(image_bytes),
+            mime_type=real_mime,
             prompt=request.prompt,
             provider=self._settings.image_model,
             provider_request_id=data.get("id"),
@@ -220,28 +215,15 @@ class OpenAIImageProvider(ImageProvider):
         )
 
     async def _download(self, url: str) -> bytes:
-        response = await self._client.get(url, headers={"Authorization": self._auth})
+        # H10 / spec section 60 (secret boundary): the Images API key
+        # authenticates ONLY the generation endpoint. A response may carry
+        # an arbitrary third-party CDN / presigned URL — sending our Bearer
+        # credential there leaks the key to a host that is not ours. The
+        # download therefore carries NO service auth header.
+        response = await self._client.get(url)
         if response.status_code != 200:
             raise PipelineError(
                 ErrorCode.IMAGE_PROVIDER_FAILED,
                 f"image download HTTP {response.status_code}",
             )
         return response.content
-
-
-def _looks_like_image(data: bytes) -> bool:
-    return (
-        data.startswith(_PNG_MAGIC)
-        or data[:2] == _JPEG_MAGIC
-        or data[:4] == _WEBP_MAGIC
-    )
-
-
-def _guess_mime(data: bytes) -> str:
-    if data.startswith(_PNG_MAGIC):
-        return "image/png"
-    if data[:2] == _JPEG_MAGIC:
-        return "image/jpeg"
-    if data[:4] == _WEBP_MAGIC:
-        return "image/webp"
-    return "application/octet-stream"

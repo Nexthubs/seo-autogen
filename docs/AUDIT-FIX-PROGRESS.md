@@ -25,7 +25,7 @@
 | B2 | P2 | H01, H02, M15 | ✅ 完成（见下） |
 | B3 | P3 | H04, M05 | ✅ 完成（见下） |
 | B4 | P4 / P5 | H09, H06, H07, H11, M08 | ✅ 完成（见下） |
-| B5 | P6 | H05, H10, M06, M07, L01 | ⏳ 待办 |
+| B5 | P6 | H05, H10, M06, M07, L01 | ✅ 完成（见下） |
 | B6 | P7 | H03, M01, M02 | ⏳ 待办 |
 | B7 | P8 / P9 + 文档 | M13, M14, M12, M10, M03, H12, L03 | ⏳ 待办 |
 
@@ -86,15 +86,17 @@
 
 **B4 测试结果**：`478 passed, 1 skipped`（B3 后 453 + 新增 25：H09 ×6、H06 扩展、H07 ×4、H11 ×3、M08 ×2（含 image_plan 温度用例），含改写用例）。**无需新迁移**（H11 刻意不引入 attempt 列——当前版本由历史派生）。
 
-### B5 — P6（⏳）
+### B5 — P6 ✅
 
-| ID | 级别 | 问题摘要 | 计划 | 状态 |
-|---|---|---|---|---|
-| H05 | High | image step 提前 commit `ready`，DoD gate 在其后；sync 入口无状态门禁 | 仅 orchestrator 同事务 DoD 后设 ready/completed_at；sync 服务端核验状态 | ⏳ |
-| H10 | High | 图片下载向任意响应 URL 带 Images API key | 下载不带服务凭证（或严格同源 + 重定向处理）；跨域/预签名/重定向测试 | ⏳ |
-| M06 | Med | 图片重试全部重新生成已成功图片 | 复用已验证 local_path，仅重做失败项；regenerate vs resume 语义 | ⏳ |
-| M07 | Med | `.webp` 文件可能是 PNG 字节 | 请求/转码 WebP；解码 + 文件头 + MIME 一致性测试 | ⏳ |
-| L01 | Low | 本地 artifact 目录缺 spec §34 列出的研究 JSON | 补全 content-brief/outline/serp/review/sources 导出 | ⏳ |
+| ID | 级别 | 问题摘要 | 修复内容 | 关键文件 | 测试证据 | 状态 |
+|---|---|---|---|---|---|---|
+| H05 | High | image step 提前 commit `ready`，DoD gate 在其后；sync 入口无状态门禁 | ① `image_generate` 不再置 `ready`（step 结束于 `image_generating`）；② READY 仅由 orchestrator 在 `validate_article_done` 通过后**同事务**设置（`completed_at` 取既有值或 now），fresh/retry/resume/no-rework backfill 四种路径统一；③ `POST /jobs/{id}/sync-strapi` 服务端门禁：status ∉ {ready, strapi_draft_created, strapi_syncing} → **409**（failed/cancelled 的 body 未过 DoD，不得进 CMS）；④ UI `can_push` 镜像同一门禁（去掉 failed） | `app/pipeline/steps/image_generate.py`、`app/pipeline/orchestrator.py`、`app/routes/jobs.py` | `tests/unit/test_image_steps.py`：4 处 READY 断言改 `IMAGE_GENERATING`；`tests/integration/test_image_pipeline.py` 直接驱动 step 后断言 `image_generating`；`tests/unit/test_p8_routes.py` 新增 4 用例（ready→enqueue / failed→409 / cancelled→409 / queued→409 / draft_created 重推→200）；既有全链路 p8/p9 断言 `ready` + 完整 DoD 不变 | ✅ |
+| H10 | High | 图片下载向任意响应 URL 带 Images API key（外域 CDN 泄露凭证） | `_download()` 去掉 `Authorization` 头——Images API key 只认证生成端点；响应 URL（同源/第三方 CDN/预签名）一律匿名下载；生成端点/health_check 的 Bearer 保持不变 | `app/providers/image/openai_image.py` | `tests/unit/test_openai_image_provider.py` 新增 `test_download_never_sends_api_key_to_response_url`（同源/跨域/presigned 三目标逐一断言下载请求 `Authorization is None`）+ `test_download_404_is_provider_failed` | ✅ |
+| M06 | Med | 图片重试全部重新生成已成功图片 | `run_image_generation` 生成循环前校验 row 的 `local_path`：文件存在且通过 M07 校验（可解码 + 扩展名一致）→ **复用**（不产生 provider 请求），仅缺失/损坏/格式不符的行重新生成；复用清单写 `image_generation_reused_existing` 日志 | `app/pipeline/steps/image_generate.py` | `tests/unit/test_image_steps.py::test_generation_failure_keeps_image_generating` 断言重跑仅 2 次请求（hero 复用，两个 inline 重做）；新增 `test_m07_corrupt_or_mismatched_file_regenerates`（`.webp` 内写入 PNG 字节 → 重跑必重生成并转回真 WebP） | ✅ |
+| M07 | Med | `.webp` 文件名实际保存 PNG/JPEG 字节 | 新增 `app/services/image_storage.py` 图像契约层：① `save_image_bytes` 对 `.webp` 文件名**转码为真 WebP**（Pillow，PNG/JPEG→WEBP q85）后落盘，返回真实 MIME；② `validate_image_bytes` = 魔数嗅探 + Pillow 解码校验 + 扩展名/MIME 一致性（`.webp` 含 PNG 字节 → `IMAGE_PROVIDER_FAILED`）；③ `validate_local_image` 供 M06 复用前校验；④ provider 落盘前置校验改走同一函数（删除本地弱嗅探）；`pyproject.toml` 新增 `pillow>=10.0`；测试 fixture 全部换成**真实可解码** 1×1 PNG（旧 fake PNG 魔数+假 IDAT 过不了解码校验） | `app/services/image_storage.py`（重写）、`app/providers/image/openai_image.py`、`pyproject.toml`、`tests/unit/test_openai_image_provider.py` | 新增 `tests/unit/test_image_steps.py::test_m07_webp_filename_gets_real_webp_bytes`（PNG payload → 落盘 RIFF/WEBP 魔数 + `image/webp`）+ `test_m07_corrupt_or_mismatched_file_regenerates`；`test_generate_stores_file_section34` 断言 `.webp` 落盘字节为真 WebP 且 mime 一致；全链 p8/p9 测试通过 | ✅ |
+| L01 | Low | 本地 artifact 目录缺 spec §34 列出的研究 JSON | 新增 `app/services/job_artifacts.py::export_research_artifacts`：从 DB 读 content-brief/outline/serp（含 synthesis）/reviews/sources（含 evidence notes），写入 `content-brief.json` / `outline.json` / `serp.json` / `review.json` / `sources.json`；`image_generate` 导出块末尾调用——§34 目录成为自包含离线交付物；缺失行组写空 payload（显式缺失，不抛错） | `app/services/job_artifacts.py`（新增）、`app/pipeline/steps/image_generate.py` | `tests/integration/test_p9_pipeline.py::test_known_keyword_full_run_reaches_ready` 新增 7 个 artifact 存在性 + 非空断言（serp.runs/results、review.reviews、sources.sources、brief 非空）；`test_p8_pipeline.py` 全链路同款 7 项断言；`test_image_pipeline.py` 直接驱动路径 5 项断言；p8/p9 cleanup 同步清理新 JSON | ✅ |
+
+**B5 测试结果**：`486 passed, 1 skipped`（B4 后 478 + 净增 8：H05 路由门禁 ×4、H10 ×2、M06/M07 ×2；另有若干既有断言按新语义改写）。**新增依赖 `pillow>=10.0`**（WebP 转码/解码校验）；**无新迁移**。
 
 ### B6 — P7（⏳）
 
@@ -118,6 +120,12 @@
 
 ## 变更日志
 
+- **2026-09-17 — B5 完成**：H05 / H10 / M06 / M07 / L01 全部修复并测试（`486 passed, 1 skipped`，净增 8 用例）。**新增依赖 `pillow>=10.0`**；**无新迁移**。
+  - **H05**：`ready` 状态归属改到 orchestrator——image step 不再提前 commit `ready`；`validate_article_done` 通过后**同事务**置 `ready` + `completed_at`（覆盖 fresh/retry/resume/no-rework backfill 全部路径）。`POST /jobs/{id}/sync-strapi` 加服务端状态门禁（非 syncable 状态 409），UI `can_push` 镜像同一门禁（failed 不再可推）。
+  - **H10**：`OpenAIImageProvider._download()` 去掉 `Authorization` 头，Images API key 不再随响应 URL（第三方 CDN / 预签名）外泄。
+  - **M06**：image step 重跑复用已通过 M07 校验的 `local_path` 文件，仅重新生成缺失/损坏/格式不符的行（付费生成不重做）。
+  - **M07**：`image_storage` 增加图像契约层——`.webp` 文件名强制真 WebP（Pillow 转码）+ 魔数/解码/扩展名一致性校验；provider 落盘前与 step 复用前共用同一校验；测试 fixture 的假 PNG 全部换成真实可解码 PNG。
+  - **L01**：新增 `job_artifacts.py::export_research_artifacts`，§34 目录补全 `content-brief.json` / `outline.json` / `serp.json` / `review.json` / `sources.json`，本地导出成为自包含离线交付物。
 - **2026-09-17 — B4 完成**：H09 / H06 / H07 / H11 / M08 全部修复并测试（`478 passed, 1 skipped`，净增 25 用例）。**无新迁移**。
   - **H09**：新增 `app/services/evidence_verification.py`——evidence note 的来源 URL 由独立提取器通道核实，不可达/空正文 → `usage="avoid"` + `confidence="low"` + `source_unverified:` 标记；orchestrator 注入 extractor，p9 集成测试的抽取调用计数同步计入该核实调用。
   - **H06**：DoD gate 重写为 Markdown 结构解析完整性门禁（Setext H1、FAQ 逐题计数、CTA 正文、图片文件存在性、marker 大小写不敏感、研究/审核/竞品分析关联完整性、源去重与上限）；负向 fixture 参数化。
