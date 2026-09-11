@@ -250,3 +250,30 @@ class TestVerifyEvidenceSources:
         assert notes[0].usage == "avoid"
         assert notes[0].verification_status == "unverified"
         assert "source_unverified" in (notes[0].note or "")
+
+
+class TestR4SemanticCaution:
+    def test_negation_and_uncertainty_are_not_affirmative_support(self):
+        sources = [
+            "Attachment therapy does not reduce anxiety.",
+            "Attachment therapy doesn't reduce anxiety.",
+            "Attachment therapy never reduces anxiety.",
+            "Attachment therapy might reduce anxiety, but this has not been tested.",
+            "Attachment therapy may reduce anxiety.",
+            "Attachment therapy could reduce anxiety.",
+            "Attachment therapy reduces anxiety. This has not been tested.",
+            "Attachment therapy reduces anxiety?",
+        ]
+        for source in sources:
+            check = assess_source_support(
+                _note(claim="Attachment therapy reduces anxiety.", source_title="Smith 2020"),
+                _page("Smith (2020) reported: " + source),
+            )
+            assert check.status in {"unverified", "unsupported", "contradicted"}, source
+
+    def test_affirmative_control_remains_supported(self):
+        check = assess_source_support(
+            _note(claim="Attachment therapy reduces anxiety.", source_title="Smith 2020"),
+            _page("Smith (2020) found that attachment therapy reduces anxiety."),
+        )
+        assert check.status == "supported"

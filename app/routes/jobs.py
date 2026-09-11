@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -138,34 +138,10 @@ def _enqueue(job_id: uuid.UUID, options: dict | None = None) -> bool:
 
 
 def _reset_artifacts(session: Session, job: GenerationJob) -> None:
-    """Clear per-run artifacts so a full-pipeline retry is clean.
+    """Invalidate the full dependency chain while retaining audit history."""
+    from app.pipeline.checkpoints import reset_from_step
 
-    Most steps are replace-on-rerun, but ``competitor_analysis`` appends and
-    ``serp_search`` adds a new run, so we delete the previous run's outputs
-    before re-running. Per-step cleanup granularity is P9.
-
-    H11: the article ``versions`` and ``reviews`` are NOT cleared — they are
-    immutable, append-only history (spec sections 27-28, 46.13-46.14). A full
-    retry re-runs the writer/reviser and appends new versions; old versions +
-    reviews stay queryable for audit, and the current draft/final are derived
-    from the history.
-    """
-    session.execute(delete(SerpRun).where(SerpRun.job_id == job.id))
-    session.execute(delete(JobSource).where(JobSource.job_id == job.id))
-    session.execute(
-        delete(CompetitorAnalysisRow).where(CompetitorAnalysisRow.job_id == job.id)
-    )
-    session.execute(
-        delete(SerpSynthesisRow).where(SerpSynthesisRow.job_id == job.id)
-    )
-    session.execute(
-        delete(EvidenceNoteRow).where(EvidenceNoteRow.job_id == job.id)
-    )
-    session.execute(delete(ContentBriefRow).where(ContentBriefRow.job_id == job.id))
-    session.execute(
-        delete(ArticleOutlineRow).where(ArticleOutlineRow.job_id == job.id)
-    )
-    session.execute(delete(ImageRow).where(ImageRow.job_id == job.id))
+    reset_from_step(session, job, 1)
     session.commit()
 
 

@@ -22,6 +22,11 @@ proposed note:
 4. **contradiction** — a relevant sentence with a negation marker or an
    opposite directional predicate (for example reduces vs increases) means
    the source argues *against* the claim.
+5. **uncertainty** — other negation, modal qualifiers, questions or adjacent
+   caveats require semantic verification and are conservatively unverified.
+
+These checks are lexical screening, not a general proof of entailment.
+Ambiguous cases may be downgraded even when a human could verify them.
 
 The verdict plus the best corroborating (or contradicting) excerpt is
 persisted on the note, so the decision is auditable. Unsupported notes are
@@ -138,6 +143,18 @@ _NEGATION_MARKERS = (
     "is a misconception",
     "misconception",
 )
+
+# Lexical matching cannot resolve negation scope or modal certainty. Preserve
+# these tokens in a separate conservative gate, rather than dropping them as
+# stopwords and treating the remaining overlap as affirmative evidence.
+_UNCERTAIN_STATEMENT_RE = re.compile(
+    r"\b(?:not|no|never|neither|nor|without|may|might|could|possibly|perhaps|"
+    r"potentially|hypothes\w*|speculat\w*|unproven|untested|uncertain)\b"
+    r"|\b\w+n['’]t\b|\b(?:yet to be|remains to be)\s+(?:tested|verified|proven)\b"
+    r"|\?",
+    re.IGNORECASE,
+)
+
 
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:%|percent)?", re.IGNORECASE)
 _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
@@ -395,6 +412,22 @@ def assess_source_support(note: EvidenceNote, page: "ExtractedPage") -> SupportC
             "claimed number(s) not found in source: " + ", ".join(missing),
             _best_excerpt(sentences, terms) or content[:MAX_EXCERPT_CHARS],
         )
+
+    # Fail closed for relevant or adjacent caveats. A separate sentence such
+    # as "This has not been tested" must not disappear from the assessment.
+    for index, sentence in enumerate(sentences):
+        if _sentence_coverage(sentence, claim_stems) < MIN_TERM_OVERLAP:
+            continue
+        context = " ".join(sentences[max(0, index - 1):index + 2])
+        if (
+            _UNCERTAIN_STATEMENT_RE.search(context)
+            or _UNCERTAIN_STATEMENT_RE.search(note.claim)
+        ):
+            return SupportCheck(
+                "unverified",
+                "negation or uncertainty requires semantic verification",
+                context[:MAX_EXCERPT_CHARS],
+            )
 
     return SupportCheck(
         "supported", "ok", support_sentence[:MAX_EXCERPT_CHARS] or None

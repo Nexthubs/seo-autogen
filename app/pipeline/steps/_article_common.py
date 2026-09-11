@@ -193,7 +193,7 @@ def review_lineage(
     job: GenerationJob,
     version_row: ArticleVersionRow,
 ) -> dict[str, dict]:
-    """The current review attempt set for a version, keyed by review type.
+    """The current seo/fact/style attempts consumed by a revision.
 
     Shape: ``{"seo": {"review_id": "<uuid>", "attempt": 1}, ...}`` — the
     value persisted on a revision's ``based_on_reviews`` (R-M03).
@@ -204,6 +204,7 @@ def review_lineage(
             ArticleReviewRow.job_id == job.id,
             ArticleReviewRow.article_version_id == version_row.id,
             ArticleReviewRow.invalidated_at.is_(None),
+            ArticleReviewRow.review_type.in_(REVISION_REVIEW_TYPES),
         )
         .order_by(ArticleReviewRow.attempt.desc())
     ).all()
