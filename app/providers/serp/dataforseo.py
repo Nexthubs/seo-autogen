@@ -156,7 +156,22 @@ class DataForSEOSERPProvider(SERPProvider):
                 continue
 
             if response.status_code == 200:
-                data = response.json()
+                try:
+                    data = response.json()
+                except ValueError as exc:
+                    raise PipelineError(
+                        ErrorCode.DATAFORSEO_REQUEST_FAILED,
+                        "DataForSEO returned invalid JSON",
+                        raw=response.text[:5000],
+                        provider_cost_reported=True,
+                    ) from exc
+                if not isinstance(data, dict):
+                    raise PipelineError(
+                        ErrorCode.DATAFORSEO_REQUEST_FAILED,
+                        "DataForSEO returned a non-object response",
+                        raw=data,
+                        provider_cost_reported=True,
+                    )
                 logger.info(
                     "dataforseo_request_ok",
                     extra={
@@ -319,7 +334,15 @@ class DataForSEOSERPProvider(SERPProvider):
     # ------------------------------------------------------------
     async def search(self, request: SERPRequest) -> SERPResponse:
         raw, cost = await self._request_raw(request)
-        parsed = self.parse(raw)
+        try:
+            parsed = self.parse(raw)
+        except PipelineError as exc:
+            # R3-M02: a successful HTTP response may carry a confirmed cost
+            # even when its business payload is unusable. Preserve the
+            # telemetry on the failure boundary for the step-level ledger.
+            exc.provider_cost = cost
+            exc.provider_cost_reported = True
+            raise
 
         # `organic` already holds only item dicts with a url (parse filtered
         # them). Rank comes from `rank_group`; the `position` field is a
@@ -365,6 +388,8 @@ class DataForSEOSERPProvider(SERPProvider):
                 ErrorCode.DATAFORSEO_EMPTY_SERP,
                 "DataForSEO response contained no organic results",
                 raw=raw,
+                provider_cost=cost,
+                provider_cost_reported=True,
             )
 
         return SERPResponse(

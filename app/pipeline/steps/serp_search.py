@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.enums import JobStatus
+from app.core.exceptions import PipelineError
 from app.db.models.job import GenerationJob
 from app.db.models.serp import SerpResult, SerpRun
 from app.providers.serp.base import SERPProvider
@@ -77,7 +78,26 @@ async def run_serp_search(
         device=settings.dataforseo_device,  # type: ignore[arg-type]
         depth=settings.dataforseo_depth,
     )
-    response: SERPResponse = await provider.search(request)
+    try:
+        response: SERPResponse = await provider.search(request)
+    except PipelineError as exc:
+        # R3-M02: only record failures for which the provider observed a
+        # response/cost field. Network/auth failures without billing evidence
+        # must not be guessed as charged.
+        if exc.provider_cost_reported:
+            record_provider_cost(
+                session,
+                job_id=job.id,
+                provider="dataforseo",
+                step="serp_search",
+                amount=exc.provider_cost,
+                detail=f"{job.keyword}; outcome={exc.error_code.value}",
+            )
+            # The external side effect already happened. Commit its ledger
+            # event independently so the orchestrator's failure rollback
+            # cannot erase known spend.
+            session.commit()
+        raise
 
     # R-M02: the paid SERP call is recorded in the append-only cost ledger
     # BEFORE any checkpoint row can be deleted by a later reset — the ledger
@@ -90,6 +110,9 @@ async def run_serp_search(
         amount=response.provider_cost,
         detail=job.keyword,
     )
+    # Decouple confirmed provider spend from later parser/checkpoint storage.
+    # If any SerpRun/SerpResult write below fails, this event remains durable.
+    session.commit()
 
     # Persist the full raw payload (spec section 12.2) so re-parsing is
     # possible without another paid SERP call.

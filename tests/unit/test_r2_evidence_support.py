@@ -125,6 +125,54 @@ class TestAssessSourceSupport:
         )
         assert check.status == "supported"
 
+    def test_percentage_does_not_match_inside_an_unrelated_number(self):
+        check = assess_source_support(
+            _note(
+                claim="97% of adults recover from anxious attachment.",
+                source_title="Smith 2020",
+            ),
+            _page(
+                "Smith (2020) studied 1970 adults with anxious attachment. "
+                "Recovery rates were not measured."
+            ),
+        )
+        assert check.status != "supported"
+        assert "number" in check.reason or "claim" in check.reason
+
+    def test_opposite_direction_is_contradicted(self):
+        check = assess_source_support(
+            _note(
+                claim="Attachment therapy reduces anxiety.",
+                source_title="Smith 2020",
+            ),
+            _page(
+                "Smith (2020) found that attachment therapy increases anxiety."
+            ),
+        )
+        assert check.status == "contradicted"
+
+    def test_same_words_with_reversed_relation_are_not_support(self):
+        check = assess_source_support(
+            _note(claim="Dogs chase cats.", source_title="Smith 2020"),
+            _page("Smith (2020) reported that cats chase dogs."),
+        )
+        assert check.status == "unsupported"
+        assert "ordered claim coverage" in check.reason
+
+    def test_same_author_newsletter_does_not_prove_randomized_trial(self):
+        check = assess_source_support(
+            _note(
+                claim="Attachment therapy reduces anxiety.",
+                source_title="Smith 2020 Randomized Trial of Attachment Therapy",
+            ),
+            _page(
+                "Smith (2020) newsletter: attachment therapy reduces anxiety.",
+                title="Smith's attachment newsletter",
+            ),
+        )
+        assert check.status == "unsupported"
+        assert "source title not corroborated" in check.reason
+
     def test_mismatched_paper_title_is_unsupported(self):
         check = assess_source_support(
             _note(source_title="Fabricated 2021 Study on Subliminal Manifestation"),

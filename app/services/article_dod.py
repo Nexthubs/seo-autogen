@@ -43,6 +43,7 @@ from app.pipeline.steps._article_common import (
     latest_article_version,
     latest_review_row,
     latest_writer_version,
+    revision_matches_current_reviews,
 )
 from app.schemas.research import ArticleOutline, ContentBrief
 from app.schemas.internal_link import MARKER_SYNTAX
@@ -58,6 +59,8 @@ if TYPE_CHECKING:  # pragma: no cover
 #: project renderer turns into ``<h1>``. A token parse also ignores ``#``
 #: inside fenced code, which a line regex would wrongly flag.
 _MD = MarkdownIt("commonmark")
+_HTML_H1_OPEN = re.compile(r"<\s*h1\b[^>]*>", re.IGNORECASE | re.DOTALL)
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 
 #: Any internal-link marker attempt: the double-bracket + prefix is
 #: case-INSENSITIVE, so a malformed attempt (lowercase marker id
@@ -88,6 +91,28 @@ def _headings(body: str) -> list[tuple[int, str, str]]:
             text = tokens[index + 1].content or ""
         out.append((index, token.tag, text))
     return out
+
+
+def _html_h1(body: str) -> str | None:
+    """Return an HTML H1 opening tag outside code, or ``None``.
+
+    CommonMark represents raw HTML as ``html_block`` / ``html_inline`` rather
+    than ``heading_open``. Walking parser tokens (including inline children)
+    catches block/inline, mixed-case, attributed and multiline tags while
+    naturally ignoring fenced and inline code literals.
+    """
+    pending = list(_MD.parse(body or ""))
+    while pending:
+        token = pending.pop(0)
+        if token.children:
+            pending[0:0] = token.children
+        if token.type not in {"html_block", "html_inline"}:
+            continue
+        fragment = _HTML_COMMENT.sub("", token.content or "")
+        match = _HTML_H1_OPEN.search(fragment)
+        if match:
+            return re.sub(r"\s+", " ", match.group(0)).strip()
+    return None
 
 
 def _find_h2(headings: list[tuple[int, str, str]], title: str) -> int | None:
@@ -291,6 +316,12 @@ def _check_article(
             "article: body_markdown contains an H1 heading "
             f"({h1_texts[0]!r})"
         )
+    html_h1 = _html_h1(body)
+    if html_h1 is not None:
+        errors.append(
+            "article: body_markdown contains an HTML H1 heading "
+            f"({html_h1!r})"
+        )
     if not (version.seo_title or "").strip():
         errors.append("article: seo_title is empty")
     if not (version.meta_description or "").strip():
@@ -344,6 +375,7 @@ def _check_article(
     #: a fresh draft (e.g. writer retry v3 + revision v4 whose own seo/fact/
     #: style reviews never ran).
     writer_version = latest_writer_version(session, job)
+    current_reviews = {}
     for rtype in REQUIRED_REVIEWS:
         row = (
             latest_review_row(session, job, writer_version, rtype)
@@ -357,6 +389,20 @@ def _check_article(
                 else ""
             )
             errors.append(f"article: missing {rtype} review{suffix}")
+        else:
+            current_reviews[rtype] = row
+    if (
+        writer_version is not None
+        and version is not None
+        and len(current_reviews) == len(REQUIRED_REVIEWS)
+        and not revision_matches_current_reviews(
+            session, job, writer_version, version
+        )
+    ):
+        errors.append(
+            "article: final revision does not consume the current "
+            "seo/fact/style review attempts"
+        )
     #: The anti-copy verdict must belong to the final (latest-attempt) row
     #: of the version that actually ships (R-M03: append-only attempts).
     anticopy_row = latest_review_row(session, job, version, "anticopy")

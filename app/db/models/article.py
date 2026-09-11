@@ -12,7 +12,7 @@ tied to the article version it reviewed.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Integer, Text, UniqueConstraint, VARCHAR
+from sqlalchemy import DateTime, ForeignKey, Integer, Text, UniqueConstraint, VARCHAR
 from sqlalchemy import JSON
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -61,6 +61,13 @@ class ArticleVersionRow(Base):
     #: it once newer attempts exist. Shape:
     #: ``{"seo": {"review_id": "<uuid>", "attempt": 1}, ...}``.
     based_on_reviews: Mapped[dict | None] = mapped_column(_JSONB, nullable=True)
+
+    #: A retry never deletes immutable history. Instead, versions made stale
+    #: by re-running the writer/reviewer chain are explicitly invalidated and
+    #: excluded from the current checkpoint/shipping view.
+    invalidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     created_at: Mapped[datetime] = created_at_column()
 
@@ -116,6 +123,13 @@ class ArticleReviewRow(Base):
     #: "current valid" verdict is the highest attempt.
     attempt: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
+    )
+
+    #: Append-only review history is retained across retries.  This marker
+    #: distinguishes an auditable historical attempt from the attempt that is
+    #: currently valid for checkpoint and revision-lineage purposes.
+    invalidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     created_at: Mapped[datetime] = created_at_column()

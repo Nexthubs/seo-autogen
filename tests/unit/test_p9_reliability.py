@@ -150,13 +150,21 @@ def _seed_full_chain(db, job, *, image_partial: bool = False) -> None:
     db.add(writer)
     db.flush()
     # steps 10-12: reviews on the writer version
+    reviews = []
     for rtype in ("seo", "fact", "style"):
-        db.add(ArticleReviewRow(job_id=job.id, article_version_id=writer.id,
-                                review_type=rtype, review={}))
+        row = ArticleReviewRow(job_id=job.id, article_version_id=writer.id,
+                               review_type=rtype, review={})
+        db.add(row)
+        reviews.append(row)
+    db.flush()
     # step 13: article_reviser
     db.add(ArticleVersionRow(
         job_id=job.id, version=2, stage="revision", title="T2",
         body_markdown="b2", seo_title="s2", meta_description="m2", slug="sl2",
+        based_on_reviews={
+            row.review_type: {"review_id": str(row.id), "attempt": row.attempt}
+            for row in reviews
+        },
     ))
     # steps 14-15: image plan + generation
     db.add(ImageRow(job_id=job.id, role="hero", sort_order=1, purpose="p",
@@ -252,12 +260,11 @@ class TestCheckpoints:
         assert checkpoints.step_done(db, job, "serp_search")
         assert checkpoints.step_done(db, job, "source_extract")
         assert checkpoints.step_done(db, job, "competitor_analysis")
-        # writer + reviser still read done (the kept rows satisfy the
-        # derived-current predicates); images gone -> image_plan (14) is the
-        # first incomplete checkpoint.
-        assert checkpoints.step_done(db, job, "article_writer")
-        assert checkpoints.step_done(db, job, "article_reviser")
-        assert checkpoints.first_incomplete_step(db, job) == 14
+        # Rows remain available as history, but the retried dependency chain
+        # is explicitly stale and must restart at the writer.
+        assert not checkpoints.step_done(db, job, "article_writer")
+        assert not checkpoints.step_done(db, job, "article_reviser")
+        assert checkpoints.first_incomplete_step(db, job) == 9
 
     def test_reset_review_keeps_version_history(self, db):
         job = _make_job(db)
@@ -270,7 +277,7 @@ class TestCheckpoints:
         db.commit()
         assert removed == 15 - 10 + 1
         assert checkpoints.step_done(db, job, "article_writer")
-        assert checkpoints.step_done(db, job, "article_reviser")  # v2 > v1 kept
+        assert not checkpoints.step_done(db, job, "article_reviser")
         # the writer draft survives with its id intact
         writer_after = db.get(ArticleVersionRow, writer_id)
         assert writer_after is not None
@@ -282,8 +289,38 @@ class TestCheckpoints:
                 ArticleReviewRow.review_type == "seo",
             )
         ) is not None
-        # images dropped -> image_plan (14) is the first incomplete checkpoint
-        assert checkpoints.first_incomplete_step(db, job) == 14
+        # Old rows remain for audit but are invalidated for the current run.
+        assert writer_after.invalidated_at is None
+        assert checkpoints.first_incomplete_step(db, job) == 10
+
+    def test_fact_retry_invalidates_style_and_revision_for_resume(self, db):
+        """R3-H01: retrying Fact Review makes downstream checkpoints stale."""
+        from app.pipeline.steps._article_common import persist_review
+
+        job = _make_job(db)
+        writer = _seed_full_chain(db, job)
+
+        checkpoints.reset_from_step(db, job, 11)
+        db.commit()
+        assert checkpoints.step_done(db, job, "seo_review")
+        assert not checkpoints.step_done(db, job, "fact_review")
+        assert not checkpoints.step_done(db, job, "style_review")
+        assert not checkpoints.step_done(db, job, "article_reviser")
+        assert checkpoints.first_incomplete_step(db, job) == 11
+
+        # The retried fact review succeeds, then style fails before persisting.
+        new_fact = persist_review(
+            db,
+            job,
+            writer,
+            review_type="fact",
+            review={"issues": [{"verdict": "remove"}]},
+        )
+        db.commit()
+        assert new_fact.attempt == 2
+        assert checkpoints.step_done(db, job, "fact_review")
+        assert not checkpoints.step_done(db, job, "style_review")
+        assert checkpoints.first_incomplete_step(db, job) == 12
 
     def test_new_writer_draft_invalidates_stale_revision(self, db):
         job = _make_job(db)

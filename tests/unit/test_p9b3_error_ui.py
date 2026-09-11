@@ -189,10 +189,24 @@ def seed_checkpoints_through(session, job: GenerationJob, upto: int) -> None:
             review_type="style", review={},
         ))
     if upto >= 13:
+        session.flush()
+        reviews = session.scalars(
+            select(ArticleReviewRow).where(
+                ArticleReviewRow.job_id == job.id,
+                ArticleReviewRow.review_type.in_(("seo", "fact", "style")),
+            )
+        ).all()
         session.add(ArticleVersionRow(
             job_id=job.id, version=2, stage="revision", title="t2",
             body_markdown="b2", seo_title="s2", meta_description="m2",
             slug="p9b3-v2",
+            based_on_reviews={
+                row.review_type: {
+                    "review_id": str(row.id),
+                    "attempt": row.attempt,
+                }
+                for row in reviews
+            },
         ))
     if upto >= 14:
         session.add(ImageRow(

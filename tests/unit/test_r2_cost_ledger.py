@@ -24,12 +24,14 @@ import json
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import httpx
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.enums import JobStatus
+from app.core.exceptions import ErrorCode, PipelineError
 from app.db.base import Base
 from app.db.models.article import ArticleVersionRow
 from app.db.models.cost import ProviderCostEventRow
@@ -44,6 +46,7 @@ from app.pipeline.steps.source_extract import run_source_extract
 from app.providers.extractor.base import ContentExtractor
 from app.providers.image.base import ImageProvider
 from app.providers.serp.base import SERPProvider
+from app.providers.serp.dataforseo import DataForSEOSERPProvider
 from app.schemas.images import GeneratedImage, ImageGenerationRequest
 from app.schemas.serp import OrganicResult, SERPRequest, SERPResponse
 from app.schemas.sources import ExtractedPage
@@ -155,6 +158,108 @@ async def test_r_m02_unknown_serp_cost_stays_null(db, tmp_path):
     event = _events(db, job)[0]
     assert event.amount is None  # unknown, never coalesced into 0
     assert total_cost(db, job.id) is None
+
+
+async def test_r3_m02_empty_serp_keeps_reported_cost(db, tmp_path):
+    """HTTP/business success can still yield no organic result; its cost is
+    durable even though the SERP checkpoint fails."""
+    raw = {
+        "status_code": 20000,
+        "cost": 0.05,
+        "tasks": [
+            {
+                "status_code": 20000,
+                "cost": 0.05,
+                "result": [{"type": "organic", "items": []}],
+            }
+        ],
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=raw)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://dfs.test"
+    )
+    provider = DataForSEOSERPProvider(
+        settings=_settings(tmp_path), client=client, backoff_seconds=(0, 0, 0)
+    )
+    job = _job(db)
+    try:
+        with pytest.raises(PipelineError) as caught:
+            await run_serp_search(db, job, provider, settings=_settings(tmp_path))
+        assert caught.value.error_code is ErrorCode.DATAFORSEO_EMPTY_SERP
+        db.rollback()  # mirrors the orchestrator failure path
+        events = _events(db, job)
+        assert len(events) == 1
+        assert events[0].kind == "charged"
+        assert events[0].amount == Decimal("0.050000")
+        assert "DATAFORSEO_EMPTY_SERP" in (events[0].detail or "")
+        assert db.scalar(select(SerpRun).where(SerpRun.job_id == job.id)) is None
+    finally:
+        await client.aclose()
+
+
+async def test_r3_m02_observed_response_without_cost_is_unknown(db, tmp_path):
+    class FailedAfterResponse(SERPProvider):
+        async def search(self, request: SERPRequest) -> SERPResponse:
+            raise PipelineError(
+                ErrorCode.DATAFORSEO_REQUEST_FAILED,
+                "business result invalid",
+                provider_cost_reported=True,
+            )
+
+        async def health_check(self) -> bool:
+            return True
+
+    job = _job(db)
+    with pytest.raises(PipelineError):
+        await run_serp_search(
+            db, job, FailedAfterResponse(), settings=_settings(tmp_path)
+        )
+    db.rollback()
+    event = _events(db, job)[0]
+    assert event.amount is None
+    assert total_cost(db, job.id) is None
+
+
+async def test_r3_m02_unobserved_failure_does_not_guess_a_charge(db, tmp_path):
+    class NetworkFailure(SERPProvider):
+        async def search(self, request: SERPRequest) -> SERPResponse:
+            raise PipelineError(
+                ErrorCode.DATAFORSEO_REQUEST_FAILED, "network failed"
+            )
+
+        async def health_check(self) -> bool:
+            return True
+
+    job = _job(db)
+    with pytest.raises(PipelineError):
+        await run_serp_search(db, job, NetworkFailure(), settings=_settings(tmp_path))
+    db.rollback()
+    assert _events(db, job) == []
+
+
+async def test_r3_m02_cost_survives_later_checkpoint_storage_failure(
+    db, tmp_path, monkeypatch
+):
+    """A confirmed charge is independent of later checkpoint persistence."""
+
+    def fail_normalize(_url: str) -> str:
+        raise RuntimeError("checkpoint storage failed")
+
+    monkeypatch.setitem(run_serp_search.__globals__, "normalize_url", fail_normalize)
+    job = _job(db)
+    with pytest.raises(RuntimeError, match="checkpoint storage failed"):
+        await run_serp_search(
+            db, job, FakeSERP(cost=0.25), settings=_settings(tmp_path)
+        )
+
+    db.rollback()  # mirrors the orchestrator failure path
+    events = _events(db, job)
+    assert len(events) == 1
+    assert events[0].amount == Decimal("0.250000")
+    assert db.scalar(select(SerpRun).where(SerpRun.job_id == job.id)) is None
 
 
 # ------------------------------------------------------------- extractor

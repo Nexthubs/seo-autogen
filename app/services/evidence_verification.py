@@ -12,16 +12,16 @@ paired with a live "Welcome to our homepage" still shipped as
 ``high / supported``. The checker now compares the fetched body against the
 proposed note:
 
-1. **title corroboration** — a significant token (or year) of
-   ``source_title`` must appear on the page;
+1. **title corroboration** — the year (when supplied) and a substantial
+   share of the distinctive title/author tokens must appear on the page;
 2. **number corroboration** — every statistic quoted in the ``claim``
    (``97%``, ``1,000``, ``12.5``) must actually occur in the body, in one of
    its common spellings (``97 %`` / ``97 percent`` / ``0.97``);
-3. **term overlap** — enough of the claim's significant terms must occur in
-   the body at all (a reachable but irrelevant page fails);
-4. **contradiction** — a negation marker (``no evidence``, ``debunked``,
-   ``not supported`` …) in a sentence that also carries the claim's terms
-   means the source argues *against* the claim.
+3. **sentence-level support** — one sentence must carry most of the claim's
+   significant terms; page-wide word overlap is screening evidence only;
+4. **contradiction** — a relevant sentence with a negation marker or an
+   opposite directional predicate (for example reduces vs increases) means
+   the source argues *against* the claim.
 
 The verdict plus the best corroborating (or contradicting) excerpt is
 persisted on the note, so the decision is auditable. Unsupported notes are
@@ -36,6 +36,7 @@ skip).
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Literal
@@ -52,7 +53,8 @@ SupportStatus = Literal["supported", "unsupported", "contradicted", "unverified"
 
 #: Minimum share of a claim's significant terms that must occur in the body
 #: before the page counts as on-topic at all.
-MIN_TERM_OVERLAP = 0.25
+MIN_TERM_OVERLAP = 0.60
+MIN_ORDERED_CLAIM_COVERAGE = 0.75
 
 #: An excerpt is a debugging artefact, not the archive — keep it short.
 MAX_EXCERPT_CHARS = 400
@@ -141,6 +143,16 @@ _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:%|percent)?", re.IGNORECASE)
 _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 _WORD_RE = re.compile(r"[a-z][a-z0-9'\-]+")
 
+_DIRECTION_GROUPS = (
+    (frozenset({"increase", "raise", "higher", "grow"}),
+     frozenset({"decrease", "reduce", "lower", "decline"})),
+    (frozenset({"improve", "benefit", "better"}),
+     frozenset({"worsen", "harm", "worse"})),
+    (frozenset({"positive", "positively"}),
+     frozenset({"negative", "negatively"})),
+    (frozenset({"more", "greater"}), frozenset({"less", "fewer"})),
+)
+
 
 @dataclass(frozen=True)
 class SupportCheck:
@@ -164,27 +176,52 @@ def _significant_terms(text: str) -> list[str]:
     return seen
 
 
-def _number_variants(raw: str) -> set[str]:
-    """Spellings under which a claimed number may appear in the body."""
+def _stem(word: str) -> str:
+    """Small deterministic stemmer for matching ordinary English variants."""
+    word = word.lower()
+    for suffix in ("ingly", "edly", "ing", "ies", "ed", "es", "s"):
+        if len(word) - len(suffix) >= 4 and word.endswith(suffix):
+            word = word[:-len(suffix)] + ("y" if suffix == "ies" else "")
+            break
+    # reduce/reduces and increase/increases should share a stem.
+    if len(word) > 4 and word.endswith("e"):
+        word = word[:-1]
+    return word
+
+
+def _term_stems(text: str) -> set[str]:
+    return {_stem(term) for term in _significant_terms(text)}
+
+
+def _number_present(raw: str, text: str) -> bool:
+    """Match a number as a numeric token with its claimed unit.
+
+    In particular, a percentage never degrades to a naked digit substring:
+    ``97%`` cannot be corroborated by the year/population ``1970``.
+    """
     match = re.match(r"^(\d[\d,]*(?:\.\d+)?)\s*(%|percent)?$", raw.strip(), re.I)
     if not match:
-        return {raw.strip().lower()}
+        return False
     digits = match.group(1).replace(",", "")
-    variants = {raw.strip().lower(), digits}
+    escaped = re.escape(digits)
     if match.group(2):
-        variants |= {
-            f"{digits}%",
-            f"{digits} %",
-            f"{digits} percent",
-            f"{digits} per cent",
-        }
+        percent = re.compile(
+            rf"(?<![\d.]){escaped}(?:\.0+)?\s*(?:%|percent\b|per\s+cent\b)",
+            re.I,
+        )
         try:
             fraction = float(digits) / 100.0
-            variants.add(f"{fraction:g}")
-            variants.add(f"{fraction:.2f}")
         except ValueError:  # pragma: no cover - regex guarantees numeric
-            pass
-    return {variant.lower() for variant in variants}
+            return bool(percent.search(text))
+        fraction_text = f"{fraction:g}"
+        fraction_pattern = re.compile(
+            rf"(?<![\d.]){re.escape(fraction_text)}(?![\d.])"
+            r"\s+(?:of\b|as\s+a\s+(?:fraction|proportion)\b)"
+        )
+        return bool(percent.search(text) or fraction_pattern.search(text))
+
+    compact = text.replace(",", "")
+    return bool(re.search(rf"(?<![\d.]){escaped}(?![\d.])", compact))
 
 
 def _claimed_numbers(claim: str) -> list[str]:
@@ -210,10 +247,53 @@ def _best_excerpt(sentences: list[str], terms: list[str]) -> str | None:
     return excerpt
 
 
-def _contradicting_excerpt(sentences: list[str], terms: list[str]) -> str | None:
+def _sentence_coverage(sentence: str, claim_stems: set[str]) -> float:
+    if not claim_stems:
+        return 1.0
+    return len(claim_stems & _term_stems(sentence)) / len(claim_stems)
+
+
+def _ordered_claim_coverage(claim: str, sentence: str) -> float:
+    """LCS coverage for a recognizable, ordered statement of the claim."""
+    claim_terms = [_stem(term) for term in _significant_terms(claim)]
+    sentence_terms = [_stem(term) for term in _significant_terms(sentence)]
+    if not claim_terms:
+        return 1.0
+    previous = [0] * (len(sentence_terms) + 1)
+    for claim_term in claim_terms:
+        current = [0]
+        for index, sentence_term in enumerate(sentence_terms, start=1):
+            if claim_term == sentence_term:
+                current.append(previous[index - 1] + 1)
+            else:
+                current.append(max(current[-1], previous[index]))
+        previous = current
+    return previous[-1] / len(claim_terms)
+
+
+def _opposite_direction(claim: str, sentence: str) -> bool:
+    claim_stems = _term_stems(claim)
+    sentence_stems = _term_stems(sentence)
+    for left, right in _DIRECTION_GROUPS:
+        left_stems = {_stem(word) for word in left}
+        right_stems = {_stem(word) for word in right}
+        if claim_stems & left_stems and sentence_stems & right_stems:
+            return True
+        if claim_stems & right_stems and sentence_stems & left_stems:
+            return True
+    return False
+
+
+def _contradicting_excerpt(
+    sentences: list[str], terms: list[str], claim: str
+) -> str | None:
+    claim_stems = {_stem(term) for term in terms}
     for sentence in sentences:
-        if any(marker in sentence for marker in _NEGATION_MARKERS) and (
-            not terms or any(term in sentence for term in terms)
+        coverage = _sentence_coverage(sentence, claim_stems)
+        relevant = coverage >= MIN_TERM_OVERLAP
+        if relevant and (
+            any(marker in sentence for marker in _NEGATION_MARKERS)
+            or _opposite_direction(claim, sentence)
         ):
             excerpt = sentence
             if len(excerpt) > MAX_EXCERPT_CHARS:
@@ -223,7 +303,7 @@ def _contradicting_excerpt(sentences: list[str], terms: list[str]) -> str | None
 
 
 def _title_matches(source_title: str, haystack: str) -> tuple[bool, str]:
-    """At least one non-generic token / year of the title must be on the page."""
+    """Require a recognizable title/author identity, not one shared word."""
     tokens = [
         token
         for token in _significant_terms(source_title)
@@ -232,9 +312,11 @@ def _title_matches(source_title: str, haystack: str) -> tuple[bool, str]:
     years = _YEAR_RE.findall(source_title or "")
     if not tokens and not years:
         return True, "no distinctive source title"
-    if any(token in haystack for token in tokens):
-        return True, "ok"
-    if any(year in haystack for year in years):
+    haystack_stems = _term_stems(haystack)
+    matched_tokens = sum(1 for token in tokens if _stem(token) in haystack_stems)
+    required_tokens = min(len(tokens), max(1, math.ceil(len(tokens) * 0.80)))
+    years_ok = all(re.search(rf"\b{re.escape(year)}\b", haystack) for year in years)
+    if matched_tokens >= required_tokens and years_ok:
         return True, "ok"
     return False, f"source title not corroborated: {source_title!r}"
 
@@ -253,10 +335,11 @@ def assess_source_support(note: EvidenceNote, page: "ExtractedPage") -> SupportC
     sentences = _sentences(content)
 
     terms = _significant_terms(note.claim)
+    claim_stems = {_stem(term) for term in terms}
     title_ok, title_reason = _title_matches(note.source_title or "", haystack)
 
     # 1. the source must not argue against the claim
-    contradicting = _contradicting_excerpt(sentences, terms)
+    contradicting = _contradicting_excerpt(sentences, terms, note.claim)
     if contradicting is not None:
         return SupportCheck(
             "contradicted", "source contradicts the claim", contradicting
@@ -270,11 +353,41 @@ def assess_source_support(note: EvidenceNote, page: "ExtractedPage") -> SupportC
             _best_excerpt(sentences, terms) or content[:MAX_EXCERPT_CHARS],
         )
 
-    # 3. every quoted statistic must actually occur in the body
+    # 3. support must occur in one claim-relevant sentence. Page-wide term
+    # overlap is not enough to prove that the page makes the asserted claim.
+    ranked = sorted(
+        (
+            (
+                _sentence_coverage(sentence, claim_stems),
+                _ordered_claim_coverage(note.claim, sentence),
+                sentence,
+            )
+            for sentence in sentences
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    best_coverage, ordered_coverage, support_sentence = (
+        ranked[0] if ranked else (0.0, 0.0, "")
+    )
+    if terms and (
+        best_coverage < MIN_TERM_OVERLAP
+        or ordered_coverage < MIN_ORDERED_CLAIM_COVERAGE
+    ):
+        return SupportCheck(
+            "unsupported",
+            "source does not state the claim "
+            f"(sentence overlap {best_coverage:.2f}, "
+            f"ordered claim coverage {ordered_coverage:.2f})",
+            _best_excerpt(sentences, terms),
+        )
+
+    # 4. every quoted statistic must occur as a token with the same unit in
+    # that claim-relevant sentence, rather than somewhere unrelated on-page.
     missing = [
         number
         for number in _claimed_numbers(note.claim)
-        if not any(variant in content for variant in _number_variants(number))
+        if not _number_present(number, support_sentence)
     ]
     if missing:
         return SupportCheck(
@@ -283,19 +396,8 @@ def assess_source_support(note: EvidenceNote, page: "ExtractedPage") -> SupportC
             _best_excerpt(sentences, terms) or content[:MAX_EXCERPT_CHARS],
         )
 
-    # 4. the page must be about the claim at all
-    if terms:
-        matched = [term for term in terms if term in content]
-        overlap = len(matched) / len(terms)
-        if overlap < MIN_TERM_OVERLAP:
-            return SupportCheck(
-                "unsupported",
-                f"source does not discuss the claim (term overlap {overlap:.2f})",
-                _best_excerpt(sentences, terms),
-            )
-
     return SupportCheck(
-        "supported", "ok", _best_excerpt(sentences, terms)
+        "supported", "ok", support_sentence[:MAX_EXCERPT_CHARS] or None
     )
 
 

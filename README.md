@@ -19,7 +19,7 @@ P0 → P1 → … → P9.
 
 **P0–P9 功能全部实现并通过自动化测试 ✅。**
 
-审计修复分两轮,订单号相互独立:
+审计修复按三轮复验记录，各轮编号相互独立:
 
 - **第一轮**(`CODEX-AUDIT-REPORT.md` 基于 commit `c5c7101`,30 项:0 Critical /
   12 High / 15 Medium / 3 Low)——B1–B7 逐批修复(见
@@ -29,6 +29,9 @@ P0 → P1 → … → P9.
   `R-H01`…`R-L01`,共 0 Critical / **7 High** / **3 Medium** / **1 Low**)——
   B8–B14 逐批修复,本轮 commit `4de7ab4`,逐项进度与测试证据见
   `docs/AUDIT-R2-FIX-PROGRESS.md`,每阶段详档见 `docs/audit-r2/`。
+- **第三轮复验**（当前 `CODEX-AUDIT-REPORT.md`，基于 HEAD `92a919e`）发现
+  R2 修复仍有 2 High / 2 Medium / 1 Low 边界。当前工作树已逐项补齐；这些是
+  R2 原复现之外的后续修复，不回写成 R2 当时已经覆盖。
 
 | 批次 | 阶段 | 修复项 | 阶段文档 |
 |---|---|---|---|
@@ -60,9 +63,11 @@ P0 → P1 → … → P9.
 
 实现口径与验收边界(诚实声明):
 
-- **代码实现 + 审计修复(已验证)**:P0–P9 全部阶段功能已落地;第一轮 30 项与
-  第二轮 13 项的代码/测试证据均已在本地回归。完整测试套件(unit + integration,
-  本地 PostgreSQL + fake providers)全绿:**`587 passed, 1 skipped`**。
+- **代码实现 + 审计修复(当前离线验证)**:P0–P9 全部阶段功能已落地;第一轮 30 项与
+  第二轮 **11 项**均保留其当时的测试记录。第三轮边界修复后，本机 Python 3.12
+  完整可执行套件为 **`556 passed, 48 skipped, 1 warning`**；48 项是 PostgreSQL /
+  真实外部服务条件未满足而跳过，未计作通过。R2 的 `587 passed, 1 skipped` 是另一
+  环境的历史结果，不代表本轮执行结果。
 - **mock 范围(测试口径)**:自动化测试使用 **fake providers**(fake LLM /
   SERP / Extractor / Image / Strapi)+ 本地 PostgreSQL 验证**逻辑正确性**,
   不调用真实付费 API、不写真实 Strapi(本仓库约定,见 `AGENTS.md`)。
@@ -113,7 +118,7 @@ uvicorn app.main:app --reload --port 8080
 python -m app.workers.article_worker
 
 # 6. tests
-python3 -m pytest            # full suite (current: 587 passed, 1 skipped)
+python3 -m pytest            # full suite; current result is recorded above
 ```
 
 > **Migrations (concurrency note).** Schema changes are pure Alembic and are

@@ -269,15 +269,21 @@ def _build_compliant_job(sess: Session) -> GenerationJob:
 
     #: Pipeline order: the three reviews persist on the draft (v1), the
     #: FINAL anti-copy verdict on the latest (v2) version.
+    review_rows = []
     for rtype in ("seo", "fact", "style"):
-        sess.add(
-            ArticleReviewRow(
+        review_row = ArticleReviewRow(
                 job_id=job.id,
                 article_version_id=writer.id,
                 review_type=rtype,
                 review={"ok": True, "review_type": rtype},
             )
-        )
+        sess.add(review_row)
+        review_rows.append(review_row)
+    sess.flush()
+    final.based_on_reviews = {
+        row.review_type: {"review_id": str(row.id), "attempt": row.attempt}
+        for row in review_rows
+    }
     sess.add(
         ArticleReviewRow(
             job_id=job.id,
@@ -688,6 +694,43 @@ def test_h1_inside_fenced_code_is_not_an_h1(session):
     assert not _contains(errors, "contains an H1 heading"), errors
 
 
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "<h1>Additional heading</h1>",
+        "<H1>Additional heading</H1>",
+        '<h1 class="article-title">Additional heading</h1>',
+        '<h1\n class="article-title">Additional heading</h1>',
+    ],
+    ids=["plain", "uppercase", "attributes", "multiline"],
+)
+def test_html_h1_fails(session, tag):
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = tag + "\n\n" + BODY
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert _contains(errors, "contains an HTML H1 heading"), errors
+
+
+def test_html_h1_inside_fenced_code_is_not_an_h1(session):
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = BODY + "\n```html\n<h1>literal</h1>\n```\n"
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert not _contains(errors, "contains an HTML H1 heading"), errors
+
+
+def test_html_h1_inside_inline_code_is_not_an_h1(session):
+    job = _job(session)
+    version = _final_version(session, job)
+    version.body_markdown = BODY + "\n`<h1>literal</h1>`\n"
+    session.flush()
+    errors = validate_article_done(session, job)
+    assert not _contains(errors, "contains an HTML H1 heading"), errors
+
+
 def test_h2_underline_is_not_an_h1(session):
     """A Setext ``-`` underline is an H2, not an H1 — must not be flagged."""
     job = _job(session)
@@ -904,15 +947,21 @@ def test_r_h05_reviews_on_current_writer_satisfy_the_gate(session):
     job = _job(session)
     writer_v3 = _add_version(session, job, 3, "writer")
     revision_v4 = _add_version(session, job, 4, "revision")
+    rows = []
     for rtype in ("seo", "fact", "style"):
-        session.add(
-            ArticleReviewRow(
+        row = ArticleReviewRow(
                 job_id=job.id,
                 article_version_id=writer_v3.id,
                 review_type=rtype,
                 review={"ok": True},
             )
-        )
+        session.add(row)
+        rows.append(row)
+    session.flush()
+    revision_v4.based_on_reviews = {
+        row.review_type: {"review_id": str(row.id), "attempt": row.attempt}
+        for row in rows
+    }
     session.add(
         ArticleReviewRow(
             job_id=job.id,
@@ -923,6 +972,28 @@ def test_r_h05_reviews_on_current_writer_satisfy_the_gate(session):
     )
     session.flush()
     assert validate_article_done(session, job) == []
+
+
+def test_r3_h01_stale_revision_lineage_fails_the_gate(session):
+    """A newer review attempt makes the old revision non-shippable."""
+    from app.pipeline.steps._article_common import persist_review
+
+    job = _job(session)
+    writer = _writer_version(session, job)
+    persist_review(
+        session,
+        job,
+        writer,
+        review_type="fact",
+        review={"issues": [{"verdict": "remove"}]},
+    )
+    session.flush()
+
+    errors = validate_article_done(session, job)
+    assert _contains(
+        errors,
+        "final revision does not consume the current seo/fact/style review attempts",
+    ), errors
 
 
 # ----------------------------------------------------------------------

@@ -66,6 +66,12 @@ class PipelineError(Exception):
     error_code: ErrorCode
     message: str
     raw: str | None = None
+    #: Paid-provider telemetry that was present on an otherwise failed
+    #: response. ``provider_cost_reported=True`` with ``provider_cost=None``
+    #: means the response was observed but did not report an amount; callers
+    #: persist that as unknown rather than inventing a zero charge.
+    provider_cost: float | None = None
+    provider_cost_reported: bool = False
 
     def __post_init__(self) -> None:
         # R-H04: normalize/redact whatever the provider handed over so the

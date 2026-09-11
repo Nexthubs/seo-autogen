@@ -9,7 +9,7 @@ version in ``article_reviews``.
 
 import json
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.models.article import ArticleReviewRow, ArticleVersionRow
@@ -26,12 +26,13 @@ from app.schemas.article import ArticleDocument
 
 #: Section 50: the guideline is part of the Writer/Reviewer context.
 MAX_GUIDELINE_CHARS = 24000
+REVISION_REVIEW_TYPES = ("seo", "fact", "style")
 
 
 def latest_article_version(
     session: Session, job: GenerationJob
 ) -> ArticleVersionRow | None:
-    """The highest-numbered article version for the job (any stage).
+    """The highest-numbered non-invalidated article version for the job.
 
     This is the FINAL / shipped version: after a complete run the highest
     version is the ``revision`` stage. Use it for "what ships" consumers
@@ -39,7 +40,10 @@ def latest_article_version(
     """
     return session.scalars(
         select(ArticleVersionRow)
-        .where(ArticleVersionRow.job_id == job.id)
+        .where(
+            ArticleVersionRow.job_id == job.id,
+            ArticleVersionRow.invalidated_at.is_(None),
+        )
         .order_by(ArticleVersionRow.version.desc())
     ).first()
 
@@ -62,14 +66,21 @@ def latest_writer_version(
         .where(
             ArticleVersionRow.job_id == job.id,
             ArticleVersionRow.stage == "writer",
+            ArticleVersionRow.invalidated_at.is_(None),
         )
         .order_by(ArticleVersionRow.version.desc())
     ).first()
 
 
 def next_article_version(session: Session, job: GenerationJob) -> int:
-    current = latest_article_version(session, job)
-    return (current.version + 1) if current is not None else 1
+    # Invalidated rows remain immutable history and still own their version
+    # numbers, so sequence allocation must consider every historical row.
+    current = session.scalar(
+        select(func.max(ArticleVersionRow.version)).where(
+            ArticleVersionRow.job_id == job.id
+        )
+    )
+    return int(current or 0) + 1
 
 
 def persist_article_version(
@@ -119,8 +130,8 @@ def latest_review_row(
     """The CURRENT VALID review row: highest ``attempt`` for that
     (version, type).
 
-    R-M03: reviews are append-only history, so "which verdict is current"
-    is derived (max attempt), never expressed by deleting older rows.
+    Reviews are append-only history, so "which verdict is current" is the
+    highest non-invalidated attempt, never expressed by deleting older rows.
     """
     return session.scalars(
         select(ArticleReviewRow)
@@ -128,6 +139,7 @@ def latest_review_row(
             ArticleReviewRow.job_id == job.id,
             ArticleReviewRow.article_version_id == version_row.id,
             ArticleReviewRow.review_type == review_type,
+            ArticleReviewRow.invalidated_at.is_(None),
         )
         .order_by(ArticleReviewRow.attempt.desc())
     ).first()
@@ -191,6 +203,7 @@ def review_lineage(
         .where(
             ArticleReviewRow.job_id == job.id,
             ArticleReviewRow.article_version_id == version_row.id,
+            ArticleReviewRow.invalidated_at.is_(None),
         )
         .order_by(ArticleReviewRow.attempt.desc())
     ).all()
@@ -203,6 +216,33 @@ def review_lineage(
                 "attempt": row.attempt,
             }
     return lineage
+
+
+def revision_matches_current_reviews(
+    session: Session,
+    job: GenerationJob,
+    writer: ArticleVersionRow,
+    revision: ArticleVersionRow,
+) -> bool:
+    """Whether ``revision`` consumed the current valid reviewer attempts.
+
+    A later retry can append a new review attempt for the same writer while
+    retaining the old revision for audit.  Such a revision is no longer a
+    valid checkpoint or shippable final even though its version is newer.
+    """
+    if revision.stage != "revision" or revision.invalidated_at is not None:
+        return False
+    expected: dict[str, dict] = {}
+    for review_type in REVISION_REVIEW_TYPES:
+        row = latest_review_row(session, job, writer, review_type)
+        if row is None:
+            return False
+        expected[review_type] = {
+            "review_id": str(row.id),
+            "attempt": row.attempt,
+        }
+    actual = revision.based_on_reviews or {}
+    return actual == expected
 
 
 def latest_review(

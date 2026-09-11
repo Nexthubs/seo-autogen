@@ -13,13 +13,12 @@ This module turns those rows into the queryable map P9 needs:
   clean state for its own per-run artifacts, e.g. a fresh SERP run or a new
   competitor-analysis batch).
 
-H11 — immutable article history: the article ``versions`` and ``reviews``
-rows are an append-only, immutable log (spec sections 27-28, 46.13-46.14).
-A retry re-runs the writer/reviser and APPENDS a new version rather than
-deleting the old one, so :func:`reset_from_step` deliberately does NOT touch
-``article_versions`` / ``article_reviews``. The "current valid" draft is
-DERIVED from that history (the newest ``stage="writer"`` version; the newest
-version overall is the final shipped one) — see the ``step_done`` notes below.
+H11 / R3-H01 — article ``versions`` and ``reviews`` remain an append-only
+audit log (spec sections 27-28, 46.13-46.14). A retry appends new output and
+never deletes history. It does set ``invalidated_at`` on the affected current
+rows, so checkpoint presence cannot mistake an old review/revision for the
+current dependency chain. The final revision must also record the exact
+current reviewer attempts it consumed.
 
 Other per-run rows (SERP, sources, research, outline, images, LLM usage) are
 deleted explicitly (not left to ORM/FK cascades) so reset behaves identically
@@ -30,8 +29,9 @@ tests).
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.db.models.article import ArticleReviewRow, ArticleVersionRow
@@ -46,6 +46,7 @@ from app.db.models.research import (
 )
 from app.db.models.serp import SerpResult, SerpRun
 from app.db.models.source import JobSource
+from app.pipeline.steps._article_common import revision_matches_current_reviews
 
 #: The 15 checkpoint steps in orchestrator order (spec section 9).
 #: ``STEP_NAMES.index(name) + 1`` is the 1-based step index used by the
@@ -108,6 +109,7 @@ def _version_exists(session: Session, job: GenerationJob, stage: str) -> bool:
             ArticleVersionRow,
             ArticleVersionRow.job_id == job.id,
             ArticleVersionRow.stage == stage,
+            ArticleVersionRow.invalidated_at.is_(None),
         )
         > 0
     )
@@ -117,7 +119,10 @@ def _latest_version(session: Session, job: GenerationJob) -> ArticleVersionRow |
     return (
         session.scalars(
             select(ArticleVersionRow)
-            .where(ArticleVersionRow.job_id == job.id)
+            .where(
+                ArticleVersionRow.job_id == job.id,
+                ArticleVersionRow.invalidated_at.is_(None),
+            )
             .order_by(ArticleVersionRow.version.desc())
         )
         .first()
@@ -131,6 +136,7 @@ def _writer_version(session: Session, job: GenerationJob) -> ArticleVersionRow |
             .where(
                 ArticleVersionRow.job_id == job.id,
                 ArticleVersionRow.stage == "writer",
+                ArticleVersionRow.invalidated_at.is_(None),
             )
             .order_by(ArticleVersionRow.version.desc())
         )
@@ -145,6 +151,7 @@ def _review_present(session: Session, version: ArticleVersionRow, review_type: s
             ArticleReviewRow,
             ArticleReviewRow.article_version_id == version.id,
             ArticleReviewRow.review_type == review_type,
+            ArticleReviewRow.invalidated_at.is_(None),
         )
         > 0
     )
@@ -234,13 +241,20 @@ def step_done(session: Session, job: GenerationJob, step_name: str) -> bool:
         writer = _writer_version(session, job)
         if writer is None:
             return False
-        return _count(
-            session,
-            ArticleVersionRow,
-            ArticleVersionRow.job_id == job.id,
-            ArticleVersionRow.stage == "revision",
-            ArticleVersionRow.version > writer.version,
-        ) > 0
+        revisions = session.scalars(
+            select(ArticleVersionRow)
+            .where(
+                ArticleVersionRow.job_id == job.id,
+                ArticleVersionRow.stage == "revision",
+                ArticleVersionRow.version > writer.version,
+                ArticleVersionRow.invalidated_at.is_(None),
+            )
+            .order_by(ArticleVersionRow.version.desc())
+        ).all()
+        return any(
+            revision_matches_current_reviews(session, job, writer, revision)
+            for revision in revisions
+        )
     if step_name == "image_plan":
         return _count(session, ImageRow, ImageRow.job_id == job.id) > 0
     if step_name == "image_generate":
@@ -304,11 +318,9 @@ def reset_from_step(
       "for later cost/performance analysis"; M12 requires retries to
       accumulate, so nothing about a step's usage rows is ever deleted here.
 
-    The article ``versions`` and ``reviews`` (steps 9-13) are NOT deleted:
-    they are immutable, append-only history (H11, spec sections 27-28,
-    46.13-46.14). A retry re-runs the writer/reviser and appends a new
-    version; the current draft/final is derived from the history, and old
-    versions + reviews stay queryable for audit.
+    The article ``versions`` and ``reviews`` (steps 9-13) are NOT deleted.
+    A retry marks the affected dependency chain invalid and appends fresh
+    rows; old versions/reviews stay queryable for audit.
     """
     if not 1 <= step_index <= len(STEP_NAMES):
         raise ValueError(
@@ -354,11 +366,51 @@ def reset_from_step(
             delete(ArticleOutlineRow).where(ArticleOutlineRow.job_id == job.id)
         )
 
-    # H11: article_versions and article_reviews are IMMUTABLE append-only
-    # history (spec sections 27-28, 46.13-46.14) — a retry appends new
-    # versions rather than deleting the old ones, so we never delete them
-    # here. The current draft/final are derived from the history (see
-    # step_done), and stale older versions/reviews stay queryable for audit.
+    # R3-H01: preserve append-only article history while explicitly marking
+    # the re-run dependency chain stale.  Presence alone is insufficient:
+    # after retrying Fact Review, the old Style Review and revision must not
+    # make Resume jump directly to images.
+    if step_index <= 13:
+        invalidated_at = datetime.now(timezone.utc)
+        if step_index <= 9:
+            session.execute(
+                update(ArticleVersionRow)
+                .where(
+                    ArticleVersionRow.job_id == job.id,
+                    ArticleVersionRow.invalidated_at.is_(None),
+                )
+                .values(invalidated_at=invalidated_at)
+            )
+            session.execute(
+                update(ArticleReviewRow)
+                .where(
+                    ArticleReviewRow.job_id == job.id,
+                    ArticleReviewRow.invalidated_at.is_(None),
+                )
+                .values(invalidated_at=invalidated_at)
+            )
+        else:
+            first_review = step_index - 10
+            stale_types = ("seo", "fact", "style")[first_review:]
+            session.execute(
+                update(ArticleReviewRow)
+                .where(
+                    ArticleReviewRow.job_id == job.id,
+                    ArticleReviewRow.invalidated_at.is_(None),
+                    ArticleReviewRow.review_type.in_((*stale_types, "anticopy")),
+                )
+                .values(invalidated_at=invalidated_at)
+            )
+            session.execute(
+                update(ArticleVersionRow)
+                .where(
+                    ArticleVersionRow.job_id == job.id,
+                    ArticleVersionRow.stage == "revision",
+                    ArticleVersionRow.invalidated_at.is_(None),
+                )
+                .values(invalidated_at=invalidated_at)
+            )
+
     if step_index <= 14:
         session.execute(delete(ImageRow).where(ImageRow.job_id == job.id))
 

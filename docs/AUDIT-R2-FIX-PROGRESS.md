@@ -55,7 +55,7 @@
 | 新增依赖 | 无（复用已有 `markdown-it-py`） |
 | 未证明项 | 真实 PostgreSQL 迁移/集成、真实 Redis Worker、真实 Provider 全链路至 READY、专用 Strapi Draft §64 人工检查（报告 §1 授权豁免，属上线前部署验收） |
 
-### 审计 13 项逐项收口状态
+### 审计 11 项逐项收口状态
 
 | 编号 | 级别 | 批次 | 状态 | 回归范围 |
 |---|---|---|---|---|
@@ -63,17 +63,33 @@
 | R-H02 | High | B12 | ✅ 已验证 | 标准 Strapi 201 顶层数组解析 + 真实 Provider 全 A–F sync + 非 PipelineError 失败态 |
 | R-H03 | High | B12 | ✅ 已验证 | 前置失败→补配置→重试复用行；create HTTP 失败→重试复用行 |
 | R-H04 | High | B9 | ✅ 已验证 | 真实 DataForSEO/Exa 错误 → 编排器失败分支 → DB `FAILED` + 安全 raw；dict raw 纵深防御 |
-| R-H05 | High | B11 | ✅ 已验证 | Markdown token H1（缩进/Setext/代码块）+ FAQ 空答案 + 当前 writer 审核血缘 |
-| R-H06 | High | B10 | ✅ 已验证 | 支持性核实四类负例（不相关/反驳/缺数字/题名不符）+ 摘录落库 |
+| R-H05 | High | B11 | ✅ 原复现已验证；R3 有后续边界 | Markdown H1/FAQ/当前 writer 已修；HTML H1 与 review retry→resume 由 R3-M01/R3-H01 后续修复 |
+| R-H06 | High | B10 | ✅ 原复现已验证；R3 有后续边界 | 不相关/固定反驳/缺数字/题名不符已修；方向相反、数字子串、同作者不同文献由 R3-H02 后续修复 |
 | R-H07 | High | B13 | ✅ 已验证 | 6 种恶意 member + symlink → 零写入、零 DB 变动 |
 | R-M01 | Med | B13 | ✅ 已验证 | DB 失败后 live 文件恢复 ORIGINAL；成功路径仍覆盖 |
-| R-M02 | Med | B13 | ✅ 已验证 | SERP/抓取/证据核实/图片重生成/复用/缓存命中/未知成本七类事件 |
+| R-M02 | Med | B13 | ✅ 原复现已验证；R3 有后续边界 | 成功调用的成本历史已修；已报告费用但业务结果失败由 R3-M02 后续修复 |
 | R-M03 | Med | B11 | ✅ 已验证 | 审核 attempt append-only + revision `based_on_reviews` 血缘 |
 | R-L01 | Low | B14 | ✅ 已验证 | README + 两份进度文档诚实更正（9 项改判 + 边界声明 + 本轮 commit） |
 
 > 说明：R-H01…R-M03 的"已验证"指本轮离线范围（SQLite/内存 + 本地 PostgreSQL +
 > MockTransport + 真实已安装依赖）内的代码与测试证据；真实服务运行验收仍未执行，
 > 也不作为本轮放行条件（报告 §1 / §8）。
+
+### 第三轮复验后的更正（2026-09-11）
+
+R2 表中的“完成”只表示其列出的**原始复现**在当时环境通过，不再解释为所有相邻
+边界均已证明。第三轮报告在 HEAD `92a919e` 上发现并由当前工作树修复：
+
+| R3 编号 | 当前处理 | 本机证据 |
+|---|---|---|
+| R3-H01 | 审核/修订增加显式失效标记；Resume 与 DoD 校验当前 review lineage | retry Fact→Style 未完成时恢复点为 step 12；过期 revision 被 DoD 拒绝 |
+| R3-H02 | 数值单位 token、句级有序 claim、方向冲突、强化题名身份匹配 | `97%≠1970`、reduces≠increases、newsletter≠trial 均拒绝 |
+| R3-M01 | Markdown parser 的 `html_block/html_inline` 另行拒绝 HTML H1 | 大小写、属性、跨行均拒绝；fenced/inline code 字面量不误报 |
+| R3-M02 | DataForSEO 失败异常携带已观察费用；流水独立于失败回滚提交 | 空 organic + cost=0.05 留一条 0.05 charged；未报金额留 NULL；网络失败不猜测收费 |
+| R3-L01 | 本节、README 与阶段文档修正数量及验证范围 | 第二轮总数明确为 11；历史测试数与本轮结果分离 |
+
+当前本机结果：`556 passed, 48 skipped, 1 warning`。48 项为 PostgreSQL/真实外部服务
+条件跳过；R2 记录的 `587 passed, 1 skipped` 保留为其原环境历史结果。
 
 ## 明细跟踪表
 
@@ -112,7 +128,7 @@
 
 | ID | 级别 | 问题摘要 | 修复内容 | 关键文件 | 测试证据 | 状态 |
 |---|---|---|---|---|---|---|
-| R-H05 | High | DoD 仍放行三类内容缺陷：① `_faq_question_count` 只数 `###`，三个**空标题**可过 gate（测试还明确接受该行为）；② H1 正则漏掉 CommonMark 允许的 1–3 空格缩进 ATX H1 与单 `=` Setext H1（`X\n=\n`），而项目渲染器把二者都渲染为 `<h1>`；③ `job_reviews` 按整个 job 聚合，新 writer v3/revision v4 没有本轮 seo/fact/style，只要旧稿有 review + v4 有 anticopy 即可通过 | ① **H1 与 FAQ 改由 Markdown token 解析**（与渲染器同一 `MarkdownIt("commonmark")`）：`_headings()` 收集 heading token，`tag=="h1"` 即违规（缩进 ATX / 单 `=` Setext / `<h1>` 全捕获，代码块内 `#` 不误判）；`_faq_qa_counts()` 逐 `###` 问题检查其后是否存在**非空内容块**（段落/列表/引用），空答案与部分空答案都 fail；② **审核血缘**：三份 review 必须挂在 `latest_writer_version()`（当前 revision 实际基于的 writer 草稿），聚合"本 job 任意版本"不再通过；③ anti-copy 校验改取 final 版本的**最高 attempt**（配合 R-M03） | `app/services/article_dod.py`（重写 H1/FAQ/审核判定）、`tests/unit/test_article_dod.py`、`tests/unit/test_article_steps.py` | `tests/unit/test_article_dod.py` 新增/改写：单 `=` Setext H1、缩进 ATX H1、代码块内 `#` 不误判、FAQ 空答案 fail、部分空答案 fail、列表答案计为已答、**审计原始复现**（writer v3 + revision v4，旧稿 review + v4 anticopy → 3 条 missing 错误）与对应正向用例 | ✅ |
+| R-H05 | High | DoD 仍放行三类内容缺陷：① `_faq_question_count` 只数 `###`，三个**空标题**可过 gate（测试还明确接受该行为）；② H1 正则漏掉 CommonMark 允许的 1–3 空格缩进 ATX H1 与单 `=` Setext H1（`X\n=\n`），而项目渲染器把二者都渲染为 `<h1>`；③ `job_reviews` 按整个 job 聚合，新 writer v3/revision v4 没有本轮 seo/fact/style，只要旧稿有 review + v4 有 anticopy 即可通过 | ① **Markdown H1 与 FAQ 改由 token 解析**：缩进 ATX / 单 `=` Setext 可捕获，代码块内 `#` 不误判；R2 此处**没有覆盖原始 HTML `<h1>`**，该边界由 R3-M01 另行修复。② **审核血缘**：三份 review 必须挂在 `latest_writer_version()`；同 writer 新 attempt 后旧 revision 的边界由 R3-H01 另行修复。③ anti-copy 校验取 final 版本最高 attempt | `app/services/article_dod.py`、`tests/unit/test_article_dod.py`、`tests/unit/test_article_steps.py` | R2 原始 Markdown/FAQ/旧 writer 复现通过；HTML H1 与 retry→resume 组合不计入 R2 当时证据，见上方第三轮更正 | ✅ 原复现；R3 补边界 |
 | R-M03 | Med | `persist_review` 对相同 (writer/version/type) **先 delete 再 insert**：重跑 Fact Review 后原 review ID 消失，已保留的旧 revision 无法追溯其输入（reset 不删 review ≠ 写入链 append-only） | 审核改为**append-only 运行历史**：① `article_reviews.attempt`（INTEGER，默认 1）记录同一 (version,type) 的第 N 次运行，"当前有效"由 `latest_review_row()`（max attempt）**派生**而非删除；② `persist_review` 不再 delete，改为 `attempt = max+1` 追加；③ `article_versions.based_on_reviews`（JSONB）由 reviser 通过 `review_lineage()` 写入本次 revision 实际消费的 `{type: {review_id, attempt}}`，使每个 revision 都能定位其审核集合 | `app/db/models/article.py`、`app/pipeline/steps/_article_common.py`、`app/pipeline/steps/article_reviser.py`、**新增迁移 `0013_review_lineage`**、`tests/unit/test_article_steps.py`、`tests/integration/test_p9_pipeline.py` | `tests/unit/test_article_dod.py`：`test_r_m03_review_retry_appends_and_keeps_history`（两次 fact review → attempt [1,2]、原 ID 仍在、`latest_review` 取 REPLACEMENT、`review_lineage` attempt=2）、`test_r_m03_latest_anticopy_attempt_wins`（新 attempt 覆盖旧判定 + 反向）；`tests/unit/test_article_steps.py` 旧用例 `..._replaces_same_version_type` 改写为 `..._appends_attempt_and_keeps_history`；`tests/integration/test_p9_pipeline.py` 全链路断言 revision 的 `based_on_reviews` 含 seo/fact/style 且 review_id/attempt 有效 | ✅ |
 
 **B11 测试结果**：全量 `559 passed, 1 skipped, 1 warning`（B10 后 549 + 新增 10）。
@@ -146,7 +162,7 @@
 
 | ID | 级别 | 问题摘要 | 修复内容 | 关键文件 | 测试证据 | 状态 |
 |---|---|---|---|---|---|---|
-| R-L01 | Low | README 与 `docs/AUDIT-FIX-PROGRESS.md` 的"30 项全部完成"超出实际证据；部分说明与代码相反（FAQ 空答案、Upload 顶层数组、完整不可变成本历史） | ① `README.md` 现状段重写：两轮审计口径分离、B8–B14 批次表（含阶段文档路径）、**第一轮 30 项的第二轮复验更正表**（9 项改判 + 对应批次）、mock/live 验收边界与"未证明项"声明、测试基线更新为 `587 passed`；备份 CLI 段补充 R-H07/R-M01 安全语义；② `docs/AUDIT-FIX-PROGRESS.md` 顶部加入 ⚠️ 诚实性更正块（逐项改判表 + "最终状态以本轮文档为准"），并在 B7"30 项全部收口"行就地标注更正；③ 本文档补"最终状态"与 13 项逐项收口状态表，引用本轮 commit | `README.md`、`docs/AUDIT-FIX-PROGRESS.md`、`docs/AUDIT-R2-FIX-PROGRESS.md`、`docs/audit-r2/B8…B13` 阶段文档 | 静态核对：文档与 `git log`、测试基线、迁移链（单 head `0014`）一致；逐项状态与本轮各批次测试证据一一对应 | ✅ |
+| R-L01 | Low | README 与 `docs/AUDIT-FIX-PROGRESS.md` 的"30 项全部完成"超出实际证据；部分说明与代码相反（FAQ 空答案、Upload 顶层数组、完整不可变成本历史） | ① `README.md` 现状段重写；②第一轮文档追加诚实性更正；③本文档补最终状态与 **11 项**逐项表。第三轮再更正 HTML H1、Evidence、失败费用等未覆盖边界 | `README.md`、`docs/AUDIT-FIX-PROGRESS.md`、`docs/AUDIT-R2-FIX-PROGRESS.md`、`docs/audit-r2/` | 历史结果保留；当前验证范围与跳过项见上方第三轮更正 | ✅ 原复现；R3 已更正 |
 
 **B14 测试结果**：文档变更不改代码；全量回归维持 `587 passed, 1 skipped, 1 warning`。
 **无新迁移**。
