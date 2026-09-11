@@ -14,6 +14,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.db.models.research import CompetitorAnalysisRow, SerpSynthesisRow
@@ -105,6 +106,8 @@ async def run_serp_synthesis(
             job.keyword, [r.analysis for r in analysis_rows], paa, related
         ),
         response_model=SERPSynthesis,
+        # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+        model=(get_settings().llm_analysis_model or get_settings().llm_model),
     )
 
     # One row per job: re-runs of the step replace the previous row.

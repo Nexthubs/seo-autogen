@@ -16,6 +16,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.core.exceptions import ErrorCode, PipelineError
 from app.db.models.job import GenerationJob
@@ -129,6 +130,8 @@ async def run_outline(
         system_prompt=prompt.content,
         user_prompt=build_user_prompt(guideline_excerpt, brief, synthesis, evidence),
         response_model=ArticleOutline,
+        # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+        model=(get_settings().llm_analysis_model or get_settings().llm_model),
     )
 
     errors = validate_outline(outline, brief)
@@ -152,6 +155,8 @@ async def run_outline(
             system_prompt=repair_prompt.content,
             user_prompt=build_repair_prompt(brief, outline, errors),
             response_model=ArticleOutline,
+            # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+            model=(get_settings().llm_analysis_model or get_settings().llm_model),
         )
         errors = validate_outline(outline, brief)
 

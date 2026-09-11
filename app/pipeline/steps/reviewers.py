@@ -115,6 +115,8 @@ async def run_seo_review(
         response_model=SEOReview,
         # M08: tunable via .env (LLM_TEMPERATURE_REVIEW), not hardcoded.
         temperature=get_settings().llm_temperature_review,
+        # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+        model=(get_settings().llm_analysis_model or get_settings().llm_model),
     )
 
     persist_review(
@@ -171,6 +173,8 @@ async def run_fact_review(
         response_model=FactReview,
         # M08: tunable via .env (LLM_TEMPERATURE_REVIEW), not hardcoded.
         temperature=get_settings().llm_temperature_review,
+        # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+        model=(get_settings().llm_analysis_model or get_settings().llm_model),
     )
 
     persist_review(
@@ -227,6 +231,8 @@ async def run_style_review(
         response_model=StyleReview,
         # M08: tunable via .env (LLM_TEMPERATURE_REVIEW), not hardcoded.
         temperature=get_settings().llm_temperature_review,
+        # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+        model=(get_settings().llm_analysis_model or get_settings().llm_model),
     )
 
     persist_review(

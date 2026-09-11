@@ -27,6 +27,11 @@ from pydantic import BaseModel
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ErrorCode, PipelineError
 from app.providers.llm.base import LLMProvider
+from app.providers.llm.structured_output import (
+    normalize_structured_output_mode,
+    response_format_for_mode,
+    schema_instruction,
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -67,6 +72,12 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         # The meter resets it before each logical call and reads it back
         # afterwards; ``None`` means the endpoint reported no usage.
         self._usage: tuple[int, int] | None = None
+        # Model actually sent by the last logical call (tier override or
+        # default). Provenance readers (llm_usage rows, 46.9-46.12 model
+        # columns) read this instead of assuming the configured default —
+        # otherwise an analysis-tier call would be recorded under the
+        # writing-tier model name.
+        self._last_model: str | None = None
 
     # ------------------------------------------------------------
     # Low-level chat call with the unified retry policy
@@ -78,16 +89,28 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         user_prompt: str,
         temperature: float | None,
         max_tokens: int | None = None,
+        model: str | None = None,
+        messages: list[dict[str, str]] | None = None,
+        response_format: dict | None = None,
     ) -> str:
-        """One chat completion with HTTP retry (spec section 51)."""
+        """One chat completion with HTTP retry (spec section 51).
+
+        ``model`` (docs/TASK-LLM-MODEL-TIERING.md): per-call override for
+        the analysis tier; ``None`` keeps the configured default
+        ``llm_model`` (every pre-tiering call).
+        """
         temperature = (
             self._settings.llm_temperature_analysis
             if temperature is None
             else temperature
         )
+        effective_model = model or self._settings.llm_model
+        self._last_model = effective_model
         payload: dict = {
-            "model": self._settings.llm_model,
-            "messages": [
+            # Tier routing (TASK-LLM-MODEL-TIERING): an explicit per-call
+            # model wins; otherwise the provider's default model.
+            "model": effective_model,
+            "messages": messages or [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
@@ -95,6 +118,8 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if response_format is not None:
+            payload["response_format"] = response_format
 
         attempts = self._settings.llm_max_retries + 1
         last_error: Exception | None = None
@@ -181,6 +206,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
     def begin_usage(self) -> None:
         """Reset the accumulator before a new logical LLM call."""
         self._usage = None
+        self._last_model = None
 
     def take_usage(self) -> tuple[int, int] | None:
         """Return the accumulated tokens of the last logical call."""
@@ -215,15 +241,25 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         user_prompt: str,
         response_model: Type[T],
         temperature: float | None = None,
+        model: str | None = None,
     ) -> T:
-        """Structured output with JSON repair (spec section 49)."""
-        schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
-        base_system = (
-            system_prompt
-            + "\n\nRespond with ONLY a single valid JSON object matching this "
-            "JSON schema. No markdown fences, no commentary:\n"
-            + schema
+        """Structured output with JSON repair (spec section 49).
+
+        ``model`` (docs/TASK-LLM-MODEL-TIERING.md): per-call override for
+        the analysis tier; applied to every attempt of this logical call
+        (initial + repair retries), ``None`` keeps the default model.
+        """
+        schema = response_model.model_json_schema()
+        mode = normalize_structured_output_mode(
+            getattr(self._settings, "llm_structured_output_mode", "prompt_only")
         )
+        schema_name = response_model.__name__.lower() or "structured_output"
+        request_format = response_format_for_mode(
+            mode,
+            schema_name=schema_name,
+            schema=schema,
+        )
+        schema_message = schema_instruction(schema)
 
         last_output = ""
         last_error: Exception | None = None
@@ -242,10 +278,22 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                     + "\n\nReturn ONLY the corrected JSON object."
                 )
 
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            if mode in {"json_object", "prompt_only"}:
+                # Match Zelig's known-good Gemma contract: keep the business
+                # prompt intact and send the schema as a separate user turn.
+                messages.append({"role": "user", "content": schema_message})
+
             output = await self._chat(
-                system_prompt=base_system,
+                system_prompt=system_prompt,
                 user_prompt=prompt,
                 temperature=temperature,
+                model=model,
+                messages=messages,
+                response_format=request_format,
             )
             last_output = output
             try:

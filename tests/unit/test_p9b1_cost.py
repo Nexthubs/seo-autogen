@@ -43,6 +43,7 @@ def _settings() -> Settings:
         dataforseo_base_url="https://api.dataforseo.test",
         dataforseo_login="u",
         dataforseo_password="p",
+        dataforseo_request_type="live",
         image_api_key="img-key",
         image_base_url="http://img.test/v1",
         image_model="gpt-image-2",
@@ -209,6 +210,43 @@ class TestMeter:
         )
         assert row.step == "article_writer"
         assert (row.input_tokens, row.output_tokens) == (7, 9)
+
+    async def test_records_model_tier_provenance(self, db):
+        """TASK-LLM-MODEL-TIERING: usage rows record the model ACTUALLY sent
+        — the analysis-tier override when given, else the default model."""
+        job = _make_job(db)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _json_response('{"value": "x"}', None)
+
+        meter = MeteredLLMProvider(_llm(handler), db, job.id, settings=_settings())
+
+        # Writing tier (no override): default model is recorded.
+        meter.current_step = "article_writer"
+        await meter.generate_text(system_prompt="s", user_prompt="u")
+
+        # Analysis tier (override): the override is recorded.
+        meter.current_step = "content_brief"
+
+        class Out(BaseModel):
+            value: str
+
+        await meter.generate_structured(
+            system_prompt="s",
+            user_prompt="u",
+            response_model=Out,
+            model="analysis-cheap-model",
+        )
+        db.commit()
+
+        rows = {
+            r.step: r
+            for r in db.scalars(
+                select(LLMUsageRow).where(LLMUsageRow.job_id == job.id)
+            ).all()
+        }
+        assert rows["article_writer"].model == "test-model"
+        assert rows["content_brief"].model == "analysis-cheap-model"
 
     async def test_records_prompt_provenance_when_set(self, db):
         """Spec 48 / audit M09: usage rows carry prompt_name / version / hash

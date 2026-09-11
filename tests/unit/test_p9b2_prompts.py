@@ -216,6 +216,63 @@ def test_api_prompts_usage_and_stale(client: TestClient):
     }
 
 
+def test_api_prompts_ignores_incomplete_provenance(client: TestClient):
+    """Legacy rows with NULL provenance must not crash the dashboard."""
+    with client.db_session() as session:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        job = GenerationJob(keyword="p9b2 incomplete provenance", status="ready")
+        session.add(job)
+        session.flush()
+        page = SourcePage(
+            url="https://example.com/p9b2-incomplete",
+            normalized_url="https://example.com/p9b2-incomplete",
+            url_hash="f" * 64,
+            domain="example.com",
+            content_markdown="x",
+            content_hash="a" * 64,
+            extractor="fake",
+            first_seen_at=now,
+            last_fetched_at=now,
+        )
+        session.add(page)
+        session.flush()
+
+        # Same name/version with and without a hash used to make sorted()
+        # compare None to str. Image rows can also have a NULL prompt_name.
+        session.add_all([
+            CompetitorAnalysisRow(
+                job_id=job.id, source_page_id=page.id, analysis={}, model="m",
+                prompt_version="0.9", prompt_hash=None,
+            ),
+            CompetitorAnalysisRow(
+                job_id=job.id, source_page_id=page.id, analysis={}, model="m",
+                prompt_version="0.9", prompt_hash="b" * 64,
+            ),
+            ImageRow(
+                job_id=job.id, role="hero", sort_order=0, purpose="p",
+                prompt="pr", filename="f.png", alt_text="a",
+                aspect_ratio="16:9", provider="x", prompt_name=None,
+                prompt_version="0.9", prompt_hash="c" * 64,
+            ),
+        ])
+        session.commit()
+
+    api = client.get("/api/prompts")
+    assert api.status_code == 200
+    assert api.json()["stale_versions"] == [{
+        "prompt_name": "competitor_analyzer",
+        "prompt_version": "0.9",
+        "prompt_hash": "b" * 64,
+        "usage": 1,
+        "jobs": 1,
+    }]
+
+    # The same payload feeds the HTML route; it must not fail in the
+    # stale-hash display either.
+    page_response = client.get("/prompts")
+    assert page_response.status_code == 200
+
+
 # -------------------------------------------------------------- web page
 def test_prompts_page_renders(client: TestClient):
     resp = client.get("/prompts")

@@ -14,6 +14,7 @@ import logging
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.db.models.research import CompetitorAnalysisRow
@@ -105,6 +106,8 @@ async def run_competitor_analysis(
                 job.keyword, str(page.id), content, page.title
             ),
             response_model=CompetitorAnalysis,
+            # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+            model=(get_settings().llm_analysis_model or get_settings().llm_model),
         )
         # The LLM echoes back the source id; enforce the actual value.
         analysis = analysis.model_copy(update={"source_id": page.id})

@@ -858,13 +858,17 @@ LLM_TEMPERATURE_REVIEW=0.20
 SERP_PROVIDER=dataforseo
 
 DATAFORSEO_BASE_URL=https://api.dataforseo.com
+DATAFORSEO_REQUEST_TYPE=standard
 DATAFORSEO_LOGIN=
 DATAFORSEO_PASSWORD=
 
 DATAFORSEO_LOCATION_CODE=2840
 DATAFORSEO_LANGUAGE_CODE=en
-DATAFORSEO_DEVICE=desktop
+DATAFORSEO_DEVICE=mobile
+DATAFORSEO_OS=ios
 DATAFORSEO_DEPTH=10
+DATAFORSEO_POLL_INTERVAL_SECONDS=5
+DATAFORSEO_POLL_TIMEOUT_SECONDS=3600
 
 # 0 = 不额外点击 PAA，节省成本
 DATAFORSEO_PAA_CLICK_DEPTH=0
@@ -937,10 +941,12 @@ SEO_GUIDELINE_PATH=prompts/seo_article_guideline.md
 
 # 12. DataForSEO 实现规范
 
-V1 使用：
+V1 支持两种请求方式（请求方式和设备平台均可通过 `.env` 切换）：
 
 ```text
-POST /v3/serp/google/organic/live/advanced
+Standard: POST /v3/serp/google/organic/task_post
+Result:   GET  /v3/serp/google/organic/task_get/advanced/{id}
+Live:     POST /v3/serp/google/organic/live/advanced
 ```
 
 认证：
@@ -951,7 +957,7 @@ username = DATAFORSEO_LOGIN
 password = DATAFORSEO_PASSWORD
 ```
 
-默认请求：
+默认请求（标准队列）：
 
 ```json
 [
@@ -959,13 +965,28 @@ password = DATAFORSEO_PASSWORD
     "keyword": "anxious attachment no contact",
     "location_code": 2840,
     "language_code": "en",
-    "device": "desktop",
+    "device": "mobile",
+    "os": "ios",
     "depth": 10,
     "calculate_rectangles": false,
     "load_async_ai_overview": false
   }
 ]
 ```
+
+请求方式通过环境变量切换：
+
+```env
+DATAFORSEO_REQUEST_TYPE=standard  # standard 或 live
+DATAFORSEO_DEVICE=mobile
+DATAFORSEO_OS=ios                 # mobile: android 或 ios；desktop: windows 或 macos
+```
+
+`standard` 使用 `task_post` 创建任务，再使用
+`task_get/advanced/{id}` 轮询结果；`live` 使用对应的 Live Advanced
+端点。标准任务的轮询间隔和超时分别由
+`DATAFORSEO_POLL_INTERVAL_SECONDS` 与 `DATAFORSEO_POLL_TIMEOUT_SECONDS`
+控制。
 
 如果：
 
@@ -4178,25 +4199,36 @@ P8
 
 ## DataForSEO
 
-Google Organic Live Advanced:
+Google Organic SERP:
 
 ```text
-https://api.dataforseo.com/v3/serp/google/organic/live/advanced
+Standard: https://api.dataforseo.com/v3/serp/google/organic/task_post
+Result:   https://api.dataforseo.com/v3/serp/google/organic/task_get/advanced/{id}
+Live:     https://api.dataforseo.com/v3/serp/google/organic/live/advanced
 ```
 
 Documentation:
 
 ```text
-https://docs.dataforseo.com/v3/serp-se-type-live-advanced/
+https://docs.dataforseo.com/v3/serp/google/organic/task_post/
 ```
 
-V1 使用：
+V1 支持两种请求方式：
+
+```text
+Standard: POST /v3/serp/google/organic/task_post
+Result:   GET  /v3/serp/google/organic/task_get/advanced/{id}
+Live:     POST /v3/serp/google/organic/live/advanced
+```
+
+默认使用 Standard；具体请求方式和设备平台由 `.env` 配置。请求体示例：
 
 ```text
 depth=10
 location_code=2840
 language_code=en
-device=desktop
+device=mobile
+os=ios
 calculate_rectangles=false
 load_async_ai_overview=false
 ```

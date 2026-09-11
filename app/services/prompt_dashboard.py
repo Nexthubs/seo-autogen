@@ -62,15 +62,22 @@ _REVIEW_TYPES = {
 
 def _usage_source(model, prompt_name: str):
     """One SELECT of (name, version, hash, job_id) for one prompt."""
+    # The provenance columns are nullable for backwards compatibility with
+    # rows written before P9-B2.  A dashboard usage key is only meaningful
+    # when all three parts of the provenance triple are present; filtering
+    # incomplete rows here also keeps the aggregate sortable by strings.
     stmt = select(
         literal(prompt_name).label("prompt_name"),
         model.prompt_version,
         model.prompt_hash,
         model.job_id,
-    ).where(model.prompt_version.is_not(None))
+    ).where(
+        model.prompt_version.is_not(None),
+        model.prompt_hash.is_not(None),
+    )
     if model is ArticleReviewRow:
         stmt = stmt.where(model.review_type == _REVIEW_TYPES[prompt_name])
-    elif model is ArticleVersionRow:
+    elif model is ArticleVersionRow or model is ImageRow:
         stmt = stmt.where(model.prompt_name == prompt_name)
     return stmt
 

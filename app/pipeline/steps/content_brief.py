@@ -13,6 +13,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.db.models.research import (
@@ -144,6 +145,8 @@ async def run_content_brief(
             strategy=job.strategy,
         ),
         response_model=ContentBrief,
+        # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+        model=(get_settings().llm_analysis_model or get_settings().llm_model),
     )
 
     # Only markers that actually exist as active rules may be planned

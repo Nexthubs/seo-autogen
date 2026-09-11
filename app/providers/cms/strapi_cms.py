@@ -175,20 +175,24 @@ class StrapiCMSProvider(CMSProvider):
         """``GET /api/{pluralApiId}/{documentId}?status=draft``
         (STEP F verification, section 36).
 
-        H03/M02: relations are POPULATED (``populate[author]`` etc.) so
-        the STEP F verification can compare the stored author/category
-        against the expected documentIds even when Strapi returns them
-        as populated objects instead of bare documentId strings.
+        H03/M02: relations are populated with Strapi's flat array syntax
+        (``populate[0]=author`` etc.).  This deliberately avoids the
+        wildcard form (``populate[author]=*``), which makes the live Strapi
+        instance recursively validate the nonexistent ``author.avatar``
+        field.  The STEP F verification can then compare the stored
+        author/category against the expected documentIds even when Strapi
+        returns them as populated objects instead of bare documentId
+        strings.
         """
         data = await self._get(
             f"/api/{self._settings.strapi_blog_plural_api_id}/{document_id}",
             {
                 "status": "draft",
-                "populate[author]": "*",
-                "populate[category]": "*",
-                "populate[mainImage]": "*",
+                "populate[0]": "author",
+                "populate[1]": "category",
+                "populate[2]": "mainImage",
             },
-            code=ErrorCode.STRAPI_AUTH_FAILED,
+            code=ErrorCode.STRAPI_SCHEMA_MISMATCH,
         )
         return self._entry_from_item(data.get("data") or {})
 
@@ -472,7 +476,7 @@ class StrapiCMSProvider(CMSProvider):
             if response.status_code in (401, 403):
                 # Section 60: no token in the message — status only.
                 raise PipelineError(
-                    code,
+                    ErrorCode.STRAPI_AUTH_FAILED,
                     f"Strapi HTTP {response.status_code}: token "
                     "rejected or insufficient permissions",
                 )

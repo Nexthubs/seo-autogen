@@ -32,7 +32,7 @@ from app.pipeline.steps.strapi_sync import run_strapi_sync
 from app.providers.cms.strapi_cms import StrapiCMSProvider
 from app.providers.extractor.tavily import build_extractor
 from app.providers.image.openai_image import OpenAIImageProvider
-from app.providers.llm.openai_compatible import OpenAICompatibleLLMProvider
+from app.providers.llm.tiering import TieredLLMProvider
 from app.providers.serp.dataforseo import DataForSEOSERPProvider
 
 logger = logging.getLogger(__name__)
@@ -46,10 +46,15 @@ def build_providers(settings=None) -> PipelineProviders:
     The extractor comes from :func:`build_extractor` (P9-A): Exa is the
     primary, and when ``TAVILY_API_KEY`` is set the wrapper transparently
     falls back to Tavily Extract for any URL Exa misses.
+
+    The LLM is the two-tier :class:`TieredLLMProvider`: writing-tier calls
+    (``model=None``) and analysis-tier calls (explicit model) land on the
+    writing endpoint by default, and on a second endpoint when the
+    ``LLM_*_ANALYSIS`` variables configure one (TASK-LLM-MODEL-TIERING).
     """
     settings = settings or get_settings()
     return PipelineProviders(
-        llm=OpenAICompatibleLLMProvider(settings=settings),
+        llm=TieredLLMProvider(settings=settings),
         serp=DataForSEOSERPProvider(settings=settings),
         extractor=build_extractor(settings=settings),
         image=OpenAIImageProvider(settings=settings),

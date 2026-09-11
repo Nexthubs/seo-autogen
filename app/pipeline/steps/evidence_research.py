@@ -17,6 +17,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.db.models.job import GenerationJob
 from app.db.models.research import EvidenceNoteRow, SerpSynthesisRow
@@ -86,6 +87,8 @@ async def run_evidence_research(
         system_prompt=prompt.content,
         user_prompt=build_user_prompt(job.keyword, context),
         response_model=EvidenceResearchOutput,
+        # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+        model=(get_settings().llm_analysis_model or get_settings().llm_model),
     )
 
     if not output.notes:

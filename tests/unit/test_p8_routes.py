@@ -418,8 +418,16 @@ def test_api_provider_status_reachability_only(client):
     body = response.json()
     names = set(body["providers"].keys())
     assert names == {"llm", "serp", "extractor", "image", "cms"}
+    # Every provider still reports reachability only as its health field...
     for value in body["providers"].values():
-        assert value == {"reachable": False}
+        assert value["reachable"] is False
+    # ...and the LLM entry additionally surfaces the effective model tier
+    # names (TASK-LLM-MODEL-TIERING; names are not secrets, spec 60).
+    llm_entry = body["providers"]["llm"]
+    assert set(llm_entry) == {"reachable", "writing_model", "analysis_model"}
+    assert llm_entry["writing_model"]
+    # analysis_model falls back to the writing model when the tier is unset.
+    assert llm_entry["analysis_model"]
 
 
 # ----------------------------------------------------------------------

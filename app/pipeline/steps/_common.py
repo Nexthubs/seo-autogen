@@ -5,8 +5,19 @@ from app.services.prompt_service import PromptSpec
 
 
 def llm_model_name(llm: LLMProvider) -> str | None:
-    """Best-effort model name for provenance columns (46.9-46.12)."""
-    settings = getattr(llm, "_settings", None)
+    """Best-effort model name for provenance columns (46.9-46.12).
+
+    Tier-aware (docs/TASK-LLM-MODEL-TIERING.md): when the last logical
+    call used a per-call analysis-tier model, the underlying
+    ``OpenAICompatibleLLMProvider`` records it in ``_last_model``; that
+    wins over the configured default so an analysis/review row is never
+    mislabelled with the writing-tier model name.
+    """
+    inner = getattr(llm, "_inner", None)  # unwrap MeteredLLMProvider
+    last = getattr(inner, "_last_model", None)
+    if isinstance(last, str) and last:
+        return last
+    settings = getattr(inner or llm, "_settings", None)
     return getattr(settings, "llm_model", None)
 
 

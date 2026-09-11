@@ -1,7 +1,9 @@
 """DataForSEO SERP provider (SEO-AUTO-DEV-SPEC.md sections 10.2, 12, 51).
 
-Endpoint:
-    POST /v3/serp/google/organic/live/advanced
+Endpoints:
+    Standard: POST /v3/serp/google/organic/task_post, followed by
+    GET /v3/serp/google/organic/task_get/advanced/{id}
+    Live: POST /v3/serp/google/organic/live/advanced
     HTTP Basic Auth with DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD
 
 The request body is a JSON *array* of one task. Only the `advanced`
@@ -13,7 +15,9 @@ SERP features we actually store are requested:
 ``DATAFORSEO_PAA_CLICK_DEPTH > 0``.)
 
 The full raw response must be preserved (spec section 12.2) — callers
-store it in ``serp_runs.raw_response``.
+store it in ``serp_runs.raw_response``.  Standard mode returns the final
+task-get envelope to the same parser as Live mode; the task-post response
+is used only to obtain the task id and preserve the reported cost.
 
 Response contract (official, machine-verified against the documented
 example; see ``tests/unit/test_dataforseo_provider.py``):
@@ -82,11 +86,14 @@ from app.schemas.serp import (
 
 logger = logging.getLogger(__name__)
 
-ENDPOINT = "/v3/serp/google/organic/live/advanced"
+ENDPOINT_LIVE = "/v3/serp/google/organic/live/advanced"
+ENDPOINT_TASK_POST = "/v3/serp/google/organic/task_post"
+ENDPOINT_TASK_GET_ADVANCED = "/v3/serp/google/organic/task_get/advanced"
 
 RETRY_BACKOFF_SECONDS = (2.0, 5.0, 15.0)
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-NON_RETRYABLE_STATUS = {400, 401, 403, 404}
+NON_RETRYABLE_STATUS = {400, 401, 402, 403, 404}
+PENDING_TASK_STATUS = {40601, 40602}
 MAX_ATTEMPTS = 3
 
 
@@ -122,6 +129,7 @@ class DataForSEOSERPProvider(SERPProvider):
             or s.dataforseo_location_code,
             "language_code": request.language_code or s.dataforseo_language_code,
             "device": request.device or s.dataforseo_device,
+            "os": s.dataforseo_os,
             "depth": request.depth or s.dataforseo_depth,
             "calculate_rectangles": s.dataforseo_calculate_rectangles,
             "load_async_ai_overview": s.dataforseo_load_async_ai_overview,
@@ -133,15 +141,20 @@ class DataForSEOSERPProvider(SERPProvider):
     # ------------------------------------------------------------
     # low-level request with the unified retry policy
     # ------------------------------------------------------------
-    async def _request_raw(self, request: SERPRequest) -> tuple[dict, float | None]:
-        """Return (raw response body, cost) after the unified retry policy."""
-        payload = [self.build_task(request)]
+    async def _request_json(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        payload: list[dict] | None = None,
+    ) -> dict:
+        """Make one DataForSEO HTTP request with the shared retry policy."""
         last_error: Exception | None = None
         started = time.monotonic()
 
         for attempt in range(MAX_ATTEMPTS):
             try:
-                response = await self._client.post(ENDPOINT, json=payload)
+                response = await self._client.request(method, endpoint, json=payload)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
                 logger.warning(
@@ -149,6 +162,7 @@ class DataForSEOSERPProvider(SERPProvider):
                     extra={
                         "event": "dataforseo_request_failed",
                         "error_code": "TIMEOUT_OR_NETWORK",
+                        "endpoint": endpoint,
                         "attempt": attempt + 1,
                     },
                 )
@@ -176,11 +190,12 @@ class DataForSEOSERPProvider(SERPProvider):
                     "dataforseo_request_ok",
                     extra={
                         "event": "dataforseo_request_ok",
+                        "endpoint": endpoint,
                         "duration_ms": int((time.monotonic() - started) * 1000),
                         "attempts": attempt + 1,
                     },
                 )
-                return data, self._extract_cost(data)
+                return data
 
             if response.status_code in NON_RETRYABLE_STATUS:
                 code = (
@@ -205,6 +220,7 @@ class DataForSEOSERPProvider(SERPProvider):
                 extra={
                     "event": "dataforseo_request_failed",
                     "error_code": f"HTTP_{response.status_code}",
+                    "endpoint": endpoint,
                     "attempt": attempt + 1,
                 },
             )
@@ -212,9 +228,108 @@ class DataForSEOSERPProvider(SERPProvider):
 
         raise PipelineError(
             ErrorCode.DATAFORSEO_REQUEST_FAILED,
-            f"DataForSEO request failed after {MAX_ATTEMPTS} attempts",
+            f"DataForSEO {method} {endpoint} failed after {MAX_ATTEMPTS} attempts",
             raw=str(last_error) if last_error else None,
         )
+
+    async def _request_raw(self, request: SERPRequest) -> tuple[dict, float | None]:
+        """Return the completed SERP envelope and its reported USD cost."""
+        if self._settings.dataforseo_request_type == "standard":
+            return await self._request_standard(request)
+        return await self._request_live(request)
+
+    async def _request_live(self, request: SERPRequest) -> tuple[dict, float | None]:
+        """Execute the synchronous Live Advanced request."""
+        data = await self._request_json(
+            "POST",
+            ENDPOINT_LIVE,
+            payload=[self.build_task(request)],
+        )
+        return data, self._extract_cost(data)
+
+    @staticmethod
+    def _first_task(data: dict) -> dict:
+        tasks = data.get("tasks") or []
+        task = tasks[0] if tasks else None
+        return task if isinstance(task, dict) else {}
+
+    @classmethod
+    def _raise_task_post_failure(cls, data: dict) -> None:
+        """Raise a stable error when task_post did not create a task."""
+        if data.get("status_code") != 20000:
+            code = (
+                ErrorCode.DATAFORSEO_AUTH_FAILED
+                if data.get("status_code") in (40100, 40101)
+                else ErrorCode.DATAFORSEO_REQUEST_FAILED
+            )
+            raise PipelineError(
+                code,
+                f"DataForSEO task_post status_code={data.get('status_code')} "
+                f"status_message={data.get('status_message')!r}",
+                raw=data,
+                provider_cost=cls._extract_cost(data),
+                provider_cost_reported=True,
+            )
+        task = cls._first_task(data)
+        if task.get("status_code") not in (20000, 20100):
+            code = (
+                ErrorCode.DATAFORSEO_AUTH_FAILED
+                if task.get("status_code") in (40100, 40101)
+                else ErrorCode.DATAFORSEO_REQUEST_FAILED
+            )
+            raise PipelineError(
+                code,
+                f"DataForSEO task_post task failed "
+                f"(status_code={task.get('status_code')}, "
+                f"status_message={task.get('status_message')!r})",
+                raw=task,
+                provider_cost=cls._extract_cost(data),
+                provider_cost_reported=True,
+            )
+
+    async def _request_standard(self, request: SERPRequest) -> tuple[dict, float | None]:
+        """Create a queue task and poll its free task-get endpoint."""
+        posted = await self._request_json(
+            "POST",
+            ENDPOINT_TASK_POST,
+            payload=[self.build_task(request)],
+        )
+        self._raise_task_post_failure(posted)
+
+        task = self._first_task(posted)
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            raise PipelineError(
+                ErrorCode.DATAFORSEO_REQUEST_FAILED,
+                "DataForSEO task_post response did not contain a task id",
+                raw=posted,
+                provider_cost=self._extract_cost(posted),
+                provider_cost_reported=True,
+            )
+
+        posted_cost = self._extract_cost(posted)
+        deadline = time.monotonic() + self._settings.dataforseo_poll_timeout_seconds
+        poll_interval = max(0.0, self._settings.dataforseo_poll_interval_seconds)
+        endpoint = f"{ENDPOINT_TASK_GET_ADVANCED}/{task_id}"
+
+        while True:
+            data = await self._request_json("GET", endpoint)
+            task = self._first_task(data)
+            status_code = task.get("status_code")
+            if status_code in PENDING_TASK_STATUS or data.get("status_code") in PENDING_TASK_STATUS:
+                if time.monotonic() >= deadline:
+                    raise PipelineError(
+                        ErrorCode.DATAFORSEO_REQUEST_FAILED,
+                        "DataForSEO standard task did not complete before the polling timeout",
+                        raw=data,
+                        provider_cost=posted_cost,
+                        provider_cost_reported=True,
+                    )
+                await asyncio.sleep(poll_interval)
+                continue
+
+            cost = self._extract_cost(data)
+            return data, cost if cost is not None else posted_cost
 
     async def _backoff(self, attempt: int) -> None:
         if attempt < len(self._backoff_seconds):
@@ -412,17 +527,17 @@ class DataForSEOSERPProvider(SERPProvider):
         )
 
     async def health_check(self) -> bool:
-        """Configured credentials + a successful live SERP call.
+        """Configured credentials + a successful configured SERP call.
 
         DataForSEO always answers HTTP 200 and carries the real outcome in
         the body's ``status_code`` (20000 = ok), so an HTTP-only check would
         treat an auth/business failure (e.g. status_code 40101, or a task
-        error) as "connected". This probe therefore runs a real (paid,
-        ~one SERP call) live search with ``depth=1`` and requires the
-        business envelope to parse successfully: top-level AND task-level
-        ``status_code == 20000`` with a non-empty ``result`` list. Any
-        ``PipelineError`` (HTTP 401/403, business failure, empty SERP) is
-        False.
+        error) as "connected". This probe therefore runs a real paid SERP
+        search with ``depth=1`` using the configured Standard or Live method
+        and requires the business envelope to parse successfully: top-level
+        AND task-level ``status_code == 20000`` with a non-empty ``result``
+        list. Any ``PipelineError`` (HTTP 401/403, business failure, empty
+        SERP) is False.
         """
         if not self._settings.dataforseo_configured:
             return False
@@ -432,7 +547,7 @@ class DataForSEOSERPProvider(SERPProvider):
                     keyword="health check",
                     location_code=self._settings.dataforseo_location_code,
                     language_code=self._settings.dataforseo_language_code,
-                    device="desktop",
+                    device=self._settings.dataforseo_device,
                     depth=1,
                 )
             )

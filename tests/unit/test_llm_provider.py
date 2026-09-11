@@ -27,21 +27,27 @@ from app.providers.llm.openai_compatible import (
 FAST_BACKOFF = (0.001, 0.001, 0.001)
 
 
-def _settings() -> Settings:
-    return Settings(
+def _settings(**overrides) -> Settings:
+    values = dict(
         llm_base_url="http://llm.test/v1",
         llm_api_key="test-key",
         llm_model="test-model",
         llm_max_retries=2,
         _env_file=None,
     )
+    values.update(overrides)
+    return Settings(**values)
 
 
 def _provider(handler) -> OpenAICompatibleLLMProvider:
+    return _provider_with_settings(handler, _settings())
+
+
+def _provider_with_settings(handler, settings: Settings) -> OpenAICompatibleLLMProvider:
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport, base_url="http://llm.test/v1")
     return OpenAICompatibleLLMProvider(
-        settings=_settings(),
+        settings=settings,
         client=client,
         backoff_seconds=FAST_BACKOFF,
     )
@@ -130,6 +136,58 @@ async def test_structured_output_success():
     await provider.aclose()
 
 
+async def test_prompt_only_structured_output_uses_a_separate_schema_user_turn():
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return _chat_ok('{"message": "ok", "count": 1}')
+
+    provider = _provider_with_settings(
+        handler,
+        _settings(
+            llm_model="gemma-4-26b",
+            llm_structured_output_mode="prompt_only",
+        ),
+    )
+    try:
+        await provider.generate_structured(
+            system_prompt="s", user_prompt="u", response_model=Greeting
+        )
+    finally:
+        await provider.aclose()
+
+    body = captured[0]
+    assert "response_format" not in body
+    assert [message["role"] for message in body["messages"]] == [
+        "system",
+        "user",
+        "user",
+    ]
+    assert "JSON Schema" in body["messages"][2]["content"]
+
+
+async def test_json_object_structured_output_sets_response_format():
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return _chat_ok('{"message": "ok", "count": 1}')
+
+    provider = _provider_with_settings(
+        handler,
+        _settings(llm_structured_output_mode="json_object"),
+    )
+    try:
+        await provider.generate_structured(
+            system_prompt="s", user_prompt="u", response_model=Greeting
+        )
+    finally:
+        await provider.aclose()
+
+    assert captured[0]["response_format"] == {"type": "json_object"}
+
+
 async def test_structured_output_with_code_fence_and_commentary():
     def handler(request: httpx.Request) -> httpx.Response:
         return _chat_ok(
@@ -142,6 +200,84 @@ async def test_structured_output_with_code_fence_and_commentary():
         system_prompt="s", user_prompt="u", response_model=Greeting
     )
     assert out.message == "hi"
+    await provider.aclose()
+
+
+# ----------------------------------------------------------------------
+# model tiering (TASK-LLM-MODEL-TIERING): per-call ``model`` override
+# ----------------------------------------------------------------------
+async def test_structured_output_default_model():
+    """No ``model`` arg -> the configured default model is sent."""
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return _chat_ok('{"message": "hi", "count": 1}')
+
+    provider = _provider(handler)
+    await provider.generate_structured(
+        system_prompt="s", user_prompt="u", response_model=Greeting
+    )
+    assert captured[0]["model"] == "test-model"
+    assert provider._last_model == "test-model"
+    await provider.aclose()
+
+
+async def test_structured_output_model_override():
+    """``model`` override wins over the configured default."""
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return _chat_ok('{"message": "hi", "count": 1}')
+
+    provider = _provider(handler)
+    await provider.generate_structured(
+        system_prompt="s",
+        user_prompt="u",
+        response_model=Greeting,
+        model="analysis-cheap-model",
+    )
+    assert captured[0]["model"] == "analysis-cheap-model"
+    assert provider._last_model == "analysis-cheap-model"
+    await provider.aclose()
+
+
+async def test_structured_output_model_override_applies_to_repairs():
+    """The override must hold on repair attempts too (spec section 49)."""
+    state = {"n": 0}
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        captured.append(json.loads(request.content))
+        if state["n"] == 1:
+            return _chat_ok("not json at all")
+        return _chat_ok('{"message": "fixed", "count": 9}')
+
+    provider = _provider(handler)
+    await provider.generate_structured(
+        system_prompt="s",
+        user_prompt="u",
+        response_model=Greeting,
+        model="analysis-cheap-model",
+    )
+    assert state["n"] == 2
+    assert all(c["model"] == "analysis-cheap-model" for c in captured)
+    await provider.aclose()
+
+
+async def test_begin_usage_resets_last_model():
+    provider = _provider(lambda request: _chat_ok('{"message": "hi", "count": 1}'))
+    await provider.generate_structured(
+        system_prompt="s",
+        user_prompt="u",
+        response_model=Greeting,
+        model="analysis-cheap-model",
+    )
+    assert provider._last_model == "analysis-cheap-model"
+    provider.begin_usage()
+    assert provider._last_model is None
     await provider.aclose()
 
 

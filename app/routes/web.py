@@ -518,18 +518,31 @@ def _provider_statuses(settings) -> list[dict]:
             status = "Connected"
         else:
             status = "Failed"
-        rows.append({"name": name, "status": status})
+        detail = ""
+        if name == "LLM" and configured:
+            # Model tiering (docs/TASK-LLM-MODEL-TIERING.md): show the
+            # effective writing / analysis model names (not secrets).
+            if settings.llm_model_analysis:
+                detail = (
+                    f"writing: {settings.llm_model} / "
+                    f"analysis: {settings.llm_model_analysis}"
+                )
+            else:
+                detail = f"writing + analysis: {settings.llm_model}"
+        rows.append({"name": name, "status": status, "detail": detail})
 
     rows.append(
         {
             "name": "PostgreSQL",
             "status": "Connected" if check_database() else "Failed",
+            "detail": "",
         }
     )
     rows.append(
         {
             "name": "Redis",
             "status": "Connected" if check_redis(settings.redis_url) else "Failed",
+            "detail": "",
         }
     )
     return rows

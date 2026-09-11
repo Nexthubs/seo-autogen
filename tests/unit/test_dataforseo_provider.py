@@ -2,8 +2,7 @@
 (spec sections 10.2, 12, 51, 52; audit H01, M12, M15).
 
 Fixtures are pinned to the REAL, desensitized official DataForSEO envelope
-(machine-verified against the documented ``/v3/serp/google/organic/live/
-advanced`` response):
+(machine-verified against the documented Google Organic Advanced response):
 
   - top-level business ``status_code == 20000`` (HTTP is always 200)
   - per-task ``status_code`` / ``cost`` (USD, NOT ``credits``)
@@ -18,7 +17,8 @@ advanced`` response):
   - featured: item ``featured_snippet`` with top-level title/url/description
 
 Covers:
-  - task body per spec section 12 (array, fields, PAA click depth flag)
+  - task body per spec section 12 (array, fields, OS, PAA click depth flag)
+  - Standard task_post -> task_get polling flow
   - HTTP Basic Auth header present
   - parse(): organic / PAA / related / featured snippet, mixed item types
   - rank ordering by ``rank_group`` from a shuffled provider order
@@ -53,13 +53,17 @@ def _settings(**over) -> Settings:
         dataforseo_base_url="https://api.dataforseo.test",
         dataforseo_login="user",
         dataforseo_password="pass",
+        dataforseo_request_type="live",
         dataforseo_location_code=2840,
         dataforseo_language_code="en",
         dataforseo_device="desktop",
+        dataforseo_os="windows",
         dataforseo_depth=10,
         dataforseo_paa_click_depth=0,
         dataforseo_load_async_ai_overview=False,
         dataforseo_calculate_rectangles=False,
+        dataforseo_poll_interval_seconds=0,
+        dataforseo_poll_timeout_seconds=1,
     )
     base.update(over)
     return Settings(**base, _env_file=None)
@@ -262,6 +266,7 @@ def test_build_task_default_fields():
         "location_code": 2840,
         "language_code": "en",
         "device": "desktop",
+        "os": "windows",
         "depth": 10,
         "calculate_rectangles": False,
         "load_async_ai_overview": False,
@@ -306,6 +311,98 @@ async def test_request_sends_basic_auth_and_array_body():
     assert captured["auth"] == f"Basic {expected}"
     assert captured["path"] == "/v3/serp/google/organic/live/advanced"
     assert isinstance(captured["body"], list) and len(captured["body"]) == 1
+
+
+async def test_standard_posts_task_then_gets_advanced_result():
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path.endswith("/task_post"):
+            body = {
+                "status_code": 20000,
+                "tasks": [
+                    {
+                        "id": "standard-task-1",
+                        "status_code": 20100,
+                        "status_message": "Task Created.",
+                        "cost": 0.0006,
+                    }
+                ],
+            }
+            return httpx.Response(200, json=body)
+        return httpx.Response(200, json=_serp_body(cost=0.0006))
+
+    p = _provider(
+        handler,
+        dataforseo_request_type="standard",
+        dataforseo_os="ios",
+        dataforseo_device="mobile",
+    )
+    response = await p.search(
+        SERPRequest(
+            keyword="standard request",
+            location_code=2840,
+            language_code="en",
+            device="mobile",
+            depth=10,
+        )
+    )
+
+    assert calls == [
+        ("POST", "/v3/serp/google/organic/task_post"),
+        ("GET", "/v3/serp/google/organic/task_get/advanced/standard-task-1"),
+    ]
+    assert response.provider_cost == pytest.approx(0.0006)
+
+
+async def test_standard_polls_pending_task_until_ready():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if request.url.path.endswith("/task_post"):
+            return httpx.Response(
+                200,
+                json={
+                    "status_code": 20000,
+                    "tasks": [
+                        {
+                            "id": "standard-task-2",
+                            "status_code": 20100,
+                            "cost": 0.0006,
+                        }
+                    ],
+                },
+            )
+        if calls["n"] == 2:
+            return httpx.Response(
+                200,
+                json={
+                    "status_code": 20000,
+                    "tasks": [
+                        {
+                            "id": "standard-task-2",
+                            "status_code": 40602,
+                            "status_message": "Task In Queue.",
+                            "result": None,
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, json=_serp_body(cost=0.0006))
+
+    p = _provider(
+        handler,
+        dataforseo_request_type="standard",
+        dataforseo_poll_interval_seconds=0,
+    )
+    response = await p.search(
+        SERPRequest(keyword="k", location_code=2840, language_code="en")
+    )
+
+    assert calls["n"] == 3
+    assert response.organic_results
 
 
 # ------------------------------------------------------------

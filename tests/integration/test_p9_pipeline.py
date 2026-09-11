@@ -298,6 +298,13 @@ class FakeLLM:
             backoff_seconds=FAST_BACKOFF,
         )
 
+    @property
+    def _last_model(self) -> str | None:
+        # TASK-LLM-MODEL-TIERING provenance: the meter records the model the
+        # underlying provider ACTUALLY sent by reading ``inner._last_model``;
+        # the fake wraps a real OpenAICompatibleLLMProvider, so proxy it.
+        return self._provider._last_model
+
     def _handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         # Exhaustion is a server fault (500), NOT a successful call: the
@@ -814,9 +821,17 @@ async def test_plain_rerun_cache_hit_vs_forced_rerun(job, tmp_path):
 # ---------------------------------------------------------------------------
 # cost tracking (spec 54)
 # ---------------------------------------------------------------------------
-async def test_cost_tracking_records_usage_and_provider_costs(job, tmp_path):
+async def test_cost_tracking_records_usage_and_provider_costs(job, tmp_path, monkeypatch):
     """A full cold run records one ``llm_usage`` row per logical LLM call and
     persists every paid provider's reported cost on its own table."""
+    from app.core.config import get_settings
+
+    # The analysis call sites read the effective tier model from the
+    # lru-cached get_settings(); in production that is the SAME object the
+    # providers are built from. Keep it in sync with the test provider's
+    # settings ("test-model") so the single-endpoint fake sees one name.
+    monkeypatch.setattr(get_settings(), "llm_model", "test-model")
+    monkeypatch.setattr(get_settings(), "llm_model_analysis", "")
     providers, llm, _, extractor, image, settings = _providers(tmp_path, _payloads())
     with SessionLocal() as session:
         job_row = session.get(GenerationJob, job)
@@ -1016,6 +1031,7 @@ def _dataforseo_settings() -> Settings:
         dataforseo_base_url="https://api.dataforseo.test",
         dataforseo_login="user",
         dataforseo_password="pw",
+        dataforseo_request_type="live",
         _env_file=None,
     )
 
@@ -1186,4 +1202,174 @@ async def test_r_h04_legacy_dict_raw_never_crashes_failure_branch(job, tmp_path)
     )
     assert "sk-legacy" not in fresh.error_raw
     assert "pw" not in fresh.error_raw
+
+
+# ---------------------------------------------------------------------------
+# Model tiering (TASK-LLM-MODEL-TIERING): one run routes the writing tier to
+# the default model and every analysis call to the analysis model, and the
+# llm_usage rows record the model that was ACTUALLY sent on the wire.
+# ---------------------------------------------------------------------------
+async def test_model_tiering_routes_writing_vs_analysis(job, tmp_path, monkeypatch):
+    """With ``llm_model_analysis`` set, a full run sends the default model for
+    the writing tier (article_writer / article_reviser) and the analysis model
+    for the 11 analysis steps; every ``llm_usage`` row records that model."""
+    from app.core.config import get_settings
+
+    # The steps read the lru-cached get_settings(); point its analysis tier at
+    # a dedicated model name. The test provider's default stays "test-model".
+    monkeypatch.setattr(get_settings(), "llm_model_analysis", "analysis-model")
+
+    providers, llm, _, _, _, settings = _providers(tmp_path, _payloads())
+    assert settings.llm_model == "test-model"
+    with SessionLocal() as session:
+        job_row = session.get(GenerationJob, job)
+        result = await _full_run(session, job_row, providers, settings)
+    assert result.status == JobStatus.READY.value
+
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(LLMUsageRow).where(LLMUsageRow.job_id == job)
+        ).all()
+    assert len(rows) == 15
+    step_counts: dict[str, int] = {}
+    for r in rows:
+        step_counts[r.step] = step_counts.get(r.step, 0) + 1
+        if r.step in ("article_writer", "article_reviser"):
+            # Writing tier: the default model, never the analysis override.
+            assert r.model == "test-model", (r.step, r.model)
+        else:
+            # Analysis tier: every one of the 11 analysis steps.
+            assert r.model == "analysis-model", (r.step, r.model)
+    # Writing tier: 2 calls (writer + reviser). Analysis tier: 13 (5 competitor
+    # + 8 other single-call steps). 2 + 13 == 15.
+    assert step_counts["article_writer"] == 1
+    assert step_counts["article_reviser"] == 1
+    assert step_counts["competitor_analysis"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Endpoint split (TASK-LLM-MODEL-TIERING follow-up): the analysis tier runs
+# on its OWN endpoint (base URL + API key + model), the writing tier stays on
+# the default endpoint, and every llm_usage row records the model that was
+# actually sent on that tier's wire.
+# ---------------------------------------------------------------------------
+class _EndpointScript:
+    """A scripted chat endpoint: pops payloads in order and records every
+    request (URL, auth header, model) for the assertions."""
+
+    def __init__(self, payloads: list[str]):
+        self.payloads = list(payloads)
+        self.requests: list[dict] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.requests.append(
+            {
+                "url": str(request.url),
+                "auth": request.headers.get("authorization"),
+                "model": body["model"],
+            }
+        )
+        if not self.payloads:
+            return httpx.Response(500, json={"error": "scripted payloads exhausted"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "cmpl-1",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": self.payloads.pop(0),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+
+async def test_endpoint_split_two_endpoints_full_run(job, tmp_path, monkeypatch):
+    """A full run through the real ``TieredLLMProvider`` + meter with a
+    dedicated analysis endpoint: the 13 analysis calls hit the analysis
+    base URL with the analysis key/model, the 2 writing calls stay on the
+    default endpoint, and the llm_usage rows prove per-tier provenance."""
+    from app.core.config import get_settings
+    from app.providers.llm.tiering import TieredLLMProvider
+
+    # The steps read the lru-cached get_settings() for the tier model name.
+    monkeypatch.setattr(get_settings(), "llm_model_analysis", "analysis-model")
+
+    settings = _settings(tmp_path)
+    settings.llm_model_analysis = "analysis-model"
+    settings.llm_base_url_analysis = "http://analysis.test/v1"
+    settings.llm_api_key_analysis = "analysis-key"
+    assert settings.llm_analysis_endpoint_distinct is True
+
+    all_payloads = [json.dumps(p) for p in _payloads()]
+    # _payloads() indices: 0-4 competitor, 5 synthesis, 6 evidence, 7 brief,
+    # 8 outline, 9 WRITER draft, 10-12 reviews, 13 REVISER draft, 14 images.
+    writing = _EndpointScript([all_payloads[9], all_payloads[13]])
+    analysis = _EndpointScript(
+        [p for i, p in enumerate(all_payloads) if i not in (9, 13)]
+    )
+    llm = TieredLLMProvider(
+        settings=settings,
+        # The production clients carry the tier API key as a client-level
+        # Authorization header; the injected fakes must mirror that.
+        writing_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(writing),
+            base_url=settings.llm_base_url,
+            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+        ),
+        analysis_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(analysis),
+            base_url=settings.llm_base_url_analysis,
+            headers={
+                "Authorization": f"Bearer {settings.llm_api_key_analysis}"
+            },
+        ),
+        backoff_seconds=FAST_BACKOFF,
+    )
+    providers = PipelineProviders(
+        llm=llm,
+        serp=FakeSERP(),
+        extractor=FakeExtractor(),
+        image=FakeImage(settings),
+        cms=None,
+    )
+
+    with SessionLocal() as session:
+        job_row = session.get(GenerationJob, job)
+        result = await _full_run(session, job_row, providers, settings)
+    assert result.status == JobStatus.READY.value
+
+    # Wire-level proof: 2 writing calls on the default endpoint with the
+    # default key + model, 13 analysis calls on the analysis endpoint with
+    # the analysis key + model.
+    assert len(writing.requests) == 2
+    assert len(analysis.requests) == 13
+    assert all(
+        r["url"].startswith("http://llm.test/v1") for r in writing.requests
+    )
+    assert all(r["auth"] == "Bearer test-key" for r in writing.requests)
+    assert all(r["model"] == "test-model" for r in writing.requests)
+    assert all(
+        r["url"].startswith("http://analysis.test/v1")
+        for r in analysis.requests
+    )
+    assert all(r["auth"] == "Bearer analysis-key" for r in analysis.requests)
+    assert all(r["model"] == "analysis-model" for r in analysis.requests)
+
+    # DB provenance: every llm_usage row carries the model its tier sent.
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(LLMUsageRow).where(LLMUsageRow.job_id == job)
+        ).all()
+    assert len(rows) == 15
+    for r in rows:
+        if r.step in ("article_writer", "article_reviser"):
+            assert r.model == "test-model", (r.step, r.model)
+        else:
+            assert r.model == "analysis-model", (r.step, r.model)
 

@@ -33,12 +33,18 @@ def api_provider_status() -> dict:
     settings = get_settings()
     providers = build_providers(settings)
     results = asyncio.run(_check_all(providers))
-    return {
-        "providers": {
-            name: results[name]
-            for name, _ in _ORDER
-        }
+    providers_out = {
+        name: results[name]
+        for name, _ in _ORDER
     }
+    # Model tiering (docs/TASK-LLM-MODEL-TIERING.md): model names are not
+    # secrets (spec 60 restricts keys/tokens/URLs), so the effective
+    # writing / analysis model names are safe to surface on the LLM entry.
+    providers_out["llm"]["writing_model"] = settings.llm_model
+    providers_out["llm"]["analysis_model"] = (
+        settings.llm_model_analysis or settings.llm_model
+    )
+    return {"providers": providers_out}
 
 
 async def _check_all(providers) -> dict:

@@ -77,7 +77,12 @@ class MeteredLLMProvider(LLMProvider):
         row = LLMUsageRow(
             job_id=self._job_id,
             step=self.current_step,
-            model=self._model,
+            # Tier-aware (TASK-LLM-MODEL-TIERING): record the model that
+            # was ACTUALLY sent — the underlying provider keeps it in
+            # ``_last_model`` (per-call analysis-tier override or default).
+            # Falls back to the configured default when the provider does
+            # not expose it (bare test fakes).
+            model=self._recorded_model(),
             input_tokens=usage[0] if usage else None,
             output_tokens=usage[1] if usage else None,
             duration_ms=duration_ms,
@@ -86,6 +91,19 @@ class MeteredLLMProvider(LLMProvider):
             prompt_hash=prompt_hash,
         )
         self._session.add(row)
+
+    def _recorded_model(self) -> str | None:
+        """Model to persist on the usage row.
+
+        Prefers the model the underlying provider actually sent
+        (``_last_model`` — per-call analysis-tier override or default).
+        Falls back to the configured default when the provider does not
+        expose the attribute (bare test fakes).
+        """
+        last = getattr(self._inner, "_last_model", None)
+        if isinstance(last, str) and last:
+            return last
+        return self._model
 
     def _begin(self) -> None:
         begin = getattr(self._inner, "begin_usage", None)
@@ -124,6 +142,7 @@ class MeteredLLMProvider(LLMProvider):
         user_prompt: str,
         response_model: Type[T],
         temperature: float | None = None,
+        model: str | None = None,
     ) -> T:
         self._begin()
         started = time.monotonic()
@@ -133,6 +152,7 @@ class MeteredLLMProvider(LLMProvider):
                 user_prompt=user_prompt,
                 response_model=response_model,
                 temperature=temperature,
+                model=model,
             )
         finally:
             duration_ms = int((time.monotonic() - started) * 1000)

@@ -358,6 +358,23 @@ async def test_404_is_not_retryable(fake, provider):
     assert len(fake.calls("GET", "/api/blogs/nope")) == 1
 
 
+async def test_get_draft_bad_query_is_schema_mismatch(fake, provider):
+    """A read-back query error is not an authentication failure."""
+    fake.routes[("GET", "/api/blogs/doc-7")] = httpx.Response(
+        400,
+        json={
+            "error": {
+                "status": 400,
+                "name": "ValidationError",
+                "message": "Invalid key avatar at author.avatar",
+            }
+        },
+    )
+    with pytest.raises(PipelineError) as excinfo:
+        await provider.get_draft("doc-7")
+    assert excinfo.value.error_code == ErrorCode.STRAPI_SCHEMA_MISMATCH
+
+
 async def test_schema_mismatch_on_bad_blog_response(fake, provider):
     # H03: flat item without id/documentId is a schema mismatch.
     fake.routes[("POST", "/api/blogs")] = httpx.Response(
@@ -377,10 +394,11 @@ async def test_get_draft_tolerates_legacy_v4_shape(fake, provider):
     entry = await provider.get_draft("doc-7")
     assert entry.title == "Legacy"
     assert entry.main_image == "https://cms/uploads/hero.webp"
-    # and the request still populated the relation fields (M02)
-    assert "populate%5Bauthor%5D" in q(
-        fake.calls("GET", "/api/blogs/doc-7")[0]
-    )
+    # and the request populated only the direct relation fields (M02).
+    query = q(fake.calls("GET", "/api/blogs/doc-7")[0])
+    assert "populate%5B0%5D=author" in query
+    assert "populate%5B1%5D=category" in query
+    assert "populate%5B2%5D=mainImage" in query
 
 
 async def test_get_draft_parses_populated_relations(fake, provider):

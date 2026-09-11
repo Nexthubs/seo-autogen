@@ -197,6 +197,8 @@ async def run_image_planner(
         response_model=ImagePlanOutput,
         # M08: tunable via .env (LLM_TEMPERATURE_IMAGE_PLANNING), not hardcoded.
         temperature=get_settings().llm_temperature_image_planning,
+        # Analysis tier (TASK-LLM-MODEL-TIERING): None -> default model.
+        model=(get_settings().llm_analysis_model or get_settings().llm_model),
     )
     plan = normalize_plan(raw, ceiling)
     rows = persist_plan(session, job, plan, prompt=prompt)

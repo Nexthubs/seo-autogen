@@ -63,6 +63,7 @@ def _settings(tmp_path) -> Settings:
         llm_base_url="http://llm.test/v1",
         llm_api_key="test-key",
         llm_model="test-model",
+        dataforseo_request_type="live",
         data_dir=str(tmp_path),
         strapi_frontend_renders_main_image=True,
         _env_file=None,
